@@ -1,0 +1,12 @@
+struct hopper_data_lcmt {
+    float  q[3];
+    float  qd[3];
+    float  tauIq[3];
+    // ---- RM M2006/C610 motors (via Pixhawk rm_c610 + px4_dds_bridge) ----
+    // Output-shaft angle (rad, multi-turn) / speed (rad/s) / torque current (A).
+    // rm_online: bit i = ESC (i+1) feedback fresh (<100ms).
+    float  rm_q[3];
+    float  rm_qd[3];
+    float  rm_iq[3];
+    int8_t rm_online;
+}

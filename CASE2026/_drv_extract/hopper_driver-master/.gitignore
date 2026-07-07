@@ -1,0 +1,16 @@
+.vscode
+.idea
+.DS_Store
+build/
+bin/
+cmake-build-debug/
+cmake-build-release/
+cmake-build-debug-coverage/
+cmake-build-release-coverage/
+cmake-build-debug-coverage-cppcheck/
+cmake-build-release-coverage-cppcheck/
+cmake-build-debug-coverage-cppcheck-clang-tidy/
+cmake-build-release-coverage-cppcheck-clang-tidy/
+hopper_lcm_types/lcm_types/**/*
+*.pyc
+file_list.txt

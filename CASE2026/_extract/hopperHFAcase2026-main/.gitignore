@@ -1,0 +1,18 @@
+build/
+__pycache__/
+*.py[cod]
+*.o
+*.so
+.cmake/
+CMakeFiles/
+CMakeCache.txt
+.ipynb_checkpoints/
+.pytest_cache/
+*.egg-info/
+.vscode/
+.idea/
+.cursor/
+
+# generated figure dirs (regenerate from logs/*.csv)
+logs/paper_figs/
+logs/paper_figs_v2/

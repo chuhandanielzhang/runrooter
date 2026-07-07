@@ -1,0 +1,189 @@
+<mujoco model="three_leg_3rsr_closed">
+  <compiler angle="radian" meshdir="." autolimits="true"/>
+  <option timestep="0.0005" gravity="0 0 -9.81" iterations="50" tolerance="1e-8"/>
+
+  <asset>
+    <mesh name="upperbody_mesh" file="upperbody_light.STL" scale="0.001 0.001 0.001"/>
+    <mesh name="joint_mesh" file="joint.STL" scale="0.001 0.001 0.001"/>
+    <mesh name="upperleg_mesh" file="upperleg.STL" scale="0.001 0.001 0.001"/>
+    <mesh name="lowerleg_mesh" file="lowerleg.STL" scale="0.001 0.001 0.001"/>
+    <mesh name="foot_mesh" file="footv5.STL" scale="0.001 0.001 0.001"/>
+    <mesh name="propeller_mesh" file="propellerlink_light.STL" scale="0.001 0.001 0.001"/>
+  </asset>
+
+  <default>
+    <joint armature="0.01" damping="0.05"/>
+    <position kp="15" kv="3"/>
+    <default class="legmesh">
+      <geom contype="0" conaffinity="0"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 2" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="2 2 0.02" rgba="0.8 0.8 0.8 1"/>
+
+    <body name="base" pos="0 0 0.6">
+      <freejoint name="root"/>
+      <!-- paper total 3.75 kg = base 2.95 + 3 props 0.45 + leg 0.35. inertia from STL; TODO(SolidWorks) measured -->
+      <geom name="upperbody_visual" type="mesh" mesh="upperbody_mesh" mass="2.95" rgba="0.55 0.6 0.7 1" contype="0" conaffinity="0"/>
+
+      <site name="imu" pos="0 0 0" size="0.012" rgba="1 1 0 0"/>
+
+      <!-- ===== LEG 1: 0 deg ===== -->
+      <body name="leg1" quat="0 0 0 1">
+        <body name="hip1" pos="0.02424 0 0">
+          <body name="upper1" quat="0 0 0 1">
+            <joint name="ctrl_joint_1" type="hinge" axis="0 1 0" range="-1.5708 1.0472" damping="0.05"/>
+            <geom name="upper1_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.05" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="1 0 0 1"/>
+            <body name="cross1" pos="-0.158 0 0">
+              <joint name="cross_pin_1" type="hinge" axis="0 1 0" damping="0.01"/>
+              <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+              <geom class="legmesh" type="mesh" mesh="joint_mesh" pos="0 0 0" rgba="0.25 0.25 0.25 1"/>
+              <body name="lower1" pos="0 0 0">
+              <joint name="lower_pin_1" type="hinge" axis="0 0 1" range="-0.7854 0.7854" damping="0.01"/>
+              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.04" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
+              <site name="foot_site_1" pos="-0.0735 0.0086 -0.396" size="0.012" rgba="1 0 0 0"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <!-- ===== LEG 2: 120 deg ===== -->
+      <body name="leg2" quat="0.8660254 0 0 -0.5">
+        <body name="hip2" pos="0.02424 0 0">
+          <body name="upper2" quat="0 0 0 1">
+            <joint name="ctrl_joint_2" type="hinge" axis="0 1 0" range="-1.5708 1.0472" damping="0.05"/>
+            <geom name="upper2_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.05" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="0 0 1 1"/>
+            <body name="cross2" pos="-0.158 0 0">
+              <joint name="cross_pin_2" type="hinge" axis="0 1 0" damping="0.01"/>
+              <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+              <geom class="legmesh" type="mesh" mesh="joint_mesh" pos="0 0 0" rgba="0.25 0.25 0.25 1"/>
+              <body name="lower2" pos="0 0 0">
+              <joint name="lower_pin_2" type="hinge" axis="0 0 1" range="-0.7854 0.7854" damping="0.01"/>
+              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.04" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
+              <site name="foot_site_2" pos="-0.0735 0.0086 -0.396" size="0.012" rgba="0 1 0 0"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <!-- ===== LEG 3: 240 deg ===== -->
+      <body name="leg3" quat="0.8660254 0 0 0.5">
+        <body name="hip3" pos="0.02424 0 0">
+          <body name="upper3" quat="0 0 0 1">
+            <joint name="ctrl_joint_3" type="hinge" axis="0 1 0" range="-1.5708 1.0472" damping="0.05"/>
+            <geom name="upper3_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.05" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="0 1 0 1"/>
+            <body name="cross3" pos="-0.158 0 0">
+              <joint name="cross_pin_3" type="hinge" axis="0 1 0" damping="0.01"/>
+              <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+              <geom class="legmesh" type="mesh" mesh="joint_mesh" pos="0 0 0" rgba="0.25 0.25 0.25 1"/>
+              <body name="lower3" pos="0 0 0">
+              <joint name="lower_pin_3" type="hinge" axis="0 0 1" range="-0.7854 0.7854" damping="0.01"/>
+              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.04" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
+              <site name="foot_site_3" pos="-0.0735 0.0086 -0.396" size="0.012" rgba="0 0 1 0"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <!-- ===== TRI-ROTOR PROPELLERS (servo tilt about prop Z = outward, X = up) ===== -->
+      <body name="proparm1" quat="1 0 0 0">
+        <body name="prop1" pos="0.56705 0 0.0866" quat="0 0.7071068 0 0.7071068">
+          <joint name="servo_1" type="hinge" axis="0 0 1" range="-1.5708 1.5708" damping="0.2"/>
+          <site name="thrust_site_1" pos="0 0 0" size="0.012" rgba="1 0.5 0 0"/>
+          <inertial pos="0 0 0" mass="0.15" diaginertia="2e-4 2e-4 2e-4"/>
+          <geom type="mesh" mesh="propeller_mesh" rgba="0.3 0.3 0.35 1" contype="0" conaffinity="0"/>
+          <!-- prop frame: X red(up), Y green, Z blue(outward) -->
+        </body>
+      </body>
+      <body name="proparm2" quat="0.5 0 0 0.8660254">
+        <body name="prop2" pos="0.56705 0 0.0866" quat="0 0.7071068 0 0.7071068">
+          <joint name="servo_2" type="hinge" axis="0 0 1" range="-1.5708 1.5708" damping="0.2"/>
+          <site name="thrust_site_2" pos="0 0 0" size="0.012" rgba="1 0.5 0 0"/>
+          <inertial pos="0 0 0" mass="0.15" diaginertia="2e-4 2e-4 2e-4"/>
+          <geom type="mesh" mesh="propeller_mesh" rgba="0.3 0.3 0.35 1" contype="0" conaffinity="0"/>
+        </body>
+      </body>
+      <body name="proparm3" quat="-0.5 0 0 0.8660254">
+        <body name="prop3" pos="0.56705 0 0.0866" quat="0 0.7071068 0 0.7071068">
+          <joint name="servo_3" type="hinge" axis="0 0 1" range="-1.5708 1.5708" damping="0.2"/>
+          <site name="thrust_site_3" pos="0 0 0" size="0.012" rgba="1 0.5 0 0"/>
+          <inertial pos="0 0 0" mass="0.15" diaginertia="2e-4 2e-4 2e-4"/>
+          <geom type="mesh" mesh="propeller_mesh" rgba="0.3 0.3 0.35 1" contype="0" conaffinity="0"/>
+        </body>
+      </body>
+    </body>
+
+    <!-- shared foot point: free body pulled to the three leg ends -->
+    <body name="foot" pos="0 0 0.231055">
+      <freejoint name="foot_free"/>
+      <inertial pos="0 0 0" mass="0.05" diaginertia="1e-5 1e-5 1e-5"/>
+      <geom name="foot_visual" type="mesh" mesh="foot_mesh" rgba="0.8 0.5 0.2 1" contype="0" conaffinity="0"/>
+      <geom name="foot_collision" type="sphere" size="0.025" pos="0 0 -0.012" rgba="0.8 0.5 0.2 0"/>
+      <site name="foot_touch" pos="0 0 -0.012" size="0.03" rgba="1 1 1 0"/>
+      <site name="foot_center" pos="0 0 0" size="0.01" rgba="1 1 1 0"/>
+      <!-- foot end frame: origin yellow, X red, Y green, Z blue -->
+    </body>
+  </worldbody>
+
+  <equality>
+    <connect site1="foot_center" site2="foot_site_1" solref="0.002 1" solimp="0.99 0.999 1e-4 0.5 2"/>
+    <connect site1="foot_center" site2="foot_site_2" solref="0.002 1" solimp="0.99 0.999 1e-4 0.5 2"/>
+    <connect site1="foot_center" site2="foot_site_3" solref="0.002 1" solimp="0.99 0.999 1e-4 0.5 2"/>
+  </equality>
+
+  <actuator>
+    <!-- hip motors: torque clamped to +-25 Nm (user-confirmed; real logs command up
+         to 18.4 Nm). Kp/Kd are firmware-settable in MIT mode. -->
+    <position name="ctrl_motor_1" joint="ctrl_joint_1" kp="100" kv="3" forcerange="-25 25" ctrlrange="-1.5708 1.0472"/>
+    <position name="ctrl_motor_2" joint="ctrl_joint_2" kp="100" kv="3" forcerange="-25 25" ctrlrange="-1.5708 1.0472"/>
+    <position name="ctrl_motor_3" joint="ctrl_joint_3" kp="100" kv="3" forcerange="-25 25" ctrlrange="-1.5708 1.0472"/>
+    <position name="servo_motor_1" joint="servo_1" ctrlrange="-1.5708 1.5708"/>
+    <position name="servo_motor_2" joint="servo_2" ctrlrange="-1.5708 1.5708"/>
+    <position name="servo_motor_3" joint="servo_3" ctrlrange="-1.5708 1.5708"/>
+    <!-- rotor thrust along prop +X (up); servo tilts this vector = thrust vectoring.
+         gear 4th term = reaction drag torque about spin axis. km/kf = 0.018 m measured
+         from T-Motor 10x5x3 thrust table (Gemfan 1050 3-blade prop, our hardware).
+         spin dirs +/+/- (tricopter): net yaw reaction is countered by tail servo tilt,
+         which is exactly what the policy must learn -> faithful aero coupling. -->
+    <!-- thrust ctrl 0-10 N/prop = 10s burst ceiling (F40 Pro V KV1950 6S, 55.5A peak);
+         continuous safe ~6 N/prop (THRUST_MAX in train_hop). TWR 0.82 burst, ~0.5 cont. -->
+    <general name="thrust_1" site="thrust_site_1" gear="1 0 0  0.018 0 0" gainprm="1 0 0" ctrlrange="0 10"/>
+    <general name="thrust_2" site="thrust_site_2" gear="1 0 0  0.018 0 0" gainprm="1 0 0" ctrlrange="0 10"/>
+    <general name="thrust_3" site="thrust_site_3" gear="1 0 0 -0.018 0 0" gainprm="1 0 0" ctrlrange="0 10"/>
+  </actuator>
+
+  <sensor>
+    <accelerometer name="imu_accel" site="imu"/>
+    <gyro name="imu_gyro" site="imu"/>
+    <framequat name="imu_quat" objtype="site" objname="imu"/>
+    <framepos name="base_pos" objtype="site" objname="imu"/>
+    <framelinvel name="base_linvel" objtype="site" objname="imu"/>
+    <jointpos name="hip1_pos" joint="ctrl_joint_1"/>
+    <jointpos name="hip2_pos" joint="ctrl_joint_2"/>
+    <jointpos name="hip3_pos" joint="ctrl_joint_3"/>
+    <jointvel name="hip1_vel" joint="ctrl_joint_1"/>
+    <jointvel name="hip2_vel" joint="ctrl_joint_2"/>
+    <jointvel name="hip3_vel" joint="ctrl_joint_3"/>
+    <jointpos name="servo1_pos" joint="servo_1"/>
+    <jointpos name="servo2_pos" joint="servo_2"/>
+    <jointpos name="servo3_pos" joint="servo_3"/>
+    <touch name="foot_touch_sensor" site="foot_touch"/>
+  </sensor>
+
+  <!-- converged feasible stance: base(7) + 3x[hip,cross,lower](9) + 3 servo(3) + foot(7) = 26 -->
+  <keyframe>
+    <key name="home"
+         qpos="0 0 0.6 1 0 0 0
+               -0.060299 -0.593065 0.116478
+               -0.060299 -0.593065 0.116478
+               -0.060299 -0.593065 0.116478
+               0 0 0
+               0 0 0.231055 1 0 0 0"
+         ctrl="-0.060299 -0.060299 -0.060299 0 0 0 0 0 0"/>
+  </keyframe>
+</mujoco>

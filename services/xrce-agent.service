@@ -1,0 +1,16 @@
+[Unit]
+Description=Micro-XRCE-DDS Agent (PX4 DDS <-> ROS2 over TELEM2/ttyTHS1, Hopper IMU link)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+Group=dialout
+Environment=HOME=/home/nvidia
+ExecStart=/bin/bash /home/nvidia/Hopper_srbRL/pixhawk/run_xrce_agent.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

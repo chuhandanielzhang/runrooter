@@ -1,0 +1,102 @@
+#ifndef HOPPER_CONTROLLER_H
+#define HOPPER_CONTROLLER_H
+
+#include <chrono>
+#include <thread>
+#include <cmath>
+#include <vector>
+#include <cstdlib>
+#include "utility.h"  // Your CAN interface class
+#include "kalman_filter.h"
+#include <mutex>
+// Constants
+const int MOTOR_COUNT_PER_PORT = 3;  // Number of motors per CAN port
+// Legs-only build: 3 AK60 leg motors live on a single SocketCAN bus (can0),
+// driven from the Jetson via a USB-CAN adapter. Wheel motors (added later)
+// belong on a SEPARATE bus / controller, not here.
+const int CAN_PORT_COUNT = 1;        // Number of CAN ports (legs-only -> 1)
+const int TOTAL_MOTORS = MOTOR_COUNT_PER_PORT * CAN_PORT_COUNT;  // Total motors
+const int LOOP_FREQ = 1000;          // 1000Hz control loop
+const float Kp = 5.0;               // Proportional gain
+const float Kd = 0.5;               // Derivative gain
+const float T_ff = 0.0;             // Feedforward torque (optional)
+
+class AK60Controller {
+private:
+    std::vector<canChannel> can_ports;
+    std::vector<float> target_positions;
+    std::vector<float> motor_states;
+    std::vector<float> target_vel;
+    std::vector<float> pos_gain;
+    std::vector<float> vel_gain;
+    std::vector<float> tau_ff;
+    std::vector<float> position_offsets;
+    int history_size = 5;
+    std::vector<std::vector<float>> dof_vel_history;  // History of velocities for each DOF
+    std::vector<float> dof_vel_history_weight = {0.06,0.25,0.38,0.25,0.06};
+    std::chrono::high_resolution_clock::time_point loop_start;
+    
+    // ========== Velocity Estimation ==========
+    // Strategy: Motor-reported velocity is noisy/quantized. 
+    // We use a Kalman Filter to fuse encoder position and finite-difference velocity.
+    KalmanFilter3D* kalman_filter;
+    enum FilterType { FILTER_NONE, FILTER_KALMAN, FILTER_EWMA } filter_type = FILTER_KALMAN;
+    
+    // Legacy / Fallback manual estimation state
+    float dt = 0.001f;  // nominal 1ms @ 1000Hz
+    float dq_cutoff_hz = 50.0f;  // default cutoff (Hz).
+    float dt_prev = 0.001f;
+    bool dt_prev_initialized = false;
+    std::vector<float> motor_pos_prev;   // q[k-1]
+    std::vector<float> motor_pos_prev2;  // q[k-2]
+    std::vector<bool> filter_initialized;
+    std::vector<bool> prev2_initialized;
+    std::vector<float> motor_vel_ewma;   // for EWMA mode
+    float forgetting_factor = 0.95f;     // for EWMA mode
+    
+    std::chrono::high_resolution_clock::time_point vel_last_ts;
+    bool vel_last_ts_initialized = false;
+    
+    // Motor state buffer: [pos, vel, torque] for each motor
+    // Indexed as: motor_states[motor_id * 3 + state_index]
+    // where motor_id goes from 0 to TOTAL_MOTORS-1
+    // and state_index: 0=position, 1=velocity, 2=torque
+
+public:
+    AK60Controller();
+    ~AK60Controller();
+    
+    // Set target position for a specific motor
+    void setMotorParams(int motor_id, float position, float velocity, float tau, float kp, float kd);
+    void getAllMotorState(std::vector<float>& pos, std::vector<float>& vel, std::vector<float>& tau);
+    // Get motor state (position, velocity, torque)
+    void getMotorState(int motor_id, float& position, float& velocity, float& torque);
+    
+    void setPositionOffset(int motor_id, float offset);
+    void setAllPositionOffsets(float offset);
+    
+
+    // Update motor states from CAN data
+    void updateMotorStates();
+    
+    // Send motor commands to all motors
+    void sendMotorCommands();
+    
+    // Main control loop
+    void runControlLoop();
+
+    // MIT mode control loop
+    void runControlLoopMIT();
+    void sendMotorCommandsMIT();
+    // Alternative: run control loop for a specified number of iterations
+    void runControlLoop(int iterations);
+
+    void enableMotors();
+    void disableMotors();
+    void setZero();
+    
+    std::mutex motor_mutex;  // Mutex for thread-safe access to motor states and commands
+
+};
+
+#endif // HOPPER_CONTROLLER_H 

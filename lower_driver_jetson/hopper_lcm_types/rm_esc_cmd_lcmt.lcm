@@ -1,0 +1,6 @@
+struct rm_esc_cmd_lcmt {
+    int64_t timestamp;
+    // Per-ESC current command for DJI C610 (M2006), CAN IDs 1..3.
+    // Raw protocol units: -10000..10000 -> -10..+10 A.
+    int16_t current_raw[3];
+}

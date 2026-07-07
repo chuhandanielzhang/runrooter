@@ -1,0 +1,8 @@
+struct jetson_power_lcmt {
+    int64_t timestamp;   // us since epoch
+    float   vin_v;       // input rail voltage (V), latest sample
+    float   iin_a;       // input rail current (A), latest sample
+    float   pin_w;       // input rail power (W), latest sample
+    float   vin_min_v;   // MIN voltage seen since previous publish (dip detector)
+    float   vin_max_v;   // MAX voltage seen since previous publish
+}

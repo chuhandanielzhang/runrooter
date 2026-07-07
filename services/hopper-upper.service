@@ -1,0 +1,26 @@
+[Unit]
+Description=Hopper upper-layer controller (ModeE, 500Hz, LCM)
+# Upper layer runs on the Jetson next to hopper-driver; PC is only the launcher.
+After=hopper-driver.service
+Wants=hopper-driver.service
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/home/nvidia/hopper_upper/hopper_controller
+# Single-threaded BLAS: the controller only does tiny 3x3 math; multithreaded
+# OpenBLAS on ARM adds huge sync overhead (measured: 305% CPU and the 500Hz
+# loop dropping to ~170Hz). One thread is much faster here.
+Environment=OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+# Skip numpy's __array_function__ dispatch layer (numpy 1.23 on the Jetson):
+# pure-overhead for plain ndarray code, worth ~0.2ms per 500Hz control step.
+Environment=NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+ExecStart=/usr/bin/python3 -u run_modee.py --tau-max 1
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=70
+# Do NOT auto-restart: if the controller dies mid-hop we want the driver's
+# remote-DAMP/OFF behavior, not a surprise re-arm.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+struct hopper_cmd_lcmt {
+    float tau_ff[3];
+    float q_des[3];
+    float qd_des[3];
+    float kp_joint[3];
+    float kd_joint[3];
+    // RM M2006/C610 torque-current command (A, -10..+10). Leg-class safety:
+    // the Jetson driver forwards this to the Pixhawk ONLY in PD/PWMPD mode
+    // (gamepad X arms, B stops); every other mode streams 0 A.
+    float rm_iq_des[3];
+    // RM re-zero trigger: on a 0->nonzero edge the Jetson driver latches the
+    // CURRENT RM shaft position as the new zero (hopper_data_lcmt.rm_q reads 0
+    // there). Same effect as the gamepad SET_ZERO combo, but RM-only.
+    int8_t rm_set_zero;
+}

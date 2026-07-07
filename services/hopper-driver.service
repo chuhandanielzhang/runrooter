@@ -1,0 +1,15 @@
+[Unit]
+Description=Hopper leg motor driver (AK60 via CAN)
+After=canable.service
+Requires=canable.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nvidia/Hopper_srbRL
+ExecStart=/home/nvidia/Hopper_srbRL/build/hopper_driver
+# Runs as root (CAN access / realtime), same as the old `sudo ./build/hopper_driver`.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+[Unit]
+Description=PX4 DDS <-> LCM bridge (Hopper: IMU downlink + prop uplink over TELEM2)
+After=network-online.target xrce-agent.service
+Wants=network-online.target
+Requires=xrce-agent.service
+
+[Service]
+Type=simple
+User=nvidia
+Group=dialout
+Environment=HOME=/home/nvidia
+WorkingDirectory=/home/nvidia/Hopper_srbRL/pixhawk
+# "Plan B": this bridge now carries BOTH directions over the single TELEM2/DDS UART:
+#   down: vehicle_attitude + sensor_combined -> hopper_imu_lcmt (500Hz)
+#   up:   motor_pwm_lcmt -> VehicleCommand DO_SET_ACTUATOR @250Hz (props)
+# The USB MAVLink prop bridge (px4-bridge.service) is retired; USB = debug only.
+# Launcher auto-passes --no-imu when an Lpms (/dev/ttyUSB*) owns hopper_imu_lcmt.
+ExecStart=/bin/bash /home/nvidia/Hopper_srbRL/pixhawk/run_px4_dds_bridge.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

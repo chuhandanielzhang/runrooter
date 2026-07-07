@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+upper_controller_pc/hopper_controller/logs/
+build/

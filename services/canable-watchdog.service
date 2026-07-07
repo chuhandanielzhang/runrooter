@@ -1,0 +1,12 @@
+[Unit]
+Description=Watchdog: auto-heal slcan bridge (zombie slcand / stale can0 / driver rebind)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/canable_watchdog.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

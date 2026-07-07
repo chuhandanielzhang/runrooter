@@ -1,0 +1,18 @@
+[Unit]
+Description=Jetson input-rail voltage monitor -> LCM (jetson_power_lcmt)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+Environment=HOME=/home/nvidia
+WorkingDirectory=/home/nvidia/Hopper_srbRL/pixhawk
+# Samples the INA3221 VDD_IN rail at 100Hz (catches brownout dips), publishes
+# 10Hz to lcm-spy with min/max voltage seen in each window.
+ExecStart=/usr/bin/python3 /home/nvidia/Hopper_srbRL/pixhawk/jetson_power_monitor.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

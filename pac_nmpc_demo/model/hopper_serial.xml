@@ -1,0 +1,214 @@
+<!-- Hopper Serial Equivalent Leg Model for MuJoCo -->
+<!-- 
+  基于 Hopper_rl_t-master/resources/robots/hopper/urdf/hopper.urdf 转换
+  使用原始 STL mesh 文件，保持与真机一致的几何外观
+  
+  参考论文：串联等效腿（Roll/Pitch/Shift）用于仿真，通过 Jacobian 映射到真实 3-RSR
+  
+  关节结构：
+  - Leg_Joint_Roll: 绕 X 轴旋转（髋关节侧倾）
+  - Leg_Joint_Pitch: 绕 Y 轴旋转（髋关节俯仰）
+  - Leg_Joint_Shift: 沿 Z 轴平移（腿伸缩）
+  
+  参数来源：
+  - 几何：原始 URDF + STL mesh
+  - 质量：hopper_config.py m=3.75 kg
+  - 惯量：原始 URDF 中的惯量参数
+-->
+<mujoco model="hopper_serial">
+  <compiler angle="radian" meshdir="meshes"/>
+  
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="RK4">
+    <flag warmstart="enable"/>
+  </option>
+  
+  <visual>
+    <global offwidth="2048" offheight="2048"/>
+  </visual>
+  
+  <default>
+    <joint armature="0.01" damping="0.1" limited="true"/>
+    <geom contype="1" conaffinity="1" friction="0.3 0.005 0.0001"/>
+    <motor ctrllimited="true"/>
+  </default>
+  
+  <asset>
+    <!-- 背景和地面纹理 -->
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="512"/>
+    <texture name="plane_tex" type="2d" builtin="checker" rgb1="0.2 0.2 0.2" rgb2="0.3 0.3 0.3" width="512" height="512"/>
+    <material name="plane_mat" texture="plane_tex" texrepeat="5 5" reflectance="0.1"/>
+    
+    <!-- 机器人材质 -->
+    <material name="body_mat" rgba="0.9 0.9 0.9 1"/>
+    <material name="leg_mat" rgba="0.7 0.7 0.7 1"/>
+    <material name="foot_mat" rgba="0.8 0.2 0.2 1"/>
+    <material name="prop_arm_mat" rgba="0.2 0.2 0.2 1"/>
+    <!-- Propeller colors: each arm has a coaxial pair (top/bottom) -->
+    <!-- Arm 0 = RED, Arm 1 = GREEN, Arm 2 = BLUE -->
+    <material name="prop_disc_0a_mat" rgba="1.0 0.1 0.1 0.90"/>
+    <material name="prop_disc_0b_mat" rgba="1.0 0.1 0.1 0.55"/>
+    <material name="prop_disc_1a_mat" rgba="0.1 0.9 0.1 0.90"/>
+    <material name="prop_disc_1b_mat" rgba="0.1 0.9 0.1 0.55"/>
+    <material name="prop_disc_2a_mat" rgba="0.1 0.3 1.0 0.90"/>
+    <material name="prop_disc_2b_mat" rgba="0.1 0.3 1.0 0.55"/>
+    
+    <!-- 原始 STL mesh 文件 -->
+    <mesh name="base_link_mesh" file="base_link.STL"/>
+    <mesh name="leg_link_mesh" file="Leg_Link.STL"/>
+    <mesh name="foot_link_mesh" file="Foot_Link.STL"/>
+  </asset>
+  
+  <worldbody>
+    <!-- Ground plane -->
+    <geom name="ground" type="plane" size="10 10 0.1" material="plane_mat"/>
+    
+    <!-- Robot base (floating) -->
+    <!-- 初始高度 0.5m，让机器人能够触地开始跳跃 -->
+    <body name="base_link" pos="0 0 0.5">
+      <freejoint name="root"/>
+      
+      <!-- IMU site on base -->
+      <site name="imu_site" pos="0 0 0" size="0.01"/>
+      
+      <!-- Base inertial properties (exactly from Hopper URDF) -->
+      <inertial pos="-0.000332 0.000002 -0.023132" mass="3.18465395566096"
+                fullinertia="0.02968509170266737 0.02968661943360321 0.05848026897029721 3.047646006465994e-05 2.715256294854543e-06 4.306334498444407e-08"/>
+      
+      <!-- Base visual (使用原始 STL mesh) -->
+      <geom name="base_visual" type="mesh" mesh="base_link_mesh" 
+            material="body_mat" contype="0" conaffinity="0"/>
+      
+      <!-- Base collision (简化为圆柱体，提高仿真稳定性) -->
+      <geom name="base_collision" type="cylinder" size="0.15 0.05" pos="0 0 0" 
+            rgba="0 0 0 0"/>
+
+      <!-- ========== Propeller arms (visual only) ========== -->
+      <!-- 三个对称布置的扶臂，与 Hopper4 中的三旋翼等效 -->
+      <!-- Prop 0 = RED (y+), Prop 1 = GREEN (x+,y-), Prop 2 = BLUE (x-,y-) -->
+      <geom name="prop_arm_0" type="capsule" fromto="0 0 0 0.000317 0.569451 0"
+            size="0.012" material="prop_arm_mat" contype="0" conaffinity="0"/>
+      <geom name="prop_arm_1" type="capsule" fromto="0 0 0 0.493317 -0.284451 0"
+            size="0.012" material="prop_arm_mat" contype="0" conaffinity="0"/>
+      <geom name="prop_arm_2" type="capsule" fromto="0 0 0 -0.493634 -0.285 0"
+            size="0.012" material="prop_arm_mat" contype="0" conaffinity="0"/>
+
+      <!-- ========== Propeller discs (visual placeholders) ========== -->
+      <!-- Coaxial pairs (top/bottom) at each arm tip -->
+      <!-- Arm 0 -->
+      <geom name="prop_disc_0a" type="cylinder" size="0.08 0.008"
+            pos="0.000317 0.569451 0.030" material="prop_disc_0a_mat" contype="0" conaffinity="0"/>
+      <geom name="prop_disc_0b" type="cylinder" size="0.08 0.008"
+            pos="0.000317 0.569451 -0.030" material="prop_disc_0b_mat" contype="0" conaffinity="0"/>
+      <!-- Arm 1 -->
+      <geom name="prop_disc_1a" type="cylinder" size="0.08 0.008"
+            pos="0.493317 -0.284451 0.030" material="prop_disc_1a_mat" contype="0" conaffinity="0"/>
+      <geom name="prop_disc_1b" type="cylinder" size="0.08 0.008"
+            pos="0.493317 -0.284451 -0.030" material="prop_disc_1b_mat" contype="0" conaffinity="0"/>
+      <!-- Arm 2 -->
+      <geom name="prop_disc_2a" type="cylinder" size="0.08 0.008"
+            pos="-0.493634 -0.285 0.030" material="prop_disc_2a_mat" contype="0" conaffinity="0"/>
+      <geom name="prop_disc_2b" type="cylinder" size="0.08 0.008"
+            pos="-0.493634 -0.285 -0.030" material="prop_disc_2b_mat" contype="0" conaffinity="0"/>
+
+      <!-- Propeller thrust reference sites (color-matched) -->
+      <site name="prop_site_0" pos="0.000317 0.569451 0" size="0.02" rgba="1.0 0.2 0.2 0.8"/>
+      <site name="prop_site_1" pos="0.493317 -0.284451 0" size="0.02" rgba="0.2 1.0 0.2 0.8"/>
+      <site name="prop_site_2" pos="-0.493634 -0.285 0" size="0.02" rgba="0.2 0.4 1.0 0.8"/>
+      
+      <!-- Hip joint: Roll (around X axis) -->
+      <!-- 从 URDF: origin xyz="0 0 -0.0416" -->
+      <body name="base_roll_link" pos="0 0 -0.0416">
+        <inertial pos="0 0 0" mass="0.06" diaginertia="9.6e-6 9.6e-6 9.6e-6"/>
+        <joint name="Leg_Joint_Roll" type="hinge" axis="1 0 0" 
+               range="-1.0 1.0" damping="0.5"/>
+        <geom name="roll_geom" type="sphere" size="0.015" rgba="0.3 0.3 0.3 1"/>
+        
+        <!-- Pitch joint (around Y axis) -->
+        <body name="roll_pitch_link" pos="0 0 0">
+          <inertial pos="0 0 0" mass="0.06" diaginertia="9.6e-6 9.6e-6 9.6e-6"/>
+          <joint name="Leg_Joint_Pitch" type="hinge" axis="0 1 0" 
+                 range="-1.0 1.0" damping="0.5"/>
+          <geom name="pitch_geom" type="sphere" size="0.015" rgba="0.3 0.3 0.3 1"/>
+          
+          <!-- pitch_leg_link (与 URDF 一致，添加中间链接) -->
+          <body name="pitch_leg_link" pos="0 0 0">
+            <inertial pos="0 0 0" mass="0.06" diaginertia="9.6e-6 9.6e-6 9.6e-6"/>
+            <geom name="pitch_leg_geom" type="sphere" size="0.015" rgba="0.3 0.3 0.3 1"/>
+            
+            <!-- Prismatic joint: Leg extension (与 URDF 完全一致) -->
+            <body name="Leg_Link" pos="0 0 0">
+              <!-- 从 URDF: mass=0.376991118430775 kg, inertia -->
+              <inertial pos="0 0 -0.2837" mass="0.376991118430775" 
+                        diaginertia="0.00724058566836107 0.00724058566836107 4.71238898038469e-06"/>
+              <!-- Shift 关节（与 URDF 完全一致）-->
+              <!-- axis="0 0 1": 正 Z 轴方向 -->
+              <!-- range="0 0.4": shift=0 是最短，shift=0.4 是最长（伸展 40cm）-->
+              <!-- 真机版本：无 MJCF 内置弹簧，弹簧力由代码 virtual spring 实现 -->
+              <joint name="Leg_Joint_Shift" type="slide" axis="0 0 1" 
+                     range="0 0.4" damping="0.1" ref="0"/>
+            
+            <!-- Leg visual (使用原始 STL mesh) -->
+            <geom name="leg_visual" type="mesh" mesh="leg_link_mesh" 
+                  material="leg_mat" contype="0" conaffinity="0"/>
+            
+            <!-- Leg collision: 禁用，避免干扰脚的接触 -->
+            <!-- 原来的圆柱体底端比脚还低，会先撞地 -->
+            <geom name="leg_collision" type="cylinder" size="0.01 0.20" 
+                  pos="0 0 -0.20" contype="0" conaffinity="0" rgba="0 0 0 0"/>
+            
+            <!-- Foot -->
+            <!-- 从 URDF: origin xyz="0 0 -0.5237" -->
+            <body name="Foot_Link" pos="0 0 -0.5237">
+              <!-- 从 URDF: mass=0.00835483868274579 kg -->
+              <inertial pos="0 0 -0.009294" mass="0.00835483868274579"
+                        diaginertia="6.20993807755469e-07 6.21007675260879e-07 9.48701641254357e-07"/>
+              
+              <!-- Foot visual (使用原始 STL mesh) -->
+              <geom name="foot_visual" type="mesh" mesh="foot_link_mesh" 
+                    material="foot_mat" contype="0" conaffinity="0"/>
+              
+              <!-- Foot collision (球体，用于接触检测，完全透明) -->
+              <geom name="foot_collision" type="sphere" size="0.03" 
+                    pos="0 0 -0.015" rgba="0 0 0 0"/>
+              
+              <!-- Foot contact site -->
+              <site name="foot_site" pos="0 0 -0.03" size="0.01"/>
+            </body>
+          </body>
+        </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  
+  <actuator>
+    <!-- Joint actuators (与 Hopper_rl_t-master URDF effort 完全一致) -->
+    <!-- Roll: 20 N·m, Pitch: 20 N·m, Shift: 50 N·m -->
+    <!-- Match RL/hardware torque limits (improves leg authority for SRB force tracking) -->
+    <motor name="roll_motor" joint="Leg_Joint_Roll" gear="1" ctrlrange="-27 27"/>
+    <motor name="pitch_motor" joint="Leg_Joint_Pitch" gear="1" ctrlrange="-27 27"/>
+    <!-- Increased shift actuation range for hopping (was -500..500). -->
+    <motor name="shift_motor" joint="Leg_Joint_Shift" gear="1" ctrlrange="-2500 2500"/>
+
+    <!-- Propeller thruster placeholders（用于可视化/调试） -->
+  </actuator>
+  
+  <sensor>
+    <!-- IMU sensors on base -->
+    <accelerometer name="imu_accel" site="imu_site"/>
+    <gyro name="imu_gyro" site="imu_site"/>
+    <framequat name="imu_quat" objtype="body" objname="base_link"/>
+    
+    <!-- Joint sensors -->
+    <jointpos name="roll_pos" joint="Leg_Joint_Roll"/>
+    <jointpos name="pitch_pos" joint="Leg_Joint_Pitch"/>
+    <jointpos name="shift_pos" joint="Leg_Joint_Shift"/>
+    <jointvel name="roll_vel" joint="Leg_Joint_Roll"/>
+    <jointvel name="pitch_vel" joint="Leg_Joint_Pitch"/>
+    <jointvel name="shift_vel" joint="Leg_Joint_Shift"/>
+    
+    <!-- Foot contact -->
+    <touch name="foot_touch" site="foot_site"/>
+  </sensor>
+  
+</mujoco>

@@ -1,0 +1,5 @@
+struct hopper_data_lcmt {
+    float  q[3];
+    float  qd[3];
+    float  tauIq[3];
+}

@@ -1,0 +1,15 @@
+struct rm_esc_data_lcmt {
+    int64_t timestamp;
+    // Accumulated multi-turn OUTPUT shaft angle (rad; M2006 gear 36:1 applied on FC).
+    float shaft_angle_rad[3];
+    // Output shaft speed (rad/s).
+    float shaft_speed_rad_s[3];
+    // Actual torque current, raw protocol units (-10000..10000 -> -10..+10 A).
+    int16_t current_raw[3];
+    // Rotor speed (rpm, before gearbox).
+    int16_t rpm[3];
+    // Rotor mechanical angle, 0..8191 (single turn, before gearbox).
+    int32_t angle_raw[3];
+    // Bit i set = ESC i+1 feedback seen within the last 100 ms.
+    int8_t online_mask;
+}

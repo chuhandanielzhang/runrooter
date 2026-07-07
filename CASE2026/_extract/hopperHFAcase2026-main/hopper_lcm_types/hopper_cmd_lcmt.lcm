@@ -1,0 +1,7 @@
+struct hopper_cmd_lcmt {
+    float tau_ff[3];
+    float q_des[3];
+    float qd_des[3];
+    float kp_joint[3];
+    float kd_joint[3];
+}

@@ -1,0 +1,12 @@
+# CANable2 (slcan firmware, CDC-ACM tty) -> stable name + systemd device unit.
+#
+# Why: /dev/ttyACM* renumbers on every USB re-enumeration, and slcand keeps the
+# DEAD old tty open forever ("can0 up but zero frames"). This rule gives the
+# adapter a stable /dev/canable symlink AND a systemd device unit
+# (dev-canable.device via SYSTEMD_ALIAS), so canable.service can use
+# BindsTo=dev-canable.device: unplug/re-enumerate -> systemd kills the zombie
+# slcand; device back -> the device unit's Wants pulls the service up again.
+#
+# Match by ID_SERIAL (contains "CANable2") instead of VID:PID so a firmware
+# update or replacement unit keeps working. Install to /etc/udev/rules.d/.
+SUBSYSTEM=="tty", ENV{ID_SERIAL}=="*CANable2*", SYMLINK+="canable", TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/canable"

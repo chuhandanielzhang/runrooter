@@ -1,0 +1,9 @@
+struct motor_pwm_lcmt {
+    int64_t timestamp;
+    float pwm_values[6];  // 修改为6个PWM通道
+    float roll_error;
+    float pitch_error;
+    float roll_output;
+    float pitch_output;
+    int32_t control_mode;
+}

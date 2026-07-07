@@ -1,0 +1,34 @@
+[Unit]
+Description=CANable slcan bridge as can0 (legs AK60 bus, 1Mbit)
+# Lifecycle is BOUND to the USB device (dev-canable.device comes from
+# 99-canable.rules). This fixes the "slcan dies once and never comes back":
+#   USB glitch -> tty re-enumerates -> device unit drops -> BindsTo STOPS the
+#   zombie slcand -> device unit returns -> its Wants (from `systemctl enable`,
+#   see [Install]) starts us again with the fresh tty.
+# The old unit could not self-heal: slcand never exits when its tty dies, so
+# Restart=on-failure never fired and can0 stayed "up" carrying zero frames.
+BindsTo=dev-canable.device
+After=dev-canable.device
+# Never give up retrying (belongs in [Unit], not [Service]).
+StartLimitIntervalSec=0
+
+[Service]
+Type=forking
+# First boot: the built-in mttcan registers as "can0"; rename it away so slcan
+# can own the name (harmless '-' failures on later restarts).
+ExecStartPre=-/sbin/ip link set can0 down
+ExecStartPre=-/sbin/ip link set can0 name mtt0
+# /dev/canable = stable udev symlink (never a stale ttyACM number).
+ExecStart=/usr/bin/slcand -o -s8 /dev/canable can0
+ExecStartPost=/bin/sleep 1
+ExecStartPost=/sbin/ip link set can0 up
+ExecStartPost=/sbin/ip link set can0 txqueuelen 65536
+# slcand crash with device still present -> plain restart. Never give up.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+# Enable creates dev-canable.device.wants/canable.service: plugging the adapter
+# (or its reappearance after a glitch) auto-starts the bridge. Keep
+# multi-user.target too so boot ordering works when the device is already there.
+WantedBy=dev-canable.device multi-user.target
