@@ -847,8 +847,40 @@ class ModeEConfig:
     # ===== Control mode switch =====
     # 1 = pure_leg:          closed-form leg, propellers OFF (stance & flight)
     # 2 = decouple_leg_prop: closed-form leg + lstsq prop overlay (stance & flight)
-    # 3 = alias of 2 (legacy unified_qp flag; WBC-QP removed)
+    # 3 = MODE 3 (2026-07-07): same leg/prop pipeline as 2, but the flight foot
+    #     placement is replaced by the HLIP step-to-step (S2S) discrete control
+    #     law (see the "Mode 3" config block below). The Raibert kv/kr gains are
+    #     NOT used in mode 3 -- the placement gain is DERIVED each hop from the
+    #     measured stance duration and pivot height (closed form, no tuning).
     control_mode: int = 2
+
+    # ===== Mode 3: HLIP S2S foot placement (2026-07-07) =====
+    # Model: stance = Linear Inverted Pendulum (LIP) about the foot pivot,
+    # flight = ballistic (XY momentum conserved). The step-to-step dynamics of
+    # the horizontal velocity at touchdown are then EXACTLY (per axis):
+    #     v[k+1] = cosh(lam*Ts) * v[k] - lam*sinh(lam*Ts) * u[k]
+    # with lam = sqrt(g/z0), Ts = stance duration, z0 = pivot (CoM) height, and
+    # u = horizontal foot offset ahead of the CoM at touchdown. Placing the
+    # closed-loop S2S pole at beta (v_err[k+1] = beta * v_err[k]) gives the
+    # closed-form placement law used in flight:
+    #     u = [ (cosh(lam*Ts) - beta) * v  -  (1 - beta) * v_des ] / (lam*sinh(lam*Ts))
+    # Notes:
+    # - beta = 0 is DEADBEAT (kill all velocity error in one hop); beta in
+    #   (0,1) trades convergence speed for robustness to velocity-estimate
+    #   noise (each hop removes (1-beta) of the error). This is the ONLY free
+    #   parameter and it is a pole location, not a gain to hand-tune.
+    # - The steady-state term reduces to the classic Raibert neutral point
+    #   u_ss = v*Ts/2 for small lam*Ts, and the feedback gain
+    #   (cosh-beta)/(lam*sinh) evaluates to ~0.2 for this robot's measured
+    #   Ts~0.25s / z0~0.35m -- consistent with the hand-tuned flight_kv=0.15,
+    #   which is why mode 2 "almost" works; mode 3 keeps the gain matched to
+    #   the ACTUAL measured timing every hop instead of freezing it.
+    # - Ts and z0 are MEASURED online (EMA over hops, seeded on the first
+    #   completed stance). Until the first stance completes, mode 3 falls back
+    #   to the mode-2 Raibert law.
+    s2s_pole_beta: float = 0.2
+    # Print the derived S2S quantities (Ts, z0, gain) once per hop at liftoff.
+    s2s_print_debug: bool = True
 
     # ===== Stance phase attitude control (SRB SO(3) PD) =====
     # SRB approach: compute Tau_des = -kR*e_R - kW*omega in body frame, then let QP
@@ -1168,6 +1200,16 @@ class ModeECore:
         self._z_apex_actual: float = float("nan")  # last measured apex h (m, for log)
         self._apex_err_last: float = float("nan")  # last apex error (m, for log)
 
+        # Mode 3 (HLIP S2S) measured hybrid-model quantities, updated every hop:
+        # Ts = last measured stance duration (s), z0 = mean pivot (base) height
+        # over that stance (m). NaN until the first complete stance -> mode 3
+        # falls back to the Raibert law until both are measured.
+        self._s2s_ts_meas: float = float("nan")
+        self._s2s_z0_meas: float = float("nan")
+        self._s2s_z0_acc: float = 0.0     # per-stance pivot-height accumulator
+        self._s2s_z0_cnt: int = 0
+        self._s2s_gain_dbg: float = float("nan")  # last applied placement gain (log)
+
         # stance reference profile (unified stance: soft landing + push-off, no discrete COMP/PUSH switching)
         self._stance_prof_inited = False
         self._stance_t_comp: float | None = None
@@ -1315,6 +1357,11 @@ class ModeECore:
         self._apex_fb_int = float(getattr(self.cfg, "apex_fb_int_init", 0.0))
         self._z_apex_actual = float("nan")
         self._apex_err_last = float("nan")
+        self._s2s_ts_meas = float("nan")
+        self._s2s_z0_meas = float("nan")
+        self._s2s_z0_acc = 0.0
+        self._s2s_z0_cnt = 0
+        self._s2s_gain_dbg = float("nan")
         self._f_ref_z_prev = 0.0
         self._f_ref_xy_prev[:] = 0.0
         self._mpc_omega_lpf[:] = 0.0
@@ -2198,6 +2245,11 @@ class ModeECore:
                 self._z_hat_contact_filt = float(z_td_est)
                 self._p_hat_w[2] = float(z_td_est)
 
+                # Mode 3 (HLIP S2S): start the per-stance pivot-height average
+                # with the touchdown sample (height of the base above the foot).
+                self._s2s_z0_acc = float(z_td_est)
+                self._s2s_z0_cnt = 1
+
                 # Takeoff speed target for desired apex (ballistic, with prop assist).
                 # z_thrust_w points UP (level: [0,0,-1] in the +Z-down world), so the
                 # baseline prop thrust REDUCES effective gravity: g_eff = g*(1 - rho).
@@ -2234,6 +2286,12 @@ class ModeECore:
         if bool(self._stance) and np.isfinite(float(q_shift)):
             td_t = float(self._td_t) if self._td_t is not None else float(self.sim_time)
             t_in_stance = float(self.sim_time) - td_t
+            # Mode 3 (HLIP S2S): accumulate the pivot height every stance tick
+            # (mean over the stance -> z0 of the LIP model).
+            h_pivot = -float((np.asarray(R_wb_hat, dtype=float).reshape(3, 3) @ foot_b.reshape(3))[2])
+            if np.isfinite(h_pivot) and (h_pivot > 0.05):
+                self._s2s_z0_acc += float(h_pivot)
+                self._s2s_z0_cnt += 1
             cond_lo = (float(q_shift) >= lo_thr) and (t_in_stance >= phase_min_t)
             # No-prop mode: do not leave stance with large roll/pitch rates.
             # This prevents "looks balanced in stance but falls in flight" failures.
@@ -2258,6 +2316,17 @@ class ModeECore:
                 self._stance = False
                 self._lo_t = float(self.sim_time)
                 self._lo_debounce_count = 0
+                # Mode 3 (HLIP S2S): latch the measured hybrid-model quantities.
+                # Ts = this stance's duration; z0 = mean pivot height over it.
+                self._s2s_ts_meas = float(t_in_stance)
+                if int(self._s2s_z0_cnt) > 0:
+                    self._s2s_z0_meas = float(self._s2s_z0_acc) / float(self._s2s_z0_cnt)
+                if int(self.cfg.control_mode) == 3 and bool(getattr(self.cfg, "s2s_print_debug", True)):
+                    lam_dbg = float(np.sqrt(self.gravity / max(0.05, float(self._s2s_z0_meas)))) \
+                        if np.isfinite(float(self._s2s_z0_meas)) else float("nan")
+                    print("[s2s] LO: Ts=%.3fs z0=%.3fm lam=%.2f -> gain=%.3f (beta=%.2f)"
+                          % (float(self._s2s_ts_meas), float(self._s2s_z0_meas), lam_dbg,
+                             float(self._s2s_gain_dbg), float(getattr(self.cfg, "s2s_pole_beta", 0.2))))
                 # ---- Horizontal takeoff velocity for the Raibert flight target ----
                 # Preferred: push-phase LINEAR FIT extrapolated to t_LO (smooth,
                 # no mean-lag). Fallbacks: push-phase mean, then instantaneous.
@@ -3076,10 +3145,30 @@ class ModeECore:
             kv = float(self.cfg.flight_kv)
             kr = float(self.cfg.flight_kr)
             step_lim = float(abs(float(self.cfg.flight_stepper_lim_m)))
-            target_xy_w = (
-                kv * np.array([float(self._v_hat_w[0]), float(self._v_hat_w[1])], dtype=float)
-                + kr * np.array([float(desired_v_xy_w[0]), float(desired_v_xy_w[1])], dtype=float)
+            v_xy_w = np.array([float(self._v_hat_w[0]), float(self._v_hat_w[1])], dtype=float)
+            vdes_xy_w = np.array([float(desired_v_xy_w[0]), float(desired_v_xy_w[1])], dtype=float)
+            use_s2s = (
+                int(self.cfg.control_mode) == 3
+                and np.isfinite(float(self._s2s_ts_meas)) and float(self._s2s_ts_meas) > 0.02
+                and np.isfinite(float(self._s2s_z0_meas)) and float(self._s2s_z0_meas) > 0.05
             )
+            if use_s2s:
+                # Mode 3: HLIP S2S placement (see the Mode 3 config block).
+                #   u = [(cosh(lam*Ts) - beta)*v - (1-beta)*v_des] / (lam*sinh(lam*Ts))
+                # u > 0 places the foot AHEAD of the CoM along +v (decelerates),
+                # exactly the same convention as the Raibert kv*v term.
+                lam = float(np.sqrt(self.gravity / float(self._s2s_z0_meas)))
+                lam_ts = float(np.clip(lam * float(self._s2s_ts_meas), 1e-3, 6.0))
+                beta = float(np.clip(float(getattr(self.cfg, "s2s_pole_beta", 0.2)), 0.0, 0.99))
+                denom = float(lam * np.sinh(lam_ts))
+                gain_v = float((np.cosh(lam_ts) - beta) / denom)
+                gain_vdes = float((1.0 - beta) / denom)
+                self._s2s_gain_dbg = gain_v
+                target_xy_w = (gain_v * v_xy_w - gain_vdes * vdes_xy_w).astype(float)
+            else:
+                # Mode 1/2 (or mode 3 before the first measured stance):
+                # classic Raibert with hand-tuned kv/kr.
+                target_xy_w = (kv * v_xy_w + kr * vdes_xy_w).astype(float)
             if bool(self.cfg.mode_1d):
                 target_xy_w[0] = 0.0
                 target_xy_w[1] = 0.0
@@ -3459,6 +3548,10 @@ class ModeECore:
             # and the current integrator boost added to the energy target.
             "z_apex_actual_m": float(self._z_apex_actual),
             "apex_err_int": float(self._apex_fb_int),
+            # Mode 3 (HLIP S2S) measured model + applied gain (NaN in mode 2)
+            "s2s_ts_s": float(self._s2s_ts_meas),
+            "s2s_z0_m": float(self._s2s_z0_meas),
+            "s2s_gain": float(self._s2s_gain_dbg),
             # Falling cat debug (recovery gating)
             # MPC debug
             "mpc_status": mpc_status,

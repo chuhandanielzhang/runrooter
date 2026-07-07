@@ -42,9 +42,13 @@ from modee.controllers.motor_utils import MotorTableModel  # type: ignore
 XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "three_leg_3rsr_closed.xml")
 
 # ---- calibration (see _modee_calib.py output, 2026-07-04) ----
+# NOTE: the 3-RSR leg has C3 (120 deg) symmetry, so the FK-deflection calibration
+# admits THREE equivalent (PERM, yaw) branches. Only one is consistent with the
+# FIXED IMU yaw below; the touchdown-direction probe selects it (MFR_PERM_BRANCH).
 HOME_SIM = -0.060299
 Q0_LCM = 0.0900
-PERM = (0, 2, 1)          # lcm motor i <- sim hip joint PERM[i]
+_PERM_BRANCHES = ((0, 2, 1), (1, 0, 2), (2, 1, 0))  # C3 cyclic relabelings
+PERM = _PERM_BRANCHES[int(os.environ.get("MFR_PERM_BRANCH", "0"))]
 JOINT_SIGN = -1.0
 YAW_FRD = np.deg2rad(90.0)
 
@@ -186,6 +190,8 @@ def main():
     next_gp = next_pub = next_frame = 0.0
     base_zs, taus_log, foot_zs, contacts_log = [], [], [], []
     t_wall0 = time.time()
+    prev_contact = False
+    td_events = []  # (t, v_xy_sim, foot_offset_xy_sim) at each touchdown
 
     while sim_t < args.duration_s:
         for _ in range(16):
@@ -284,7 +290,23 @@ def main():
         base_zs.append(d.qpos[2])
         taus_log.append(np.abs(tau_sim).max())
         foot_zs.append(d.qpos[21])
-        contacts_log.append(1.0 if d.sensordata[-1] > 1e-6 else 0.0)
+        in_contact = d.sensordata[-1] > 1e-6
+        contacts_log.append(1.0 if in_contact else 0.0)
+
+        # Raibert direction probe: at touchdown, does the foot land AHEAD of the
+        # hip along the velocity (braking, correct) or BEHIND (accelerating, flipped)?
+        if in_contact and not prev_contact and sim_t > args.drop_start_s:
+            v_xy = np.array([d.qvel[0], d.qvel[1]])
+            foot_off = np.array([d.qpos[19] - d.qpos[0], d.qpos[20] - d.qpos[1]])
+            td_events.append((sim_t, v_xy.copy(), foot_off.copy()))
+            vn = float(np.linalg.norm(v_xy))
+            if vn > 0.03:
+                dot = float(v_xy @ foot_off) / vn
+                print(f"[TD] t={sim_t:5.2f} v_xy_sim=[{v_xy[0]:+.2f},{v_xy[1]:+.2f}] "
+                      f"foot_off_sim=[{foot_off[0]:+.3f},{foot_off[1]:+.3f}] "
+                      f"along_v={dot:+.3f} m ({'BRAKE ok' if dot > 0 else 'REVERSED'})",
+                      flush=True)
+        prev_contact = in_contact
 
         if args.print_roll and int(sim_t / dt) % int(0.2 / dt) == 0:
             R_dbg = quat_to_R(d.qpos[3:7])

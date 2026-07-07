@@ -6,7 +6,7 @@ pkill -9 -f modee_fake_robot 2>/dev/null
 pkill -9 -f run_cao_on_our_model 2>/dev/null
 sleep 0.5
 
-FAKE_TAU=${FAKE_TAU:-25} python3 -u modee_fake_robot.py --duration-s ${DUR:-15} --drop-start-s 1.5 \
+FAKE_TAU=${FAKE_TAU:-25} MFR_PERM_BRANCH=${MFR_PERM_BRANCH:-0} python3 -u modee_fake_robot.py --duration-s ${DUR:-15} --drop-start-s 1.5 \
   --record-gif "${GIF:-/tmp/modee_on_sim.gif}" > /tmp/mfr.log 2>&1 &
 MJ=$!
 sleep 2
