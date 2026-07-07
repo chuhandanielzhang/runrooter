@@ -468,7 +468,7 @@ class ModeEConfig:
     # use the CAN-reported qd carried in hopper_data_lcmt.qd (the Jetson driver
     # now publishes the AK60 internal velocity estimate); the upper layer does
     # NOT differentiate q itself. Set True to go back to PC-side dq/dt.
-    qd_kin_from_q_diff: bool = True
+    qd_kin_from_q_diff: bool = False
     # Low-pass on q_shift / qd_shift used for touchdown/liftoff detection (seconds). Set <=0 to disable.
     q_shift_lpf_tau: float = 0.005
     qd_shift_lpf_tau: float = 0.005
@@ -567,7 +567,7 @@ class ModeEConfig:
 
     # ===== Flight foot placement =====
     # Raibert (Kv/Kr) in WORLD (+Z down), then foot_des_b = R_wb^T @ target_w (quaternion).
-    flight_kv: float = 0.10
+    flight_kv: float = 0.15
     flight_kr: float = 0.0
     # If you see "摆腿太小" (world/heading XY step is small), increase this cap first.
     flight_stepper_lim_m: float = 0.2
@@ -821,9 +821,9 @@ class ModeEConfig:
     # direct channel / higher prop idle), NOT because 60 is "enough" but
     # because anything higher self-oscillates and destabilizes the hops.
     flight_kR_roll: float = 90.0
-    flight_kW_roll: float = 15.0
+    flight_kW_roll: float = 35.0
     flight_kR_pitch: float = 90.0
-    flight_kW_pitch: float = 15.0
+    flight_kW_pitch: float = 35.0
     flight_tau_rp_max: float = 25.0
 
     # ===== Flight velocity -> attitude tilt (Raibert-style pull-back) =====
@@ -874,8 +874,8 @@ class ModeEConfig:
     # User-tuned values (2026-07-05: keep these, do NOT bulk-restore CASE).
     stance_kpp_x: float = 23.0    # leg stance kR roll
     stance_kpp_y: float = 23.0    # leg stance kR pitch
-    stance_kpd_x: float = 5    # leg stance kW roll
-    stance_kpd_y: float = 5    # leg stance kW pitch
+    stance_kpd_x: float = 3    # leg stance kW roll
+    stance_kpd_y: float = 3    # leg stance kW pitch
     # ===== Stance D-term gyro conditioning: NOTCH + light LPF =====
     # We consume PX4 /fmu/out/sensor_combined = RAW gyro (PX4's own filter
     # pipeline only applies to vehicle_angular_velocity, which is not in the
@@ -890,10 +890,14 @@ class ModeEConfig:
     # (gain 0.95 vs 0.79) -> kpd can be raised without push-phase twitching.
     # Filters run CONTINUOUSLY (flight too) so touchdown sees no warm-up
     # transient. Set notch_hz <= 0 to disable the notch.
+    # 2026-07-07: strengthened per user request -- notch BW 25->32 Hz (covers
+    # ~11-43 Hz, the full measured noise band) and LPF 8->15 ms. Cost: phase
+    # loss at 5 Hz grows back to roughly the old -38 deg level; if the push
+    # phase starts twitching or D feels sluggish, revert to BW 25 / tau 0.008.
     stance_gyro_notch_hz: float = 25.0
-    stance_gyro_notch_bw_hz: float = 25.0
+    stance_gyro_notch_bw_hz: float = 32.0
     # Light first-order LPF after the notch (residual >45 Hz content).
-    stance_gyro_lpf_tau: float = 0.008
+    stance_gyro_lpf_tau: float = 0.015
     stance_tau_rp_max: float = 20.0
 
     # ===== WBC-QP slack weights (stance vs flight) =====

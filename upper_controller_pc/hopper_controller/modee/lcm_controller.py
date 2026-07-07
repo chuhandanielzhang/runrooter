@@ -159,7 +159,7 @@ class ModeELCMConfig:
     # - Setting this > 0 helps reduce flight-phase jitter/oscillation, because it dissipates energy using
     #   the motor's own high-rate velocity estimate (not the Python/Lcm qd).
     # - Applied per-phase (FLIGHT vs STANCE) so you can add a small amount in stance too.
-    ak60_flight_damp_kd: float = 0.01
+    ak60_flight_damp_kd: float = 0.02
     ak60_stance_damp_kd: float = 0.1
 
     # ===== Command shaping / demo mode =====
@@ -310,11 +310,13 @@ class ModeELCMController:
         # RM M2006 desired torque current (A); sent inside every hopper_cmd_lcmt.
         self._rm_iq_des = np.zeros(3, dtype=float)
         # RM sequence: 0 idle (0 A), 1 drive to _rm_target, 2 hold before re-zero.
-        # LT job (-11) starts at the switch-loop start (push end); RT job (+11)
-        # starts at the RT->hopping handoff. B resets to idle.
+        # LT job (-11) starts at the NEXT push end (liftoff edge) after the LT
+        # press; RT job (+11) starts at the RT->hopping handoff. B resets to idle.
         self._rm_stage: int = 0
         self._rm_target: float = 0.0
         self._rm_hold_t0: float = 0.0
+        # LT armed flag: set at the LT press, consumed at the next liftoff edge.
+        self._rm_lt_pending: bool = False
         # rm_set_zero pulse deadline: hopper_cmd_lcmt.rm_set_zero = 1 until then
         # (the Jetson driver latches the new zero on the 0->1 edge).
         self._rm_zero_until: float = 0.0
@@ -352,47 +354,43 @@ class ModeELCMController:
         x_now = bool(getattr(gamepad_msg, "x", 0)) if gamepad_msg is not None else False
         a_now = bool(getattr(gamepad_msg, "a", 0)) if gamepad_msg is not None else False
         start_now = bool(getattr(gamepad_msg, "start", 0)) if gamepad_msg is not None else False
-        # Switch-loop triggers remapped LB/RB -> LT/RT. The driver only fills the analog
-        # trigger fields (leftTriggerAnalog/rightTriggerAnalog in [0,1]), so threshold at 0.5.
+        # LT/RT analog triggers (driver only fills leftTriggerAnalog/rightTriggerAnalog
+        # in [0,1], so threshold at 0.5). 2026-07-07 rework: LT/RT are the RM M2006
+        # job triggers ONLY -- they no longer arm the old LB leg-retraction loop.
+        # (The P1/P2/P3 parking loop code is kept but currently has no button.)
         lb_now = (float(getattr(gamepad_msg, "leftTriggerAnalog", 0.0)) > 0.5) if gamepad_msg is not None else False
         rb_now = (float(getattr(gamepad_msg, "rightTriggerAnalog", 0.0)) > 0.5) if gamepad_msg is not None else False
 
-        # LeftBumper edge toggles the switch/arming loop (3-phase: approach -> continue -> position-settle).
-        # RightBumper edge toggles the SAME loop but also spins props (phase 1/2 ON, phase 3 OFF).
+        # LT = RM job only: pre-zero at the press; the drive to rm_lt_target_rad
+        # (-11) starts at the NEXT push end (liftoff edge, see the main loop).
+        # Legs keep hopping normally -- NO leg retraction.
         if bool(lb_now) and (not bool(self._mode_last_lb)):
-            if bool(self._switch_loop) or bool(self._switch_pending):
-                # LB is ONE-WAY: once armed or running it does nothing. A second LB press must
-                # NOT return to the hopping cycle -- use RB for that (only after LB settles).
-                print("[switch_loop] LB ignored (already armed/active; press RB after it settles to re-enter hopping)")
+            if bool(self._rm_lt_pending) or int(self._rm_stage) != 0:
+                print("[rm] LT ignored (RM job already pending/active)")
             else:
-                # ARM only, and only from the normal hopping cycle. Do NOT start now: the loop
-                # begins on the NEXT flight phase, once the leg has returned to its original
-                # length (|q_shift| <= switch_arm_l0_tol_m). Actual start: _maybe_start_pending_switch.
-                self._switch_pending = True
-                self._switch_pending_seen_liftoff = False
-                self._lb_done = False
-                self._hop_prop_base_active = False   # parking again cancels any prop base window
-                # RM pre-zero at the PRESS: by the time the loop starts (next
-                # liftoff / push end) the fresh zero is long latched, so the RM
-                # drive begins exactly at push end with no settling wait.
+                self._rm_lt_pending = True
                 self._rm_prezero("LT press")
-                print("[switch_loop] ARMED (LB, legs only) -> starts at next FLIGHT phase when leg ~ l0 (|q_shift|<=%.3fm)"
-                      % float(getattr(self.lcm_cfg, "switch_arm_l0_tol_m", 0.02)))
+                print("[rm] LT ARMED -> RM drive to %+.1f rad at the NEXT push end (liftoff)"
+                      % float(self.lcm_cfg.rm_lt_target_rad))
         self._mode_last_lb = bool(lb_now)
 
         if bool(rb_now) and (not bool(self._mode_last_rb)):
-            # RT is ONLY valid AFTER the LB retraction has settled (reached P3 -> _lb_done).
-            # RT Phase 4 (2026-07-07 spec): legs position-control to switch_rb_target_rad
-            # (-0.1 rad) capped at switch_rb_tau_max_nm (1 Nm), props forced ON at the
-            # upward baseline switch_rb_prop_base_pwm_us (1100); after switch_rb_pushdelay_s
-            # (2 s) the loop exits into hopping (_enter_hop_from_rb), where ModeE takes
-            # over legs + prop balance and the RM motors start their RT job (+11).
-            if bool(self._switch_loop) and bool(self._lb_done):
+            # RT (2026-07-07 spec, standalone -- no LB parking prerequisite):
+            # legs position-control to switch_rb_target_rad (-0.1 rad) capped at
+            # switch_rb_tau_max_nm (1 Nm), props forced ON at the upward baseline
+            # switch_rb_prop_base_pwm_us (1100); after switch_rb_pushdelay_s (2 s)
+            # exit into hopping (_enter_hop_from_rb), where ModeE takes over
+            # legs + prop balance and the RM motors start their RT job (+11).
+            if bool(self._switch_loop) and int(self._switch_phase) == 4:
+                print("[switch_loop] RT ignored (P4 stand already active)")
+            else:
+                self._switch_loop = True
                 self._switch_phase = 4
                 self._rb_p4_t0 = time.time()
+                self._switch_pending = False
                 self._lb_done = False
                 self._switch_prop = False
-                self._lb_prop_t0 = None   # stop the LB reverse-balance props: P4 owns the props now
+                self._lb_prop_t0 = None   # P4 owns the props now
                 # RM pre-zero at the PRESS: the 2s P4 stand gives the zero plenty
                 # of time to latch before the RT drive starts at hop entry.
                 self._rm_prezero("RT press")
@@ -402,8 +400,6 @@ class ModeELCMController:
                          float(self.lcm_cfg.switch_rb_tau_max_nm),
                          float(self.lcm_cfg.switch_rb_prop_base_pwm_us),
                          float(self.lcm_cfg.switch_rb_pushdelay_s)))
-            else:
-                print("[switch_loop] RT ignored (only valid after the LB retraction has settled at P3)")
         self._mode_last_rb = bool(rb_now)
 
         # Edge-triggered transitions (same priority order as Pi)
@@ -414,6 +410,7 @@ class ModeELCMController:
             # B also aborts the RM sequence (driver gates the current to 0 in
             # DAMP anyway; this keeps the upper-layer state machine consistent).
             self._rm_stage = 0
+            self._rm_lt_pending = False
             self._rm_iq_des = np.zeros(3, dtype=float)
             self._rm_zero_until = 0.0
             if int(self._mode_est) != DAMP:
@@ -453,9 +450,6 @@ class ModeELCMController:
         # LB prop-stage clock (P1): stage 1 fixed reverse for switch_lb_prop_spin_s
         # from NOW, then stage 2 balance around switch_lb_balance_base_pwm_us.
         self._lb_prop_t0 = time.time()
-        # RM M2006 LT job: the push has just ended (loop starts on the liftoff
-        # edge) -> drive to rm_lt_target_rad (-11) and re-zero there.
-        self._rm_start(float(self.lcm_cfg.rm_lt_target_rad), "LT job (push end)")
         print("[switch_loop] ON (LB, legs only) -> P1 %.1fNm to %.0fdeg | P2 %.1fNm for %.2fs | P3 posctrl %.0fdeg cap%.1fNm"
               % (float(self.lcm_cfg.switch_approach_tau_nm),
                  np.rad2deg(self.lcm_cfg.switch_target_rad),
@@ -1539,6 +1533,12 @@ class ModeELCMController:
                 # LB deferred-start: a pending (armed) switch loop only begins on the next
                 # flight phase, once the leg has returned to its original length.
                 self._maybe_start_pending_switch(info)
+
+                # LT-armed RM job: start the drive to rm_lt_target_rad exactly at
+                # the push end (liftoff edge). Legs/props are NOT touched.
+                if bool(self._rm_lt_pending) and int(info.get("liftoff", 0)) != 0:
+                    self._rm_lt_pending = False
+                    self._rm_start(float(self.lcm_cfg.rm_lt_target_rad), "LT job (push end)")
 
                 if self._switch_loop:
                     # Switch/arming loop: ignore ModeE. 3-phase state machine, all computed here
