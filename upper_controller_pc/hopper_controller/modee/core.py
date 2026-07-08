@@ -359,7 +359,7 @@ class ModeEConfig:
     # This helps achieve target hop height even with model errors.
     use_energy_compensation: bool = True
     # Hopper4-style energy loop (scaled conservative for real-robot bring-up).
-    energy_comp_kp: float = 5
+    energy_comp_kp: float = 5.6
     # TRUE desired apex height above liftoff (m). 2026-07-05: this is now a real
     # closed-loop target -- see apex_fb_* below. Set what you actually want.
     hop_height_m: float = 0.1
@@ -568,7 +568,7 @@ class ModeEConfig:
 
     # ===== Flight foot placement =====
     # Raibert (Kv/Kr) in WORLD (+Z down), then foot_des_b = R_wb^T @ target_w (quaternion).
-    flight_kv: float = 0.15
+    flight_kv: float = 0.12
     flight_kr: float = 0.0
     # If you see "摆腿太小" (world/heading XY step is small), increase this cap first.
     flight_stepper_lim_m: float = 0.2
@@ -930,10 +930,10 @@ class ModeEConfig:
     # 2026-07-01: RESTORED to ACTUAL CASE values (kpp=100, kpd=1) from the CASE zip; had been
     # cut to 5/0 (20x weaker stance attitude, no damping) -> couldn't arrest tip-over.
     # User-tuned values (2026-07-05: keep these, do NOT bulk-restore CASE).
-    stance_kpp_x: float = 23.0    # leg stance kR roll
-    stance_kpp_y: float = 23.0    # leg stance kR pitch
-    stance_kpd_x: float = 3    # leg stance kW roll
-    stance_kpd_y: float = 3    # leg stance kW pitch
+    stance_kpp_x: float = 27.0    # leg stance kR roll
+    stance_kpp_y: float = 27.0    # leg stance kR pitch
+    stance_kpd_x: float = 4    # leg stance kW roll
+    stance_kpd_y: float = 4    # leg stance kW pitch
     # ===== Stance D-term gyro conditioning: NOTCH + light LPF =====
     # We consume PX4 /fmu/out/sensor_combined = RAW gyro (PX4's own filter
     # pipeline only applies to vehicle_angular_velocity, which is not in the
@@ -954,8 +954,18 @@ class ModeEConfig:
     # phase starts twitching or D feels sluggish, revert to BW 25 / tau 0.008.
     stance_gyro_notch_hz: float = 25.0
     stance_gyro_notch_bw_hz: float = 32.0
-    # Light first-order LPF after the notch (residual >45 Hz content).
-    stance_gyro_lpf_tau: float = 0.015
+    # Second cascaded notch (2026-07-09): the pure-leg log showed the stance
+    # gyro noise is dominated by the touchdown impact RING at ~13 Hz (57% of
+    # gyro_x energy in 8-20 Hz), which the 25 Hz notch barely touches. Offline
+    # replay of that log: dual notch + 8 ms LPF cuts the residual D-term noise
+    # 0.28->0.21 (x) / 0.17->0.11 (y) rad/s while the 3 Hz phase lag (body
+    # rocking band) only grows 24->28 deg -- strictly better than fattening the
+    # LPF (25-40 ms costs 53-66 deg at 5 Hz). Set hz<=0 to disable.
+    stance_gyro_notch2_hz: float = 13.0
+    stance_gyro_notch2_bw_hz: float = 10.0
+    # Light first-order LPF after the notches (residual >45 Hz content).
+    # 15->8 ms (2026-07-09): phase budget moved into the second notch above.
+    stance_gyro_lpf_tau: float = 0.008
     stance_tau_rp_max: float = 20.0
 
     # ===== WBC-QP slack weights (stance vs flight) =====
@@ -1133,6 +1143,10 @@ class ModeECore:
         self._gyro_notch_x = np.zeros((2, 4), dtype=float)
         self._gyro_notch_init: bool = False
         self._gyro_notch_coefs: tuple | None = None
+        # Second cascaded notch (touchdown-ring band, see stance_gyro_notch2_hz).
+        self._gyro_notch2_x = np.zeros((2, 4), dtype=float)
+        self._gyro_notch2_init: bool = False
+        self._gyro_notch2_coefs: tuple | None = None
 
         # Shift-coordinate LPF + debounce (phase robustness)
         self._q_shift_lpf: float = 0.0
@@ -1383,6 +1397,8 @@ class ModeECore:
         self._stance_gyro_lpf_init = False
         self._gyro_notch_x[:] = 0.0
         self._gyro_notch_init = False
+        self._gyro_notch2_x[:] = 0.0
+        self._gyro_notch2_init = False
         self._q_shift_lpf = 0.0
         self._qd_shift_lpf = 0.0
         self._shift_lpf_init = False
@@ -3131,39 +3147,56 @@ class ModeECore:
         tau_b_stance_des = np.zeros(3, dtype=float)
         tau_b_att_des = np.zeros(3, dtype=float)
 
-        # --- D-term gyro conditioning: biquad notch + light LPF, run EVERY
-        # step (flight too) so touchdown sees a warm, transient-free filter.
-        # Rationale/params: see stance_gyro_notch_hz in ModeEConfig.
+        # --- D-term gyro conditioning: cascaded biquad notches + light LPF,
+        # run EVERY step (flight too) so touchdown sees a warm, transient-free
+        # filter. Notch 1 = prop band (25 Hz), notch 2 = touchdown-ring band
+        # (13 Hz). Rationale/params: see stance_gyro_notch_hz in ModeEConfig.
         omega_raw = np.asarray(imu_gyro_b, dtype=float).reshape(3)
         omega_flt = omega_raw.copy()
-        f0 = float(getattr(self.cfg, "stance_gyro_notch_hz", 0.0))
-        if f0 > 0.0:
-            key = (f0, float(self.cfg.stance_gyro_notch_bw_hz), float(self.dt))
-            if self._gyro_notch_coefs is None or self._gyro_notch_coefs[0] != key:
+
+        def _run_notch(sig_in, f0, bw, coefs, state, inited):
+            """One biquad notch on axes x/y. Returns (out, coefs, inited)."""
+            key = (f0, bw, float(self.dt))
+            if coefs is None or coefs[0] != key:
                 w0 = 2.0 * math.pi * f0 * float(self.dt)
-                q_f = f0 / max(1e-6, float(self.cfg.stance_gyro_notch_bw_hz))
+                q_f = f0 / max(1e-6, bw)
                 alpha = math.sin(w0) / (2.0 * q_f)
                 c = math.cos(w0)
                 a0 = 1.0 + alpha
                 # normalized: b = [1, -2c, 1]/a0 ; a = [-2c, 1-alpha]/a0
-                self._gyro_notch_coefs = (
+                coefs = (
                     key,
                     1.0 / a0, -2.0 * c / a0, 1.0 / a0,
                     -2.0 * c / a0, (1.0 - alpha) / a0,
                 )
-            _, b0, b1, b2, a1, a2 = self._gyro_notch_coefs
-            if not self._gyro_notch_init:
+            _, b0, b1, b2, a1, a2 = coefs
+            if not inited:
                 # seed steady-state at current value (DC gain of notch = 1)
                 for ax in range(2):
-                    v = float(omega_raw[ax])
-                    self._gyro_notch_x[ax, :] = (v, v, v, v)
-                self._gyro_notch_init = True
+                    v = float(sig_in[ax])
+                    state[ax, :] = (v, v, v, v)
+                inited = True
+            out = sig_in.copy()
             for ax in range(2):  # x, y only (z unused by the D-term)
-                x1, x2, y1, y2 = self._gyro_notch_x[ax]
-                x0 = float(omega_raw[ax])
+                x1, x2, y1, y2 = state[ax]
+                x0 = float(sig_in[ax])
                 y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
-                self._gyro_notch_x[ax] = (x0, x1, y0, y1)
-                omega_flt[ax] = y0
+                state[ax] = (x0, x1, y0, y1)
+                out[ax] = y0
+            return out, coefs, inited
+
+        f0 = float(getattr(self.cfg, "stance_gyro_notch_hz", 0.0))
+        if f0 > 0.0:
+            omega_flt, self._gyro_notch_coefs, self._gyro_notch_init = _run_notch(
+                omega_flt, f0, float(self.cfg.stance_gyro_notch_bw_hz),
+                self._gyro_notch_coefs, self._gyro_notch_x, self._gyro_notch_init,
+            )
+        f2 = float(getattr(self.cfg, "stance_gyro_notch2_hz", 0.0))
+        if f2 > 0.0:
+            omega_flt, self._gyro_notch2_coefs, self._gyro_notch2_init = _run_notch(
+                omega_flt, f2, float(getattr(self.cfg, "stance_gyro_notch2_bw_hz", 10.0)),
+                self._gyro_notch2_coefs, self._gyro_notch2_x, self._gyro_notch2_init,
+            )
         g_tau = float(getattr(self.cfg, "stance_gyro_lpf_tau", 0.0))
         if g_tau > 0.0:
             if not self._stance_gyro_lpf_init:
