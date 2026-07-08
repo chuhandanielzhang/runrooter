@@ -1,0 +1,10 @@
+struct hopper_nav_cmd_lcmt {
+    // High-level navigation command from lidar_perception/patrol.py.
+    // lcm_controller uses this INSTEAD of the gamepad stick while patrol
+    // mode is engaged (Y button); stick motion / B always wins back.
+    int64_t utime;        // publish time (us)
+    float   v_xy_w[2];    // desired horizontal velocity in map frame (m/s)
+    int8_t  active;       // 1 = patrol wants control (fresh + valid)
+    int8_t  wp_index;     // current waypoint index (status/debug)
+    float   dist_to_wp;   // distance to current waypoint (m, debug)
+}

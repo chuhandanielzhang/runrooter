@@ -1,0 +1,35 @@
+# Mid-360 感知子系统配置(odom_lcm_bridge.py + patrol.py 共用)
+
+lcm_url: "udpm://239.255.76.67:7667?ttl=255"
+
+# ---- Point-LIO 里程计话题 ----
+odom_topic: "/aft_mapped_to_init"
+
+# ---- 雷达安装外参: 雷达坐标系 -> 机体 FRD 坐标系 ----
+# 机体 FRD: +X 前, +Y 右, +Z 下 (与 IMU / core.py 一致)
+# 雷达自身: +X 前, +Y 左, +Z 上 (Livox FLU)
+# 顶部正装(雷达 x 与机体 x 同向)时: rpy_deg = [180, 0, 0]
+#   (绕机体 X 转 180°: 雷达 y-> -y, z-> -z, 即 FLU -> FRD)
+# t_bl_m: 雷达原点在机体系中的位置 (m, FRD)。装机后用尺子量了填。
+extrinsic:
+  rpy_deg: [180.0, 0.0, 0.0]
+  t_bl_m: [0.0, 0.0, -0.15]     # 例: 雷达在机体原点正上方 15cm (FRD 的 -Z 是上)
+
+# ---- 里程计健康门控 ----
+health:
+  max_pos_jump_m: 0.5        # 相邻两帧位置跳变超过它 -> quality=0
+  stale_timeout_s: 0.5       # 超时没有新 odom -> 桥停止发布 quality=1
+
+# ---- 重定位 (M4): 若存在此文件则应用 T_map_odom 并置 localized=1 ----
+# 由 relocalize.py 生成 (4x4 齐次矩阵, npy 格式, map <- odom)
+reloc_transform_file: "/home/abc/Hopper/robot_runtime/lidar_perception/maps/T_map_odom.npy"
+
+# ---- 巡视 patrol.py ----
+patrol:
+  waypoints_file: "/home/abc/Hopper/robot_runtime/lidar_perception/waypoints.yaml"
+  rate_hz: 50.0
+  kp: 0.6                    # v = kp * (wp - pos), 再 clip 到 v_max
+  v_max_mps: 0.4             # 巡视速度上限 (低于控制器 max_cmd_vel=0.8)
+  arrive_radius_m: 0.35      # 进入该半径视为到点, 切下一个航点
+  loop: true                 # 走完最后一个航点后回到第一个
+  odom_stale_s: 0.3          # odom 超时 -> active=0 (控制器自动回摇杆)

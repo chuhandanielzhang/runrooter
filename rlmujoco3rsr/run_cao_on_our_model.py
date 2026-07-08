@@ -21,6 +21,12 @@ cfg.tau_cmd_max_nm = (float(os.environ.get("CAO_TAU", "9.0")),) * 3
 cfg.mode_1d = os.environ.get("CAO_1D", "0") == "1"        # real robot runs 3D (mode_1d=False)
 cfg.prop_base_thrust_ratio = 0.10 if cfg.control_mode >= 2 else 0.0
 cfg.stance_use_props = cfg.control_mode >= 2
+# CAO_PURE=1: leg-only operation regardless of control_mode (props fully off,
+# enables core.py no-prop liftoff omega gate). Use with CAO_MODE=3 for HLIP S2S.
+if os.environ.get("CAO_PURE", "0") == "1":
+    cfg.pure_leg_mode = True
+    cfg.stance_use_props = False
+    cfg.prop_base_thrust_ratio = 0.0
 # stance virtual-spring stiffness: default 1100 N/m is stiff (little visible
 # compression). Lower it (e.g. 500) for SLIP-style touchdown buffering.
 cfg.stance_kp_z = float(os.environ.get("CAO_KZ", "1100"))
@@ -36,6 +42,24 @@ if os.environ.get("CAO_FL_KW"):
     cfg.flight_kW_roll = cfg.flight_kW_pitch = float(os.environ["CAO_FL_KW"])
 if os.environ.get("CAO_PROP_BASE"):
     cfg.prop_base_thrust_ratio = float(os.environ["CAO_PROP_BASE"])
+# Friction-cone modulation: total prop DOWNforce (N) in stance; leg fz raised
+# by the same amount (CoM dynamics unchanged, contact normal force +F_dn).
+if os.environ.get("CAO_DOWNFORCE"):
+    cfg.stance_downforce_n = float(os.environ["CAO_DOWNFORCE"])
+# Downforce window after touchdown (s); <=0 = whole stance. Default 0.06.
+if os.environ.get("CAO_DOWNFORCE_TD"):
+    cfg.stance_downforce_td_s = float(os.environ["CAO_DOWNFORCE_TD"])
+# Controller-side friction coefficient (should match the plant floor mu).
+if os.environ.get("CAO_MU"):
+    cfg.stance_mu = float(os.environ["CAO_MU"])
+if os.environ.get("CAO_S2S_BETA"):
+    cfg.s2s_pole_beta = float(os.environ["CAO_S2S_BETA"])
+# swing (flight foot tracking) gains — the closed-chain sim leg has more inertia
+# and joint damping than the real delta leg, so it may need stiffer swing PD.
+if os.environ.get("CAO_SW_KP"):
+    cfg.swing_kp_xy = float(os.environ["CAO_SW_KP"])
+if os.environ.get("CAO_SW_KD"):
+    cfg.swing_kd_xy = float(os.environ["CAO_SW_KD"])
 
 lcm_cfg = ModeELCMConfig()
 lcm_cfg.print_hz = 2.0

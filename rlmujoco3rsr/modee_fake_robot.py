@@ -109,6 +109,9 @@ def main():
     ap.add_argument("--x-at-s", type=float, default=3.0, help="X edge (PD legs on)")
     ap.add_argument("--a-at-s", type=float, default=3.5, help="A edge (props on)")
     ap.add_argument("--drop-start-s", type=float, default=4.5)
+    ap.add_argument("--drop-z", type=float, default=0.55,
+                    help="hold height before release; raise for more first-touchdown energy "
+                         "(0.55 gives only ~0.10 m foot free-fall with l0=0.455 -> marginal bootstrap)")
     ap.add_argument("--strict-1d", action="store_true",
                     help="lock base xy + attitude every step (pure vertical hopping)")
     ap.add_argument("--strict-2d", action="store_true",
@@ -122,9 +125,20 @@ def main():
     ap.add_argument("--print-roll", action="store_true", help="print roll/pitch trace at 5 Hz")
     ap.add_argument("--record-gif", type=str, default=None)
     ap.add_argument("--realtime", action="store_true", default=True)
+    ap.add_argument("--floor-mu", type=float, default=None,
+                    help="tangential friction of floor AND foot geoms (MuJoCo pairs "
+                         "take the elementwise max, so both must be set)")
     args = ap.parse_args()
 
     m = mujoco.MjModel.from_xml_path(XML)
+    if args.floor_mu is not None:
+        for gname in ("floor", "foot_collision"):
+            gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, gname)
+            m.geom_friction[gid, 0] = float(args.floor_mu)
+        print(f"floor/foot tangential friction set to mu={args.floor_mu}")
+    # Bidirectional ESC model: controller side maps thrust<0 to pwm<1000 (3D mode);
+    # widen the sim thrust actuators so reverse (downforce) actually acts.
+    m.actuator_ctrlrange[6:9, 0] = -10.0
     # controller sends torques; bypass hip position actuators (unless --hold-hips)
     if not args.hold_hips:
         m.actuator_gainprm[0:3, :] = 0.0
@@ -138,6 +152,11 @@ def main():
         a2 = 0.5 * np.deg2rad(args.init_roll_deg)
         d.qpos[3:7] = [np.cos(a2), np.sin(a2), 0.0, 0.0]
         mujoco.mj_forward(m, d)
+
+    # foot body/geom ids (for contact-point slip velocity)
+    foot_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "foot")
+    foot_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "foot_collision")
+    foot_r = float(m.geom_size[foot_gid, 0])
 
     # map PWM channels -> sim thrust actuators by arm angle in FRD
     mujoco.mj_forward(m, d)
@@ -192,6 +211,18 @@ def main():
     t_wall0 = time.time()
     prev_contact = False
     td_events = []  # (t, v_xy_sim, foot_offset_xy_sim) at each touchdown
+    # foot slip accounting (friction-cone experiments): path length of the foot
+    # contact point in the ground plane, accumulated per stance
+    slip_acc = 0.0
+    slip_per_hop = []
+    foot_xy_prev = None
+    thrust_min_seen, thrust_max_seen = 0.0, 0.0
+    # early-stance (touchdown transient) slip: first TD_WIN seconds of each stance,
+    # the window the downforce pulse targets (fz still ramping, cone at its tightest)
+    TD_WIN = 0.08
+    slip_td_acc = 0.0
+    slip_td_per_hop = []
+    t_td_last = None
 
     while sim_t < args.duration_s:
         for _ in range(16):
@@ -201,7 +232,9 @@ def main():
         # synthetic gamepad: Y (log/reset) -> X (PD legs) -> A (props on)
         if sim_t >= next_gp:
             gp = gamepad_lcmt()
-            gp.rightStickAnalog = [0.0, 0.0]
+            stick_x = float(os.environ.get("MFR_STICK_X", "0.0")) if sim_t > float(os.environ.get("MFR_STICK_AT_S", "8.0")) else 0.0
+            stick_y = float(os.environ.get("MFR_STICK_Y", "0.0")) if sim_t > float(os.environ.get("MFR_STICK_AT_S", "8.0")) else 0.0
+            gp.rightStickAnalog = [stick_x, stick_y]
             gp.leftStickAnalog = [0.0, 0.0]
             gp.y = 1 if args.y_at_s <= sim_t < args.y_at_s + 0.2 else 0
             gp.x = 1 if args.x_at_s <= sim_t < args.x_at_s + 0.2 else 0
@@ -221,11 +254,21 @@ def main():
             d.ctrl[0:3] = home_ctrl[0:3]
         d.ctrl[3:6] = home_ctrl[3:6]  # servos frozen
 
-        # props: PWM -> thrust -> mapped sim thrust actuator
-        thr6 = motor_table.thrust_from_pwm(pwm_cmd) if armed[0] else np.zeros(6)
+        # props: PWM -> thrust -> mapped sim thrust actuator.
+        # pwm >= 1000: forward, measured table. pwm < 1000: REVERSE (3D-mode ESC),
+        # thrust = -k*(1000-pwm)^2 mirroring the controller's bidir sqrt law
+        # (core.py _pwm_from_arm_thrusts, prop_k_thrust=1.10e-4).
+        if armed[0]:
+            thr6 = motor_table.thrust_from_pwm(np.maximum(pwm_cmd, 1000.0))
+            rev = pwm_cmd < 1000.0
+            thr6[rev] = -1.10e-4 * np.square(1000.0 - pwm_cmd[rev])
+        else:
+            thr6 = np.zeros(6)
         d.ctrl[6:9] = 0.0
         for pwm_idx, (act_i, _) in pwm_to_act.items():
-            d.ctrl[6 + act_i] = float(np.clip(thr6[pwm_idx], 0.0, 10.0))
+            d.ctrl[6 + act_i] = float(np.clip(thr6[pwm_idx], -10.0, 10.0))
+        thrust_min_seen = min(thrust_min_seen, float(np.min(d.ctrl[6:9])))
+        thrust_max_seen = max(thrust_max_seen, float(np.max(d.ctrl[6:9])))
 
         mujoco.mj_step(m, d)
         if args.strict_1d:
@@ -248,7 +291,7 @@ def main():
             d.qvel[0] = 0
             d.qvel[4:6] = 0
         if args.drop_start_s > 0 and sim_t < args.drop_start_s:
-            d.qpos[0:3] = [0, 0, 0.55]
+            d.qpos[0:3] = [0, 0, float(args.drop_z)]
             d.qvel[0:3] = 0
             if args.hold_att_free:
                 pass  # attitude left free (prop attitude-loop sign test)
@@ -306,6 +349,35 @@ def main():
                       f"foot_off_sim=[{foot_off[0]:+.3f},{foot_off[1]:+.3f}] "
                       f"along_v={dot:+.3f} m ({'BRAKE ok' if dot > 0 else 'REVERSED'})",
                       flush=True)
+
+        # per-stance foot slip = integral of the CONTACT-POINT tangential speed.
+        # NOTE: the foot geom is a SPHERE -- tracking the foot-center xy would
+        # count rolling as slip (and high mu transmits MORE rolling torque, giving
+        # slip "increasing" with friction). True slip is the material-point
+        # velocity at the contact: v_cp = v_foot + omega_foot x r_cp.
+        if in_contact:
+            vel6 = np.zeros(6)
+            mujoco.mj_objectVelocity(m, d, mujoco.mjtObj.mjOBJ_BODY, foot_bid, vel6, 0)
+            omega_w, v_com_w = vel6[:3], vel6[3:]
+            # contact point = bottom of the collision sphere, in world coords
+            p_cp = d.geom_xpos[foot_gid] + np.array([0.0, 0.0, -foot_r])
+            v_cp = v_com_w + np.cross(omega_w, p_cp - d.xipos[foot_bid])
+            step_slip = float(np.hypot(v_cp[0], v_cp[1])) * dt
+        if in_contact and not prev_contact:
+            slip_acc = 0.0
+            slip_td_acc = 0.0
+            t_td_last = sim_t
+            slip_acc += step_slip
+            slip_td_acc += step_slip
+        elif in_contact:
+            slip_acc += step_slip
+            if t_td_last is not None and (sim_t - t_td_last) <= TD_WIN:
+                slip_td_acc += step_slip
+        elif (not in_contact) and prev_contact and sim_t > args.drop_start_s:
+            slip_per_hop.append(slip_acc)
+            slip_td_per_hop.append(slip_td_acc)
+            print(f"[SLIP] t={sim_t:5.2f} stance #{len(slip_per_hop)} slip={slip_acc*1000.0:6.1f} mm "
+                  f"(td{TD_WIN*1000:.0f}ms {slip_td_acc*1000.0:5.1f} mm)", flush=True)
         prev_contact = in_contact
 
         if args.print_roll and int(sim_t / dt) % int(0.2 / dt) == 0:
@@ -332,10 +404,27 @@ def main():
     ct = np.array(contacts_log)
     n = len(bz)
     third = n // 3
+    # longest continuous ground-contact streak AFTER release (stick detector)
+    rel_i = int(args.drop_start_s / dt)
+    streak = best_streak = 0
+    for v in ct[rel_i:]:
+        streak = streak + 1 if v > 0.5 else 0
+        best_streak = max(best_streak, streak)
+    stuck_s = best_streak * dt
     print(f"\nRESULT: {sim_t:.1f}s  base_z min={bz.min():.3f} max={bz.max():.3f} final={bz[-1]:.3f}  "
           f"peak|tau|={max(taus_log):.2f} Nm")
     print(f"late-phase base_z mean={bz[-third:].mean():.3f}  oscillation={bz[-third:].max()-bz[-third:].min():.3f} m  "
-          f"contact fraction={ct.mean()*100:.0f}%")
+          f"contact fraction={ct.mean()*100:.0f}%  max_contact_streak={stuck_s:.2f}s"
+          + ("  [STUCK]" if stuck_s > 1.5 else ""))
+    if slip_per_hop:
+        sp = np.array(slip_per_hop) * 1000.0
+        st = np.array(slip_td_per_hop) * 1000.0
+        print(f"SLIP: {len(sp)} stances  mean={sp.mean():.1f} mm  median={np.median(sp):.1f} mm  "
+              f"max={sp.max():.1f} mm  total={sp.sum():.0f} mm  "
+              f"drift_xy={np.hypot(d.qpos[0], d.qpos[1]):.3f} m")
+        print(f"SLIP-TD({TD_WIN*1000:.0f}ms): mean={st.mean():.1f} mm  median={np.median(st):.1f} mm  "
+              f"max={st.max():.1f} mm  total={st.sum():.0f} mm")
+    print(f"THRUST range seen: [{thrust_min_seen:.2f}, {thrust_max_seen:.2f}] N/prop")
     if args.record_gif and gif_frames:
         import imageio.v2 as imageio
         imageio.mimsave(args.record_gif, gif_frames, fps=25)

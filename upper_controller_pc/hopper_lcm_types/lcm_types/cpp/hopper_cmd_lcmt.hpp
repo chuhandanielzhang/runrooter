@@ -49,6 +49,13 @@ class hopper_cmd_lcmt
          */
         float      rm_iq_des[3];
 
+        /**
+         * RM re-zero trigger: on a 0->nonzero edge the Jetson driver latches the
+         * CURRENT RM shaft position as the new zero (hopper_data_lcmt.rm_q reads 0
+         * there). Same effect as the gamepad SET_ZERO combo, but RM-only.
+         */
+        int8_t     rm_set_zero;
+
     public:
         /**
          * Encode a message into binary form.
@@ -163,6 +170,9 @@ int hopper_cmd_lcmt::_encodeNoHash(void *buf, int offset, int maxlen) const
     tlen = __float_encode_array(buf, offset + pos, maxlen - pos, &this->rm_iq_des[0], 3);
     if(tlen < 0) return tlen; else pos += tlen;
 
+    tlen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &this->rm_set_zero, 1);
+    if(tlen < 0) return tlen; else pos += tlen;
+
     return pos;
 }
 
@@ -188,6 +198,9 @@ int hopper_cmd_lcmt::_decodeNoHash(const void *buf, int offset, int maxlen)
     tlen = __float_decode_array(buf, offset + pos, maxlen - pos, &this->rm_iq_des[0], 3);
     if(tlen < 0) return tlen; else pos += tlen;
 
+    tlen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &this->rm_set_zero, 1);
+    if(tlen < 0) return tlen; else pos += tlen;
+
     return pos;
 }
 
@@ -200,12 +213,13 @@ int hopper_cmd_lcmt::_getEncodedSizeNoHash() const
     enc_size += __float_encoded_array_size(NULL, 3);
     enc_size += __float_encoded_array_size(NULL, 3);
     enc_size += __float_encoded_array_size(NULL, 3);
+    enc_size += __int8_t_encoded_array_size(NULL, 1);
     return enc_size;
 }
 
 uint64_t hopper_cmd_lcmt::_computeHash(const __lcm_hash_ptr *)
 {
-    uint64_t hash = 0x0cfebad2f9c48defLL;
+    uint64_t hash = 0x05debe732ba9c8f9LL;
     return (hash<<1) + ((hash>>63)&1);
 }
 

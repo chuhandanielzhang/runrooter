@@ -16,6 +16,7 @@ This file is MuJoCo-free and is meant to run on the real robot via LCM.
 from dataclasses import dataclass
 import math
 import os
+import time as _time
 import numpy as np
 
 # NOTE: hopper_controller is not a Python package by default (no __init__.py).
@@ -766,6 +767,31 @@ class ModeEConfig:
     # deepening this.
     pwm_rev_floor_us: float = 700.0
 
+    # ===== Stance friction-cone modulation via prop downforce (2026-07-07) =====
+    # Physics: during stance the props push DOWN (collective reverse, total
+    # stance_downforce_n newtons). The leg fz command is raised by the same
+    # amount, so the CoM vertical dynamics (hop apex, SLIP energy) are UNCHANGED
+    # -- the extra prop force and the extra ground reaction cancel on the body.
+    # What DOES change is the contact normal force:  N = fz_leg = fz_slip + F_dn,
+    # so the friction cone |fxy| <= mu*N widens by mu*F_dn. Crucially this holds
+    # right AT touchdown when fz_slip is still near zero -- exactly the moment
+    # the foot normally breaks loose on low-mu ground. Equivalent friction:
+    #   mu_eff = mu * (1 + F_dn / fz_slip)   (pointwise; largest gain early stance)
+    # Only active when prop_bidir (needs reverse thrust); the applied value is
+    # capped by the physical reverse budget 3*prop_reverse_max_n. In stance this
+    # REPLACES the positive baseline prop_base_thrust_ratio (they contradict).
+    # 0 = off (default; behavior identical to before).
+    stance_downforce_n: float = 0.0
+    # Downforce window after touchdown (s). Sim finding (2026-07-08): full-stance
+    # downforce BACKFIRES -- fz_cmd += F_dn also scales the lever-arm fxy
+    # feedforward (fxy ~ rx*fz/rz), so with an off-center foot the robot pushes
+    # itself horizontally harder all stance (drift/slip UP even on high-mu
+    # ground). The slip that matters happens in the first tens of ms after
+    # touchdown while fz_slip is still ramping from ~0; a short pulse boosts N
+    # exactly there and expires before the lever-arm side effect integrates.
+    # <=0 = apply for the whole stance (the naive variant, kept for A/B).
+    stance_downforce_td_s: float = 0.06
+
     # ===== Propeller PWM mapping method =====
     # If True: use Hopper4-style k_thrust square-root relationship (pwm = 1000 + sqrt(thrust / k_thrust))
     # If False: use MotorTableModel lookup table (interpolation from measured data)
@@ -1013,6 +1039,22 @@ class ModeEConfig:
     mpc_fxy_max: float = 80.0     # relax horizontal bound; friction constraint remains the main limiter
     mpc_fxy_lpf_alpha: float = 1.0
 
+    # ===== LiDAR odometry fusion (Mid-360 / Point-LIO via hopper_odom_lcmt) =====
+    # The LiDAR gives a DRIFT-FREE global reference; the fast loop stays
+    # IMU+leg-kinematics. Fusion is a slow complementary pull, NOT a replacement:
+    #   - XY position: _p_hat_w slowly pulled to the lidar position
+    #   - yaw: a world-frame yaw offset (applied on top of the IMU quaternion)
+    #     slowly tracks the lidar yaw, so the core world frame CONVERGES to the
+    #     lidar map frame (patrol waypoints/velocities are in that map frame).
+    #   - z and velocity are NOT touched (stance leg-kinematics z and the
+    #     velocity KF are the control-critical fast estimates).
+    # Fusion silently pauses (pure dead-reckoning) when odom is stale/degraded.
+    lidar_fuse_en: bool = True
+    lidar_pos_tau_s: float = 0.7    # XY pull time constant (s)
+    lidar_yaw_tau_s: float = 2.0    # yaw-offset pull time constant (s)
+    lidar_stale_s: float = 0.4      # ignore odom older than this (wall clock, s)
+    lidar_pos_init_snap_m: float = 1e9  # first healthy fix snaps XY (no slow pull from 0)
+
 
 class ModeECore:
     """
@@ -1184,6 +1226,20 @@ class ModeECore:
         self._flight_vel_b = np.zeros(3, dtype=float)
         # User override: freeze internal velocity estimate to zero (used to stop drift on demand).
         self._user_zero_vel_hold: bool = False
+
+        # ---- LiDAR odometry fusion state (see lidar_* in ModeEConfig) ----
+        # Written by update_lidar_odom() (LCM thread, under the runner's lock);
+        # read in step(). Wall-clock stamped for the staleness gate.
+        self._lidar_pos_map = np.zeros(3, dtype=float)
+        self._lidar_yaw_map: float = 0.0
+        self._lidar_quality: int = 0
+        self._lidar_rx_walltime: float = 0.0
+        self._lidar_pos_inited: bool = False
+        # World-frame yaw offset applied on top of the IMU attitude:
+        # R_wb_used = Rz(_lidar_yaw_off) @ R_wb_imu. Slowly tracks the lidar
+        # yaw so the core world frame converges to the lidar map frame.
+        self._lidar_yaw_off: float = 0.0
+        self._lidar_fused_n: int = 0
 
         # phase state
         self.sim_time = 0.0
@@ -1380,6 +1436,9 @@ class ModeECore:
         # Rebase XY position for nicer logs (doesn't materially change the control because references are relative)
         self._p_hat_w[0] = 0.0
         self._p_hat_w[1] = 0.0
+        # LiDAR fusion: re-snap to the next healthy fix after a rebase (a slow
+        # pull from the rebased origin would fight the fresh lidar position).
+        self._lidar_pos_inited = False
 
         # Reset swing placement memory/gating
         self._apex_reached = False
@@ -1407,6 +1466,32 @@ class ModeECore:
         if bool(self._user_zero_vel_hold):
             # Make the state look like a fresh start immediately.
             self.user_reset()
+
+    def update_lidar_odom(
+        self,
+        *,
+        pos_map: np.ndarray,
+        yaw_map: float,
+        quality: int,
+        rx_walltime: float,
+    ) -> None:
+        """
+        Feed one LiDAR odometry sample (hopper_odom_lcmt, already in the hopper
+        map frame: +Z DOWN, FRD body). Called from the LCM thread under the
+        runner's lock; the actual fusion happens inside step().
+
+          pos_map:     body position in map frame (m)
+          yaw_map:     body yaw in map frame (rad, aerospace ZYX)
+          quality:     1 = healthy (fuse), 0 = degraded (ignore)
+          rx_walltime: time.time() at receive (staleness gate in step())
+        """
+        p = np.asarray(pos_map, dtype=float).reshape(3)
+        if not (np.all(np.isfinite(p)) and np.isfinite(float(yaw_map))):
+            return
+        self._lidar_pos_map = p.copy()
+        self._lidar_yaw_map = float(yaw_map)
+        self._lidar_quality = int(quality)
+        self._lidar_rx_walltime = float(rx_walltime)
 
     @staticmethod
     def _pinv_ridge(A: np.ndarray, lambda_rel: float) -> np.ndarray:
@@ -2137,6 +2222,30 @@ class ModeECore:
         else:
             q_hat = self.att.update(omega_b=imu_gyro_b, acc_b=imu_acc_b, dt=float(self.dt))
         R_wb_hat = _quat_to_R_wb(q_hat)
+
+        # ---- LiDAR yaw fusion (slow complementary pull, see lidar_* config) ----
+        # A world-frame yaw offset rotates the IMU attitude so the core world
+        # frame converges to the lidar map frame; roll/pitch stay pure IMU.
+        # Applied BEFORE R_wb_hat is used anywhere (velocities, Raibert, e_R),
+        # so the whole step sees one consistent frame.
+        lidar_fresh = False
+        if bool(getattr(self.cfg, "lidar_fuse_en", True)) and (int(self._lidar_quality) == 1) \
+           and (float(self._lidar_rx_walltime) > 0.0):
+            age_s = float(_time.time()) - float(self._lidar_rx_walltime)
+            lidar_fresh = age_s <= float(getattr(self.cfg, "lidar_stale_s", 0.4))
+        if lidar_fresh:
+            yaw_imu = float(math.atan2(R_wb_hat[1, 0], R_wb_hat[0, 0]))
+            yaw_err = float(self._lidar_yaw_map) - (yaw_imu + float(self._lidar_yaw_off))
+            yaw_err = math.atan2(math.sin(yaw_err), math.cos(yaw_err))  # wrap to [-pi, pi]
+            tau_yaw = float(max(1e-3, float(getattr(self.cfg, "lidar_yaw_tau_s", 2.0))))
+            if not bool(self._lidar_pos_inited):
+                # first healthy fix: snap the yaw offset (no slow swing-in)
+                self._lidar_yaw_off = float(self._lidar_yaw_off) + yaw_err
+            else:
+                a_yaw = float(_clipf(float(self.dt) / (tau_yaw + float(self.dt)), 0.0, 1.0))
+                self._lidar_yaw_off = float(self._lidar_yaw_off) + a_yaw * yaw_err
+        if abs(float(self._lidar_yaw_off)) > 1e-12:
+            R_wb_hat = (_Rz(float(self._lidar_yaw_off)) @ R_wb_hat).astype(float)
         rpy_hat = _R_to_rpy_xyz(R_wb_hat)
         z_w = np.asarray(R_wb_hat[:, 2], dtype=float).reshape(3)
         # Propeller thrust direction in WORLD. In the current FRD IMU/body convention,
@@ -2246,8 +2355,9 @@ class ModeECore:
                 self._p_hat_w[2] = float(z_td_est)
 
                 # Mode 3 (HLIP S2S): start the per-stance pivot-height average
-                # with the touchdown sample (height of the base above the foot).
-                self._s2s_z0_acc = float(z_td_est)
+                # with the touchdown sample. World is NED-like (+Z down), so the
+                # base z above ground is NEGATIVE -> height = -z_td_est.
+                self._s2s_z0_acc = -float(z_td_est)
                 self._s2s_z0_cnt = 1
 
                 # Takeoff speed target for desired apex (ballistic, with prop assist).
@@ -2288,7 +2398,9 @@ class ModeECore:
             t_in_stance = float(self.sim_time) - td_t
             # Mode 3 (HLIP S2S): accumulate the pivot height every stance tick
             # (mean over the stance -> z0 of the LIP model).
-            h_pivot = -float((np.asarray(R_wb_hat, dtype=float).reshape(3, 3) @ foot_b.reshape(3))[2])
+            # World +Z is DOWN; the foot sits below the base, so the world-frame z
+            # of the foot offset is POSITIVE and equals the pivot height directly.
+            h_pivot = float((np.asarray(R_wb_hat, dtype=float).reshape(3, 3) @ foot_b.reshape(3))[2])
             if np.isfinite(h_pivot) and (h_pivot > 0.05):
                 self._s2s_z0_acc += float(h_pivot)
                 self._s2s_z0_cnt += 1
@@ -2528,6 +2640,24 @@ class ModeECore:
             az = float(_clipf(float(self.dt) / (z_tau + float(self.dt)), 0.0, 1.0))
             self._z_hat_contact_filt = (1.0 - az) * float(self._z_hat_contact_filt) + az * float(z_meas)
             self._p_hat_w[2] = float(self._z_hat_contact_filt)
+
+        # ---- LiDAR XY position correction (slow pull; z stays leg-based) ----
+        # lidar_fresh was evaluated at the attitude section this same tick.
+        if lidar_fresh:
+            ex = float(self._lidar_pos_map[0]) - float(self._p_hat_w[0])
+            ey = float(self._lidar_pos_map[1]) - float(self._p_hat_w[1])
+            if not bool(self._lidar_pos_inited):
+                # First healthy fix: snap XY to the lidar (the dead-reckoned
+                # origin is arbitrary anyway). Yaw offset was snapped above.
+                self._p_hat_w[0] = float(self._lidar_pos_map[0])
+                self._p_hat_w[1] = float(self._lidar_pos_map[1])
+                self._lidar_pos_inited = True
+            else:
+                tau_p = float(max(1e-3, float(getattr(self.cfg, "lidar_pos_tau_s", 0.7))))
+                a_p = float(_clipf(float(self.dt) / (tau_p + float(self.dt)), 0.0, 1.0))
+                self._p_hat_w[0] = float(self._p_hat_w[0]) + a_p * ex
+                self._p_hat_w[1] = float(self._p_hat_w[1]) + a_p * ey
+            self._lidar_fused_n += 1
 
         # apex detection (flight): vz_hat sign change
         # World +Z is DOWN: ascending => vz < 0, descending => vz > 0.
@@ -3267,7 +3397,29 @@ class ModeECore:
         if bool(self._stance):
             # --- Stance: closed-form leg (fz + fxy) + optional prop overlay ---
             F_des = np.asarray(f_ref, dtype=float).reshape(3).copy()
-            fz_cmd = float(max(0.0, float(f_ref[2])))
+            # Friction-cone modulation (2026-07-07, see stance_downforce_n docs):
+            # props push DOWN by f_dn total; the leg pushes UP by f_dn extra. Net
+            # body force = 0 (CoM trajectory unchanged), contact normal force
+            # +f_dn -> friction cone |fxy| <= mu*(fz_slip + f_dn) widens, most
+            # valuably at touchdown when fz_slip ~ 0. Capped by the physical
+            # reverse budget; replaces the positive stance baseline thrust.
+            f_dn = 0.0
+            if props_on and bool(getattr(self.cfg, "prop_bidir", False)):
+                f_dn = min(
+                    max(0.0, float(getattr(self.cfg, "stance_downforce_n", 0.0))),
+                    3.0 * abs(float(self.cfg.prop_reverse_max_n)),
+                )
+                # Touchdown-window gating (see stance_downforce_td_s): boost N only
+                # while fz_slip is still ramping; expire before the lever-arm fxy
+                # side effect (fxy ~ rx*fz/rz) integrates into horizontal drift.
+                td_win = float(getattr(self.cfg, "stance_downforce_td_s", 0.0))
+                if td_win > 0.0:
+                    t_td = float(self._td_t) if self._td_t is not None else float(self.sim_time)
+                    if (float(self.sim_time) - t_td) > td_win:
+                        f_dn = 0.0
+            if f_dn > 0.0:
+                thrust_sum_ref = -f_dn
+            fz_cmd = float(max(0.0, float(f_ref[2]))) + f_dn
             try:
                 r_foot_b = (foot_b - self.com_b).reshape(3)
                 rx = float(r_foot_b[0])
@@ -3286,10 +3438,17 @@ class ModeECore:
                 #   fy = (tau_x + ry*fz)/rz ,  fx = (rx*fz - tau_y)/rz
                 # (reduces exactly to the old solution when rx=ry=0).
                 tau_att_xy = np.asarray(tau_b_att_des, dtype=float).reshape(3)[:2]
+                # Lever feedforward uses fz WITHOUT the downforce pulse: feeding
+                # f_dn through here converts the pulse into extra TANGENTIAL force
+                # (fx ~ rx*fz/rz) -- measured in sim as more TD slip, the opposite
+                # of the pulse's purpose. The residual tipping moment of the extra
+                # normal force (rx*f_dn ~ 1 Nm for 60 ms) is left to the attitude
+                # PD, well inside prop authority.
+                fz_lever = float(max(0.0, fz_cmd - f_dn))
                 if abs(rz) > 1e-6:
                     fxy_b = (
-                        (rx * fz_cmd - float(tau_att_xy[1])) / rz,
-                        (float(tau_att_xy[0]) + ry * fz_cmd) / rz,
+                        (rx * fz_lever - float(tau_att_xy[1])) / rz,
+                        (float(tau_att_xy[0]) + ry * fz_lever) / rz,
                     )
                 else:
                     fxy_b = (0.0, 0.0)
@@ -3467,6 +3626,11 @@ class ModeECore:
             # Velocity-KF accel bias estimate (body frame) -- should settle to a
             # small near-constant value; a drifting/saturated bias means bad tuning.
             "kf_b_a": np.asarray(self._kf_b_a, dtype=float).reshape(3).copy(),
+            # LiDAR odometry fusion debug (hopper_odom_lcmt):
+            "lidar_fresh": int(bool(lidar_fresh)),
+            "lidar_pos_map": np.asarray(self._lidar_pos_map, dtype=float).reshape(3).copy(),
+            "lidar_yaw_off": float(self._lidar_yaw_off),
+            "lidar_fused_n": int(self._lidar_fused_n),
             # Foot kinematics:
             # - foot_vicon: delta/vicon frame (+Z DOWN)
             # - foot_b:     body frame (FRD, +Z DOWN)

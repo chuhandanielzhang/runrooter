@@ -21,6 +21,8 @@ from python.hopper_cmd_lcmt import hopper_cmd_lcmt  # type: ignore
 from python.hopper_imu_lcmt import hopper_imu_lcmt  # type: ignore
 from python.gamepad_lcmt import gamepad_lcmt  # type: ignore
 from python.motor_pwm_lcmt import motor_pwm_lcmt  # type: ignore
+from python.hopper_odom_lcmt import hopper_odom_lcmt  # type: ignore
+from python.hopper_nav_cmd_lcmt import hopper_nav_cmd_lcmt  # type: ignore
 
 from modee.core import ModeECore, ModeEConfig
 
@@ -49,6 +51,13 @@ class ModeELCMConfig:
     lcm_url: str = "udpm://239.255.76.67:7667?ttl=255"
     max_cmd_vel: float = 0.8
     stick_deadzone: float = 0.10
+    # ---- LiDAR patrol (hopper_nav_cmd_lcmt from lidar_perception/patrol.py) ----
+    # SELECT toggles patrol; while engaged the nav velocity replaces the stick.
+    # ANY stick input beyond the deadzone (or B) immediately disengages.
+    # Nav command staleness gate: older than this -> treat as inactive (robot
+    # falls back to zero-velocity stick behavior, patrol stays engaged).
+    nav_cmd_stale_s: float = 0.3
+    nav_cmd_vel_max: float = 0.5  # hard cap on patrol velocity (below max_cmd_vel)
     # Print rate (Hz). Default 5: status line only; control loop stays 500 Hz (dt=0.002).
     # Set <=0 to print every control step (500 lines/s — usually too fast).
     print_hz: float = 5.0
@@ -202,6 +211,16 @@ class ModeELCMController:
             "gamepad": None,
             "have_motor": False,
             "have_imu": False,
+            # LiDAR odometry (hopper_odom_lcmt) -- fed to core.update_lidar_odom
+            "odom_pos": np.zeros(3),
+            "odom_yaw": 0.0,
+            "odom_quality": 0,
+            "odom_rx_t": 0.0,
+            # Patrol nav command (hopper_nav_cmd_lcmt)
+            "nav_v_xy": np.zeros(2),
+            "nav_active": 0,
+            "nav_wp_index": -1,
+            "nav_rx_t": 0.0,
         }
 
         # CSV logger (starts on gamepad Y press; stops when program exits)
@@ -271,9 +290,15 @@ class ModeELCMController:
         # (the Jetson driver latches the new zero on the 0->1 edge).
         self._rm_zero_until: float = 0.0
 
+        # Patrol engage flag (SELECT toggles; stick/B disengages).
+        self._patrol_enable: bool = False
+        self._last_select: bool = False
+
         self.lc.subscribe("hopper_data_lcmt", self._handle_robot_data)
         self.lc.subscribe("hopper_imu_lcmt", self._handle_imu_data)
         self.lc.subscribe("gamepad_lcmt", self._handle_gamepad_data)
+        self.lc.subscribe("hopper_odom_lcmt", self._handle_odom_data)
+        self.lc.subscribe("hopper_nav_cmd_lcmt", self._handle_nav_cmd)
 
         # SAFE latch (upper-layer)
         self._safe_until = 0.0
@@ -437,6 +462,32 @@ class ModeELCMController:
             return
         with self.lock:
             self.robot_state["gamepad"] = msg
+
+    def _handle_odom_data(self, channel: str, data: bytes) -> None:
+        try:
+            msg = hopper_odom_lcmt.decode(data)
+        except Exception:
+            return
+        with self.lock:
+            self.robot_state["odom_pos"] = np.array(
+                [float(msg.pos[0]), float(msg.pos[1]), float(msg.pos[2])], dtype=float
+            )
+            self.robot_state["odom_yaw"] = float(msg.rpy[2])
+            self.robot_state["odom_quality"] = int(msg.quality)
+            self.robot_state["odom_rx_t"] = float(time.time())
+
+    def _handle_nav_cmd(self, channel: str, data: bytes) -> None:
+        try:
+            msg = hopper_nav_cmd_lcmt.decode(data)
+        except Exception:
+            return
+        with self.lock:
+            self.robot_state["nav_v_xy"] = np.array(
+                [float(msg.v_xy_w[0]), float(msg.v_xy_w[1])], dtype=float
+            )
+            self.robot_state["nav_active"] = int(msg.active)
+            self.robot_state["nav_wp_index"] = int(msg.wp_index)
+            self.robot_state["nav_rx_t"] = float(time.time())
 
     def run_lcm_handler(self) -> None:
         while self.running:
@@ -1015,8 +1066,17 @@ class ModeELCMController:
         else:
             ph = "FLIGHT"
         v_leg_w = np.asarray(info.get("v_meas_foot_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
+        # LiDAR / patrol tags: +LIDAR when odom is fresh-and-fused this tick,
+        # +PATROL(wpN) while the SELECT patrol mode drives the velocity command.
+        lidar_tag = ""
+        if int(info.get("lidar_fresh", 0)):
+            p_l = np.asarray(info.get("lidar_pos_map", [np.nan] * 3), dtype=float).reshape(3)
+            lidar_tag = f" +LIDAR[{p_l[0]:+.2f},{p_l[1]:+.2f}]"
+        patrol_tag = ""
+        if bool(self._patrol_enable):
+            patrol_tag = f" +PATROL(wp{int(self.robot_state.get('nav_wp_index', -1))})"
         return (
-            f"[{ph}] "
+            f"[{ph}]{lidar_tag}{patrol_tag} "
             f"v_leg_w=[{v_leg_w[0]:+.3f},{v_leg_w[1]:+.3f},{v_leg_w[2]:+.3f}]"
         )
 
@@ -1335,6 +1395,23 @@ class ModeELCMController:
                     imu_acc = np.asarray(self.robot_state["imu_acc"], dtype=float).reshape(3).copy()
                     imu_rpy = np.asarray(self.robot_state["imu_rpy"], dtype=float).reshape(3).copy()
                     gamepad_msg = self.robot_state["gamepad"]
+                    odom_pos = np.asarray(self.robot_state["odom_pos"], dtype=float).reshape(3).copy()
+                    odom_yaw = float(self.robot_state["odom_yaw"])
+                    odom_quality = int(self.robot_state["odom_quality"])
+                    odom_rx_t = float(self.robot_state["odom_rx_t"])
+                    nav_v_xy = np.asarray(self.robot_state["nav_v_xy"], dtype=float).reshape(2).copy()
+                    nav_active = int(self.robot_state["nav_active"])
+                    nav_rx_t = float(self.robot_state["nav_rx_t"])
+
+                # Feed the latest lidar odometry to the core estimator (fusion
+                # itself happens inside core.step, gated by freshness/quality).
+                if odom_rx_t > 0.0:
+                    self.core.update_lidar_odom(
+                        pos_map=odom_pos,
+                        yaw_map=odom_yaw,
+                        quality=odom_quality,
+                        rx_walltime=odom_rx_t,
+                    )
 
                 # Y key logging trigger works even before we have all packets
                 self._handle_log_trigger(gamepad_msg)
@@ -1351,6 +1428,30 @@ class ModeELCMController:
                     continue
 
                 desired_v_xy = self._compute_desired_v_xy(gamepad_msg)
+
+                # ===== LiDAR patrol (SELECT toggles; stick/B wins back) =====
+                sel_now = bool(getattr(gamepad_msg, "select", 0)) if gamepad_msg is not None else False
+                if sel_now and not self._last_select:
+                    self._patrol_enable = not self._patrol_enable
+                    print(f"[patrol] {'ENGAGED' if self._patrol_enable else 'OFF'} (SELECT)")
+                self._last_select = sel_now
+                b_now_pat = bool(getattr(gamepad_msg, "b", 0)) if gamepad_msg is not None else False
+                stick_moved = bool(np.any(np.abs(desired_v_xy) > 1e-9))  # already deadzoned
+                if self._patrol_enable and (b_now_pat or stick_moved):
+                    self._patrol_enable = False
+                    print(f"[patrol] OFF ({'B' if b_now_pat else 'stick override'})")
+                if self._patrol_enable:
+                    nav_fresh = (now - nav_rx_t) < float(getattr(self.lcm_cfg, "nav_cmd_stale_s", 0.3))
+                    if nav_fresh and (nav_active == 1):
+                        v_cap = float(getattr(self.lcm_cfg, "nav_cmd_vel_max", 0.5))
+                        n_nav = float(np.hypot(float(nav_v_xy[0]), float(nav_v_xy[1])))
+                        if n_nav > v_cap and n_nav > 1e-9:
+                            nav_v_xy = nav_v_xy * (v_cap / n_nav)
+                        desired_v_xy = nav_v_xy.astype(float).copy()
+                    else:
+                        # patrol engaged but no valid nav cmd -> hold position (v=0)
+                        desired_v_xy = np.zeros(2, dtype=float)
+
                 if bool(self._zero_vel_hold) or bool(self._y_hold_until_stance):
                     desired_v_xy[:] = 0.0
                 # Demo override: walk slowly in -X (or any configured constant velocity)

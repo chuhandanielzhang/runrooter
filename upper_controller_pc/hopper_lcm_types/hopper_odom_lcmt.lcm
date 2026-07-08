@@ -1,0 +1,14 @@
+struct hopper_odom_lcmt {
+    // LiDAR-inertial odometry of the robot BODY frame, expressed in the
+    // hopper world convention: NED-style, +Z DOWN, x = map-forward.
+    // Published by lidar_perception/odom_lcm_bridge.py (Point-LIO output,
+    // extrinsics + FLU/ENU -> FRD/NED conversion already applied).
+    int64_t utime;        // wall-clock time of the odom estimate (us)
+    float   pos[3];       // body/COM position in map frame (m, +Z down)
+    float   vel[3];       // body velocity in map frame (m/s, +Z down)
+    float   quat[4];      // body->map attitude, wxyz (FRD body, NED map)
+    float   rpy[3];       // roll/pitch/yaw of the above (rad, aerospace ZYX)
+    int8_t  localized;    // 1 = map-relocalized (map frame is the SAVED map);
+                          // 0 = odometry frame (map origin = power-on pose)
+    int8_t  quality;      // 1 = healthy, 0 = degraded (do not fuse)
+}
