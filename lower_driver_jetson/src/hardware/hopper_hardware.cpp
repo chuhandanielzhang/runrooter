@@ -1,6 +1,8 @@
 #include "hopper_hardware.hpp"
 
 #include <cstdlib>
+#include <string>
+#include <thread>
 
 static inline float wrap_to_pi(float a) {
     a = std::fmod(a + static_cast<float>(M_PI), 2.0f * static_cast<float>(M_PI));
@@ -43,22 +45,77 @@ HopperHardware::HopperHardware(bool is_publish_lcm_data):
                 * coordinateRotation(CoordinateAxis::Y, 0.0f)
                 * coordinateRotation(CoordinateAxis::X, 0.0f);
     // initialize the Lpms IG1 IMU (same as CASE hopper_driver-master)
+    // 2026-07-09: run the IG1 at 500 Hz (factory default streams 100 Hz, which
+    // held every gyro/rpy sample for ~5 control ticks). 500 Hz does not fit in
+    // 115200 baud, so the sensor UART is converted to 921600 and the payload
+    // trimmed to the fields this driver consumes.
     imu_wrapper_ptr_ = new ImuWrapper();
     {
+        const uint32_t kImuTdrMask =
+            TDR_ACC_CALIBRATED_OUTPUT_ENABLED |
+            TDR_GYR1_BIAS_CALIBRATED_OUTPUT_ENABLED |   // parsed as gyroIIBiasCalibrated
+            TDR_QUAT_OUTPUT_ENABLED |
+            TDR_EULER_OUTPUT_ENABLED;
+        const int kImuTargetBaud = LPMS_UART_BAUDRATE_921600;
+        // Probe target baud first (sensor already converted on a previous run),
+        // then factory default, then intermediates in case a conversion half-landed.
+        const int bauds[] = {kImuTargetBaud, LPMS_UART_BAUDRATE_115200,
+                             LPMS_UART_BAUDRATE_460800, LPMS_UART_BAUDRATE_230400};
         const char* env_port = std::getenv("HOPPER_IMU_PORT");
-        const char* ports[] = {env_port, "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM2", nullptr};
-        bool imu_ok = false;
-        for (const char* const* p = ports; *p != nullptr; ++p) {
-            if (*p == nullptr || (*p)[0] == '\0') continue;
-            if (imu_wrapper_ptr_->connect(*p)) {
-                imu_ok = true;
-                std::cout << "Lpms IMU connected on " << *p << std::endl;
-                break;
+        std::vector<std::string> ports;
+        if (env_port != nullptr && env_port[0] != '\0') ports.push_back(env_port);
+        ports.push_back("/dev/ttyUSB0");
+        ports.push_back("/dev/ttyUSB1");
+        ports.push_back("/dev/ttyACM2");
+
+        std::string imu_port;
+        int imu_baud = 0;
+        for (const std::string& p : ports) {
+            for (int b : bauds) {
+                if (imu_wrapper_ptr_->connect(p, b)) {
+                    imu_port = p;
+                    imu_baud = b;
+                    break;
+                }
             }
+            if (imu_baud != 0) break;
         }
-        if (!imu_ok) {
+
+        if (imu_baud == 0) {
             std::cerr << "WARN: Lpms IMU connect failed (tried HOPPER_IMU_PORT, ttyUSB0/1, ttyACM2)."
                       << std::endl;
+        } else {
+            std::cout << "Lpms IMU connected on " << imu_port << " @ " << imu_baud << std::endl;
+            if (imu_baud != kImuTargetBaud) {
+                // Convert the sensor UART BEFORE raising the stream rate, so we
+                // never stream 500 Hz into a saturated 115200 link.
+                std::cout << "IMU: converting sensor UART " << imu_baud << " -> "
+                          << kImuTargetBaud << std::endl;
+                imu_wrapper_ptr_->setUartBaudrate(static_cast<uint32_t>(kImuTargetBaud));
+                imu_wrapper_ptr_->disconnect();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                if (imu_wrapper_ptr_->connect(imu_port, kImuTargetBaud)) {
+                    imu_baud = kImuTargetBaud;
+                } else if (imu_wrapper_ptr_->connect(imu_port, imu_baud)) {
+                    // Sensor kept the old baud (some firmwares apply it only after
+                    // a power cycle); stay at a stream rate the link can carry.
+                    std::cerr << "WARN: IMU stayed at " << imu_baud
+                              << " baud; will retry conversion next boot." << std::endl;
+                } else {
+                    std::cerr << "WARN: IMU reconnect after baud conversion failed." << std::endl;
+                    imu_baud = 0;
+                }
+            }
+            if (imu_baud != 0) {
+                // Pick the highest stream rate the serial link can carry
+                // (~70 B/packet with the trimmed TDR incl. LP-BUS framing).
+                const uint32_t hz = (imu_baud >= LPMS_UART_BAUDRATE_460800) ? 500u
+                                  : (imu_baud >= LPMS_UART_BAUDRATE_230400) ? 250u : 100u;
+                imu_wrapper_ptr_->configureStreaming(hz, kImuTdrMask);
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                std::cout << "IMU stream rate: " << imu_wrapper_ptr_->getDataFrequency()
+                          << " Hz (target " << hz << " Hz @ " << imu_baud << " baud)" << std::endl;
+            }
         }
     }
     std::cout << "Driver: 3x AK60 (can0) + Lpms IMU -> hopper_data_lcmt / hopper_imu_lcmt @ 500Hz" << std::endl;

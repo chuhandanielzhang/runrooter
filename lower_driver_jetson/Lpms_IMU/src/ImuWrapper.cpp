@@ -28,7 +28,7 @@ ImuWrapper::~ImuWrapper() {
     }
 }
 
-bool ImuWrapper::connect(const std::string& port, int baudrate) {
+bool ImuWrapper::connect(const std::string& port, int baudrate, int timeout_s) {
     if (!sensor_) {
         log("Error: Sensor not initialized");
         return false;
@@ -41,22 +41,24 @@ bool ImuWrapper::connect(const std::string& port, int baudrate) {
         return false;
     }
     
-    // Wait for connection
-    do {
+    // Wait for connection. A baudrate mismatch can leave the library stuck in
+    // CONNECTING/DATA_TIMEOUT forever (autoReconnect keeps retrying), so bound
+    // the wait: we probe several baudrates at startup and must fail fast.
+    for (int i = 0; i < timeout_s; ++i) {
         log("Waiting for sensor to connect...");
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    } while (
-        !(sensor_->getStatus() == STATUS_CONNECTED) && 
-        !(sensor_->getStatus() == STATUS_CONNECTION_ERROR)
-    );
-    
-    if (sensor_->getStatus() != STATUS_CONNECTED) {
-        log("Sensor connection error status: " + std::to_string(sensor_->getStatus()));
-        return false;
+        int st = sensor_->getStatus();
+        if (st == STATUS_CONNECTED) {
+            log("Sensor connected successfully");
+            return true;
+        }
+        if (st == STATUS_CONNECTION_ERROR) break;
     }
     
-    log("Sensor connected successfully");
-    return true;
+    log("Sensor connect failed @ " + std::to_string(baudrate) +
+        " (status: " + std::to_string(sensor_->getStatus()) + ")");
+    sensor_->disconnect();
+    return false;
 }
 
 void ImuWrapper::disconnect() {
@@ -100,6 +102,46 @@ bool ImuWrapper::resetHeading() {
     
     sensor_->commandSetOffsetMode(LPMS_OFFSET_MODE_HEADING);
     log("Reset heading");
+    return true;
+}
+
+bool ImuWrapper::configureStreaming(uint32_t freq_hz, uint32_t tdr_mask) {
+    if (!isConnected()) {
+        log("Error: Sensor not connected");
+        return false;
+    }
+    // NOTE: every command* call in LpmsIG1 CLEARS the internal command queue
+    // before enqueueing, so calls must be spaced out to let the queue drain.
+    log("Set stream frequency " + std::to_string(freq_hz) + " Hz");
+    sensor_->commandSetSensorFrequency(freq_hz);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (tdr_mask != 0) {
+        log("Set transmit data mask 0x" + std::to_string(tdr_mask));
+        sensor_->commandSetTransmitData(tdr_mask);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    log("Save parameters to sensor flash");
+    sensor_->commandSaveParameters();
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    sensor_->commandGotoStreamingMode();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    return true;
+}
+
+bool ImuWrapper::setUartBaudrate(uint32_t baud) {
+    if (!isConnected()) {
+        log("Error: Sensor not connected");
+        return false;
+    }
+    // Order matters: persist everything else BEFORE touching the baudrate
+    // (configureStreaming already saved). If the sensor switches its UART
+    // immediately, the trailing save may be lost -- the startup probe list
+    // covers both outcomes (sensor at new or old baud).
+    log("Set sensor UART baudrate " + std::to_string(baud));
+    sensor_->commandSetUartBaudRate(baud);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    sensor_->commandSaveParameters();
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
     return true;
 }
 

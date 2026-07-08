@@ -21,9 +21,20 @@ public:
     ~ImuWrapper();
     
     // Connection management
-    bool connect(const std::string& port = "/dev/ttyUSB0", int baudrate = 115200);
+    bool connect(const std::string& port = "/dev/ttyUSB0", int baudrate = 115200,
+                 int timeout_s = 8);
     void disconnect();
     bool isConnected() const;
+
+    // ===== High-rate configuration (2026-07-09) =====
+    // Set stream frequency (DATA_STREAM_FREQ_xxx) and, if tdr_mask != 0, the
+    // transmit data register (TDR_xxx bit-or), then persist to sensor flash.
+    // The IG1 library re-reads the TDR after setting it, so its packet parser
+    // stays in sync. Sensor must be connected.
+    bool configureStreaming(uint32_t freq_hz, uint32_t tdr_mask = 0);
+    // Persist a new sensor UART baudrate (LPMS_UART_BAUDRATE_xxx) to flash.
+    // The caller must disconnect() and connect() again at the new baudrate.
+    bool setUartBaudrate(uint32_t baud);
     
     // Mode control
     bool gotoCommandMode();
