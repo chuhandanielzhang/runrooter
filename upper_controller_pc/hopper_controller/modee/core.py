@@ -359,7 +359,7 @@ class ModeEConfig:
     # This helps achieve target hop height even with model errors.
     use_energy_compensation: bool = True
     # Hopper4-style energy loop (scaled conservative for real-robot bring-up).
-    energy_comp_kp: float = 5.2
+    energy_comp_kp: float = 5
     # TRUE desired apex height above liftoff (m). 2026-07-05: this is now a real
     # closed-loop target -- see apex_fb_* below. Set what you actually want.
     hop_height_m: float = 0.1
@@ -568,7 +568,7 @@ class ModeEConfig:
 
     # ===== Flight foot placement =====
     # Raibert (Kv/Kr) in WORLD (+Z down), then foot_des_b = R_wb^T @ target_w (quaternion).
-    flight_kv: float = 0.12
+    flight_kv: float = 0.18
     flight_kr: float = 0.0
     # Neutral-point forward bias (BODY +x, meters), added to the Raibert/S2S
     # XY target. Motivation (2026-07-09 log, 5 pure-leg hops): the foot touches
@@ -740,17 +740,14 @@ class ModeEConfig:
     stance_fz_max: float = 260.0   # raised 240->260 for more vertical headroom in stance
     # Stance horizontal (attitude) force limit, applied by PROPORTIONAL scaling
     # (direction preserved) in the closed-form allocation. 2026-07-09 user
-    # decision: ONE friction cone with a 20 N ceiling,
-    #   |fxy| <= min(stance_mu * fz, stance_fxy_max)
-    # The cone (mu*fz) is what protects right at touchdown while fz is still
-    # ramping; the 20 N ceiling bounds it once fz is large (0.3*fz would allow
-    # 45+ N at push peak). Set either to <=0 to disable that part.
-    stance_mu: float = 0.3
-    # 30 -> 20 (2026-07-09, user): tighter ceiling; measured hops 1-2 peaked at
-    # |fxy| ~ 19 N, so 20 N keeps normal operation untouched and only trims the
-    # extremes (the old 15 N cap clipped the fz lever-arm feedforward, 30 N
-    # never engaged).
-    stance_fxy_max: float = 20.0
+    # decision (v2, 08:38): friction cone DISABLED (mu=0), replaced by a plain
+    # hard cut:  |fxy| <= stance_fxy_max = 10 N  at every instant of stance,
+    # including touchdown. Set stance_mu > 0 to bring the mu*fz cone back.
+    stance_mu: float = 0.0
+    # 20 -> 10 (2026-07-09, user): note the 08:32 run needed up to ~16 N on its
+    # good hops, so this cap WILL clip the fz lever-arm feedforward and part of
+    # the attitude torque; raise it back if roll/pitch stops converging.
+    stance_fxy_max: float = 10.0
 
     # PWM limits
     pwm_min_us: float = 1000.0
@@ -942,10 +939,10 @@ class ModeEConfig:
     # 2026-07-01: RESTORED to ACTUAL CASE values (kpp=100, kpd=1) from the CASE zip; had been
     # cut to 5/0 (20x weaker stance attitude, no damping) -> couldn't arrest tip-over.
     # User-tuned values (2026-07-05: keep these, do NOT bulk-restore CASE).
-    stance_kpp_x: float = 80.0    # leg stance kR roll
-    stance_kpp_y: float = 80.0    # leg stance kR pitch
-    stance_kpd_x: float = 1    # leg stance kW roll
-    stance_kpd_y: float = 1    # leg stance kW pitch
+    stance_kpp_x: float = 43.0    # leg stance kR roll
+    stance_kpp_y: float = 43.0    # leg stance kR pitch
+    stance_kpd_x: float = 1.4    # leg stance kW roll
+    stance_kpd_y: float = 1.4    # leg stance kW pitch
     # ===== Stance D-term gyro conditioning: NOTCH + light LPF =====
     # We consume PX4 /fmu/out/sensor_combined = RAW gyro (PX4's own filter
     # pipeline only applies to vehicle_angular_velocity, which is not in the
