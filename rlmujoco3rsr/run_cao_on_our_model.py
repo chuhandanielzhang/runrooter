@@ -70,6 +70,12 @@ if os.environ.get("CAO_SW_KD"):
     cfg.swing_kd_xy = float(os.environ["CAO_SW_KD"])
 
 lcm_cfg = ModeELCMConfig()
+# SIM ISOLATION (2026-07-09): NEVER use the default lcm_url here -- it is the
+# REAL robot bus (port 7667, ttl=255 -> leaves this host and reaches the
+# Jetson driver; running the sim actuated the real robot twice today).
+# Port 7669 + ttl=0 stays on loopback and cannot collide with run_modee.py
+# (7667) even on the same machine. LCM_DEFAULT_URL (sweep scripts) wins.
+lcm_cfg.lcm_url = os.environ.get("LCM_DEFAULT_URL", "udpm://239.255.76.67:7669?ttl=0")
 lcm_cfg.print_hz = 2.0
 lcm_cfg.tau_out_max_nm = float(os.environ.get("CAO_TAU", "9.0"))
 # our 3RSR retracts further than their hardware (q_lcm up to ~1.60 at the sim

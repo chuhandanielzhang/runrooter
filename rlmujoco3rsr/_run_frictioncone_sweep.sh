@@ -7,6 +7,13 @@
 set -u
 cd "$(dirname "$0")"
 
+# Isolated LCM bus: port 7669, ttl=0 (loopback only). MUST differ from the
+# REAL robot bus (7667): ttl=0 only stops packets leaving this host -- a
+# run_modee.py session on the SAME PC still receives same-port multicast via
+# local loopback and forwards it to the Jetson (this actuated the real robot
+# twice on 2026-07-09). Different port = hard isolation.
+export LCM_DEFAULT_URL="udpm://239.255.76.67:7669?ttl=0"
+
 MUS=${MUS:-"0.9 0.4 0.25"}
 DFS=${DFS:-"0 15 30"}
 DUR=${DUR:-15}

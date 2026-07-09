@@ -359,7 +359,7 @@ class ModeEConfig:
     # This helps achieve target hop height even with model errors.
     use_energy_compensation: bool = True
     # Hopper4-style energy loop (scaled conservative for real-robot bring-up).
-    energy_comp_kp: float = 6.4
+    energy_comp_kp: float = 6
     # TRUE desired apex height above liftoff (m). 2026-07-05: this is now a real
     # closed-loop target -- see apex_fb_* below. Set what you actually want.
     hop_height_m: float = 0.06
@@ -596,7 +596,7 @@ class ModeEConfig:
     # Use moderate kd (8-12) with strong LPF filtering instead of high kd.
     # Over-extension is also limited by the axial_coeff clamp logic (line ~2169).
     swing_kp_z: float = 1000.0
-    stance_kp_z: float = 1300.0   # RESTORED to Cao original (was drifted to 1100)
+    stance_kp_z: float = 1400.0   # RESTORED to Cao original (was drifted to 1100)
     stance_kd_z: float = 10.0    # RESTORED to Cao original (was drifted to 20)
     swing_kd_z: float = 10.0
     # Baseline anti-chatter around nominal length (flight):
@@ -1179,10 +1179,16 @@ class ModeECore:
         # Filtered gyro for the stance attitude D-term (see stance_gyro_lpf_tau).
         self._stance_gyro_lpf = np.zeros(3, dtype=float)
         self._stance_gyro_lpf_init: bool = False
-        # Last DELIVERED stance attitude torque (post tau_rp_max clip), used by
-        # the delay predictor (stance_att_pred_s) to extrapolate omega. Zeroed
-        # in flight so the first stance step predicts from tau_prev = 0.
-        self._tau_att_cmd_prev = np.zeros(2, dtype=float)
+        # Ring buffer of the stance attitude torques (roll/pitch) sent during
+        # the last stance_att_pred_s seconds -- the commands still "in flight"
+        # through the actuation delay. The omega predictor integrates each of
+        # them with its TRUE impulse dt/J. (v1 bug 2026-07-09 10:2x log:
+        # multiplying only the LAST sample by the whole horizon T overweights
+        # it 5x -> per-step loop gain kW*T/J ~ 1.0 -> sign-alternating fxy
+        # chatter at Nyquist. The buffer removes that algebraic loop.)
+        _n_pred = int(max(1, round(float(getattr(cfg, "stance_att_pred_s", 0.0)) / max(1e-6, float(self.dt)))))
+        self._tau_att_hist = np.zeros((_n_pred, 2), dtype=float)
+        self._tau_att_hist_i = 0
         # Biquad notch state for the D-term gyro (x/y axes): [x1,x2,y1,y2] each.
         self._gyro_notch_x = np.zeros((2, 4), dtype=float)
         self._gyro_notch_init: bool = False
@@ -3288,9 +3294,15 @@ class ModeECore:
                 # Small-angle: d(e_R_xy)/dt ~= omega_xy (level target, yaw-free).
                 e_R_use[0] += float(omega_d[0]) * T_pred
                 e_R_use[1] += float(omega_d[1]) * T_pred
-                # omega evolves under the torque already in the pipeline.
-                omega_use[0] += (T_pred / J_xy) * float(self._tau_att_cmd_prev[0])
-                omega_use[1] += (T_pred / J_xy) * float(self._tau_att_cmd_prev[1])
+                # omega evolves under the torques already in the pipeline: each
+                # buffered command acts for ONE control period, so its impulse
+                # is dt/J (NOT T/J -- see _tau_att_hist init for the v1 bug).
+                dw = (float(self.dt) / J_xy) * self._tau_att_hist.sum(axis=0)
+                # Robustness clip: if the cone/torque limits shaved the real
+                # delivered torque, the model overestimates; bound the term.
+                dw = np.clip(dw, -3.0, 3.0)
+                omega_use[0] += float(dw[0])
+                omega_use[1] += float(dw[1])
             tau_b_stance = np.zeros(3, dtype=float)
             tau_b_stance[0] = -kR_x * float(e_R_use[0]) - kW_x * float(omega_use[0])
             tau_b_stance[1] = -kR_y * float(e_R_use[1]) - kW_y * float(omega_use[1])
@@ -3329,11 +3341,15 @@ class ModeECore:
             tau_b_att_des[1] = float(tau_b_att_des[1] * scale)
         if bool(self._stance):
             tau_b_stance_des = tau_b_att_des.copy()
-            # Predictor memory: post-clip torque actually sent this cycle.
-            self._tau_att_cmd_prev[0] = float(tau_b_att_des[0])
-            self._tau_att_cmd_prev[1] = float(tau_b_att_des[1])
+            # Predictor memory: push the post-clip torque sent this cycle into
+            # the delay ring buffer (may be scaled down again by the friction
+            # cone in the allocation below -- see the s_fxy hook there).
+            self._tau_att_hist[self._tau_att_hist_i, 0] = float(tau_b_att_des[0])
+            self._tau_att_hist[self._tau_att_hist_i, 1] = float(tau_b_att_des[1])
         else:
-            self._tau_att_cmd_prev[:] = 0.0
+            self._tau_att_hist[self._tau_att_hist_i, :] = 0.0
+        _tau_hist_i_now = int(self._tau_att_hist_i)
+        self._tau_att_hist_i = (self._tau_att_hist_i + 1) % self._tau_att_hist.shape[0]
         tau_w = (R_wb_hat @ tau_b_att_des.reshape(3)).reshape(3)
         Tau_des = np.array([float(tau_w[0]), float(tau_w[1]), 0.0], dtype=float)
         # Propeller attitude demand uses the propeller/flight gains in both
@@ -3591,6 +3607,10 @@ class ModeECore:
                 if np.isfinite(lim) and fxy_norm > lim and fxy_norm > 1e-9:
                     s_fxy = lim / fxy_norm
                     fxy_b = (float(fxy_b[0]) * s_fxy, float(fxy_b[1]) * s_fxy)
+                    # Delay predictor sees the DELIVERED torque: the cone just
+                    # shaved the tangential force, so shave this step's entry
+                    # in the torque ring buffer by the same factor.
+                    self._tau_att_hist[_tau_hist_i_now, :] *= float(s_fxy)
                 f_contact_b_cmd = np.array([float(fxy_b[0]), float(fxy_b[1]), fz_cmd], dtype=float)
                 # Downstream variables named *_w expect world frame; convert once here.
                 f_contact_w = (R_wb_hat @ f_contact_b_cmd.reshape(3)).reshape(3)

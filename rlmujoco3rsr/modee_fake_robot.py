@@ -176,7 +176,10 @@ def main():
           {k: f"thrust_{v[0]+1} (err {v[1]:.0f} deg)" for k, v in pwm_to_act.items()})
 
     motor_table = MotorTableModel.default_from_table()
-    lc = lcm.LCM()
+    # SIM ISOLATION: default to a loopback-only bus (7669, ttl=0) so the fake
+    # robot can NEVER talk to the real Jetson driver (7667, ttl=255). Sweep
+    # scripts that export LCM_DEFAULT_URL keep working (env wins).
+    lc = lcm.LCM(os.environ.get("LCM_DEFAULT_URL", "udpm://239.255.76.67:7669?ttl=0"))
     tau_lcm = np.zeros(3)
     qd_filt = np.zeros(3)
     pwm_cmd = np.full(6, 1000.0)

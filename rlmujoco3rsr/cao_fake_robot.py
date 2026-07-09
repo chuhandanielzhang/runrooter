@@ -107,7 +107,8 @@ def main():
 
     motor_table = MotorTableModel.default_from_table()
 
-    lc = lcm.LCM()
+    # SIM ISOLATION: loopback-only bus, never the real robot's 7667.
+    lc = lcm.LCM(os.environ.get("LCM_DEFAULT_URL", "udpm://239.255.76.67:7669?ttl=0"))
     tau_lcm = np.zeros(3)
     qd_filt = np.zeros(3)
     pwm_cmd = np.full(6, 1000.0)
