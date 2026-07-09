@@ -359,10 +359,10 @@ class ModeEConfig:
     # This helps achieve target hop height even with model errors.
     use_energy_compensation: bool = True
     # Hopper4-style energy loop (scaled conservative for real-robot bring-up).
-    energy_comp_kp: float = 5
+    energy_comp_kp: float = 6.4
     # TRUE desired apex height above liftoff (m). 2026-07-05: this is now a real
     # closed-loop target -- see apex_fb_* below. Set what you actually want.
-    hop_height_m: float = 0.1
+    hop_height_m: float = 0.06
     # ===== Per-hop apex feedback (closes the height loop) =====
     # The energy pump above is a P-only law: fz ~ Kp*(E_tgt - E_now). Its
     # steady-state height sits FAR below hop_height_m (0.39 commanded ->
@@ -568,7 +568,7 @@ class ModeEConfig:
 
     # ===== Flight foot placement =====
     # Raibert (Kv/Kr) in WORLD (+Z down), then foot_des_b = R_wb^T @ target_w (quaternion).
-    flight_kv: float = 0.18
+    flight_kv: float = 0.17
     flight_kr: float = 0.0
     # Neutral-point forward bias (BODY +x, meters), added to the Raibert/S2S
     # XY target. Motivation (2026-07-09 log, 5 pure-leg hops): the foot touches
@@ -596,7 +596,7 @@ class ModeEConfig:
     # Use moderate kd (8-12) with strong LPF filtering instead of high kd.
     # Over-extension is also limited by the axial_coeff clamp logic (line ~2169).
     swing_kp_z: float = 1000.0
-    stance_kp_z: float = 1200.0   # RESTORED to Cao original (was drifted to 1100)
+    stance_kp_z: float = 1300.0   # RESTORED to Cao original (was drifted to 1100)
     stance_kd_z: float = 10.0    # RESTORED to Cao original (was drifted to 20)
     swing_kd_z: float = 10.0
     # Baseline anti-chatter around nominal length (flight):
@@ -747,7 +747,12 @@ class ModeEConfig:
     # touchdown (small fz) is protected while mid-push (fz ~ 150 N) keeps
     # authority; the 20 N ceiling bounds the cone once fz is large. Set either
     # to <= 0 to disable that part.
-    stance_mu: float = 0.1
+    # 2026-07-09: mu 0.08 -> 0.25. The 09:55 log showed fx/fy RIDING the cone
+    # limit through early stance (attitude PD demanded ~6 Nm, the cone allowed
+    # ~1.7 Nm at fz~50 N) -- "no force at small angles" was the cone clipping,
+    # not a gain problem. Rubber foot on floor has real mu >= 0.5, so 0.25
+    # still keeps 2x physical margin.
+    stance_mu: float = 0.25
     stance_fxy_max: float = 20.0
 
     # PWM limits
@@ -940,10 +945,33 @@ class ModeEConfig:
     # 2026-07-01: RESTORED to ACTUAL CASE values (kpp=100, kpd=1) from the CASE zip; had been
     # cut to 5/0 (20x weaker stance attitude, no damping) -> couldn't arrest tip-over.
     # User-tuned values (2026-07-05: keep these, do NOT bulk-restore CASE).
-    stance_kpp_x: float = 60.0    # leg stance kR roll
-    stance_kpp_y: float = 60.0    # leg stance kR pitch
-    stance_kpd_x: float = 1.4    # leg stance kW roll
-    stance_kpd_y: float = 1.4    # leg stance kW pitch
+    # 2026-07-09: raised 30/1.3 -> 50/3.0 TOGETHER with the delay predictor
+    # below (stance_att_pred_s). Without the predictor the old kW ceiling was
+    # ~1.4 -- grey-box ID on the 09:5x log measured a 10 ms cmd->response
+    # delay, and Skogestad-SIMC for a double integrator + delay gives exactly
+    # kW_max = 8*tau*kR/16... i.e. ~1.5 at kR=19. The predictor cancels most
+    # of that delay, buying headroom for these gains. If you DISABLE the
+    # predictor (stance_att_pred_s=0), drop back to kR~19-30, kW~1.3-1.5.
+    stance_kpp_x: float = 50.0    # leg stance kR roll
+    stance_kpp_y: float = 50.0    # leg stance kR pitch
+    stance_kpd_x: float = 3.0    # leg stance kW roll
+    stance_kpd_y: float = 3.0    # leg stance kW pitch
+    # ===== Stance attitude delay compensation (Smith-predictor style) =====
+    # The stance attitude loop is delay-limited: LCM->Jetson->CAN->current
+    # loop->mechanics measured ~10 ms (5 samples @500 Hz, cross-correlation of
+    # tau_b_stance_des vs measured angular acceleration, 2026-07-09 log).
+    # A raw-gyro PD acting on 10 ms old information self-excites when kW
+    # exceeds ~1.4 (matches SIMC theory). Instead of filtering (adds MORE
+    # lag) we feed the PD a state PREDICTED stance_att_pred_s ahead:
+    #   e_R_pred  = e_R + omega_xy * T        (d(e_R)/dt ~= omega for small ang)
+    #   omega_pred = omega + (T/J) * tau_prev (last DELIVERED attitude torque)
+    # Both are first-order model extrapolations -- no new sensors, no tuning
+    # beyond T (set to the measured delay) and J (from the MJCF inertia).
+    # Set stance_att_pred_s <= 0 to disable.
+    stance_att_pred_s: float = 0.010
+    # Body roll/pitch inertia about COM (kg m^2), from hopper_serial.xml base
+    # inertial (Ixx=Iyy=0.0297). Only used by the omega predictor above.
+    body_inertia_xy: float = 0.0297
     # ===== Stance D-term gyro conditioning: NOTCH + light LPF =====
     # We consume PX4 /fmu/out/sensor_combined = RAW gyro (PX4's own filter
     # pipeline only applies to vehicle_angular_velocity, which is not in the
@@ -1151,6 +1179,10 @@ class ModeECore:
         # Filtered gyro for the stance attitude D-term (see stance_gyro_lpf_tau).
         self._stance_gyro_lpf = np.zeros(3, dtype=float)
         self._stance_gyro_lpf_init: bool = False
+        # Last DELIVERED stance attitude torque (post tau_rp_max clip), used by
+        # the delay predictor (stance_att_pred_s) to extrapolate omega. Zeroed
+        # in flight so the first stance step predicts from tau_prev = 0.
+        self._tau_att_cmd_prev = np.zeros(2, dtype=float)
         # Biquad notch state for the D-term gyro (x/y axes): [x1,x2,y1,y2] each.
         self._gyro_notch_x = np.zeros((2, 4), dtype=float)
         self._gyro_notch_init: bool = False
@@ -3245,9 +3277,23 @@ class ModeECore:
             kR_y = float(self.cfg.stance_kpp_y)
             kW_x = float(self.cfg.stance_kpd_x)
             kW_y = float(self.cfg.stance_kpd_y)
+            # --- Delay compensation (see stance_att_pred_s in ModeEConfig) ---
+            # Feed the PD the state predicted T_pred ahead so the torque lands
+            # on the attitude it was computed for, not the one 10 ms ago.
+            e_R_use = np.asarray(e_R, dtype=float).reshape(3).copy()
+            omega_use = np.asarray(omega_d, dtype=float).reshape(3).copy()
+            T_pred = float(getattr(self.cfg, "stance_att_pred_s", 0.0))
+            if T_pred > 0.0:
+                J_xy = float(max(1e-4, float(getattr(self.cfg, "body_inertia_xy", 0.0297))))
+                # Small-angle: d(e_R_xy)/dt ~= omega_xy (level target, yaw-free).
+                e_R_use[0] += float(omega_d[0]) * T_pred
+                e_R_use[1] += float(omega_d[1]) * T_pred
+                # omega evolves under the torque already in the pipeline.
+                omega_use[0] += (T_pred / J_xy) * float(self._tau_att_cmd_prev[0])
+                omega_use[1] += (T_pred / J_xy) * float(self._tau_att_cmd_prev[1])
             tau_b_stance = np.zeros(3, dtype=float)
-            tau_b_stance[0] = -kR_x * float(e_R[0]) - kW_x * float(omega_d[0])
-            tau_b_stance[1] = -kR_y * float(e_R[1]) - kW_y * float(omega_d[1])
+            tau_b_stance[0] = -kR_x * float(e_R_use[0]) - kW_x * float(omega_use[0])
+            tau_b_stance[1] = -kR_y * float(e_R_use[1]) - kW_y * float(omega_use[1])
             tau_b_stance_des = tau_b_stance.copy()
             tau_b_att_des = tau_b_stance.copy()
             # DEBUG: kill stance attitude torque so QP produces NO horizontal contact force (fxfy=0).
@@ -3283,6 +3329,11 @@ class ModeECore:
             tau_b_att_des[1] = float(tau_b_att_des[1] * scale)
         if bool(self._stance):
             tau_b_stance_des = tau_b_att_des.copy()
+            # Predictor memory: post-clip torque actually sent this cycle.
+            self._tau_att_cmd_prev[0] = float(tau_b_att_des[0])
+            self._tau_att_cmd_prev[1] = float(tau_b_att_des[1])
+        else:
+            self._tau_att_cmd_prev[:] = 0.0
         tau_w = (R_wb_hat @ tau_b_att_des.reshape(3)).reshape(3)
         Tau_des = np.array([float(tau_w[0]), float(tau_w[1]), 0.0], dtype=float)
         # Propeller attitude demand uses the propeller/flight gains in both
