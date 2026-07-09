@@ -165,11 +165,13 @@ Examples:
         "--control-mode",
         type=int,
         default=None,
-        choices=[2, 3],
-        help="Control mode: 2=decouple (lstsq prop, stance+flight), "
+        choices=[1, 2, 3],
+        help="Control mode: 1=LEGACY stance PD (pre-2026-07-09, for A/B), "
+        "2=decouple + stance attitude upgrades (rate KF + TD reference shaping + "
+        "error-scheduled damping), "
         "3=mode2 + HLIP S2S foot placement (gain derived from measured Ts/z0 each hop, "
         "deadbeat-family; falls back to Raibert until the first stance is measured). "
-        "Pure leg = mode 2 without pressing A (props never armed). Default: 2",
+        "Pure leg = any mode without pressing A (props never armed). Default: 2",
     )
     ap.add_argument(
         "--stance-use-props",
@@ -353,8 +355,9 @@ Examples:
         if args.demo_vy is not None:
             lcm_cfg.demo_vy_mps = float(args.demo_vy)
 
-    _mode_names = {2: "DECOUPLE (lstsq prop; pure leg = don't press A)",
-                   3: "MODE 3: DECOUPLE + HLIP S2S foot placement (measured Ts/z0, pole beta)"}
+    _mode_names = {1: "LEGACY stance PD (pre-upgrade A/B baseline)",
+                   2: "DECOUPLE + stance att upgrades (rate KF / TD ref shaping / scheduled kW)",
+                   3: "MODE 3: mode2 upgrades + HLIP S2S foot placement (measured Ts/z0, pole beta)"}
     print("=" * 58)
     print("HOPPER-AERO  |  Right stick → v_des  |  Y → log")
     print(f"  mode={modee_cfg.control_mode}: {_mode_names.get(modee_cfg.control_mode, '???')}")

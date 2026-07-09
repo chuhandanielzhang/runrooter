@@ -16,19 +16,17 @@ cfg = ModeEConfig()
 # give the controller push-off stroke like the real robot (l0 0.464)
 cfg.leg_l0_m = float(os.environ.get("CAO_L0", "0.42"))
 cfg.hop_height_m = float(os.environ.get("CAO_HOP_H", "0.20"))
-cfg.control_mode = int(os.environ.get("CAO_MODE", "3"))   # 2=decouple, 3=+HLIP S2S (mode 1 deleted)
+cfg.control_mode = int(os.environ.get("CAO_MODE", "3"))   # 1=legacy PD, 2=decouple+att upgrades, 3=+HLIP S2S
 cfg.tau_cmd_max_nm = (float(os.environ.get("CAO_TAU", "9.0")),) * 3
 cfg.mode_1d = os.environ.get("CAO_1D", "0") == "1"        # real robot runs 3D (mode_1d=False)
 cfg.prop_base_thrust_ratio = 0.10
 cfg.stance_use_props = True
-# CAO_PURE=1: leg-only operation (mode-1 replacement: props never armed at
-# runtime, enables core.py no-prop liftoff omega gate). Works with CAO_MODE=2/3.
-# Compat shim: legacy CAO_MODE=1 (used by older tuning scripts) maps to
-# mode 2 + pure leg.
+# CAO_PURE=1: leg-only operation (props never armed at runtime, enables
+# core.py no-prop liftoff omega gate). Works with any CAO_MODE.
+# NOTE 2026-07-09: CAO_MODE=1 now means "legacy stance PD" (the pre-upgrade
+# attitude law) -- it is NO LONGER remapped to mode2+pure-leg. Use CAO_PURE=1
+# explicitly for leg-only runs.
 _pure_leg = os.environ.get("CAO_PURE", "0") == "1"
-if cfg.control_mode == 1:
-    cfg.control_mode = 2
-    _pure_leg = True
 if _pure_leg:
     cfg.stance_use_props = False
     cfg.prop_base_thrust_ratio = 0.0
@@ -41,9 +39,9 @@ if os.environ.get("CAO_ST_KR"):
     cfg.stance_kpp_x = cfg.stance_kpp_y = float(os.environ["CAO_ST_KR"])
 if os.environ.get("CAO_ST_KW"):
     cfg.stance_kpd_x = cfg.stance_kpd_y = float(os.environ["CAO_ST_KW"])
-# Stance attitude delay predictor horizon (s); 0 disables (see stance_att_pred_s).
-if os.environ.get("CAO_ATT_PRED"):
-    cfg.stance_att_pred_s = float(os.environ["CAO_ATT_PRED"])
+# SLIP-style stance allocation A/B (1=axial/side split, 0=legacy z/xy+lever).
+if os.environ.get("CAO_LEG_ALLOC"):
+    cfg.stance_leg_frame_alloc = bool(int(os.environ["CAO_LEG_ALLOC"]))
 if os.environ.get("CAO_FL_KR"):
     cfg.flight_kR_roll = cfg.flight_kR_pitch = float(os.environ["CAO_FL_KR"])
 if os.environ.get("CAO_FL_KW"):

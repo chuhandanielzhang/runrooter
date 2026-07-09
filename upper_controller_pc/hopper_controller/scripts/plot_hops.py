@@ -39,8 +39,8 @@ try:
     FXY_CAP_N = float(_cfg.stance_fxy_max)
     STANCE_MU = float(_cfg.stance_mu)
 except Exception:
-    FXY_CAP_N = 20.0
-    STANCE_MU = 0.3
+    FXY_CAP_N = 15.0
+    STANCE_MU = 0.0
 
 
 def rot_wb(r, p, y):
