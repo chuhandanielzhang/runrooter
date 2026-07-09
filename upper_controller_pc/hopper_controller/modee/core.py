@@ -359,7 +359,7 @@ class ModeEConfig:
     # This helps achieve target hop height even with model errors.
     use_energy_compensation: bool = True
     # Hopper4-style energy loop (scaled conservative for real-robot bring-up).
-    energy_comp_kp: float = 5.6
+    energy_comp_kp: float = 5.2
     # TRUE desired apex height above liftoff (m). 2026-07-05: this is now a real
     # closed-loop target -- see apex_fb_* below. Set what you actually want.
     hop_height_m: float = 0.1
@@ -570,6 +570,16 @@ class ModeEConfig:
     # Raibert (Kv/Kr) in WORLD (+Z down), then foot_des_b = R_wb^T @ target_w (quaternion).
     flight_kv: float = 0.12
     flight_kr: float = 0.0
+    # Neutral-point forward bias (BODY +x, meters), added to the Raibert/S2S
+    # XY target. Motivation (2026-07-09 log, 5 pure-leg hops): the foot touches
+    # down near the CoM (+3 cm) and, as the body passes over the pivot, leaves
+    # at -7 cm BEHIND it -> the stance-mean lever arm rx*fz is a one-signed
+    # ~+8 Nm pitch torque that the attitude PD (kR=27, demand peaked -8 Nm)
+    # can only just cancel, so pitch ratchets +8..10 deg every hop. Shifting
+    # the touchdown ahead makes the swept interval symmetric (e.g. +5..-5 cm),
+    # so the early-stance and late-stance lever torques cancel over the hop.
+    # Start at +0.03..+0.05 on the real robot; 0 = off (old behavior).
+    flight_foot_x_bias_m: float = 0.0
     # If you see "摆腿太小" (world/heading XY step is small), increase this cap first.
     flight_stepper_lim_m: float = 0.2
     # swing (flight) foot-space torque reference (passed via QP tau_ref)
@@ -586,7 +596,7 @@ class ModeEConfig:
     # Use moderate kd (8-12) with strong LPF filtering instead of high kd.
     # Over-extension is also limited by the axial_coeff clamp logic (line ~2169).
     swing_kp_z: float = 1000.0
-    stance_kp_z: float = 1000.0   # RESTORED to Cao original (was drifted to 1100)
+    stance_kp_z: float = 1200.0   # RESTORED to Cao original (was drifted to 1100)
     stance_kd_z: float = 10.0    # RESTORED to Cao original (was drifted to 20)
     swing_kd_z: float = 10.0
     # Baseline anti-chatter around nominal length (flight):
@@ -621,9 +631,11 @@ class ModeEConfig:
     # KEEP the low idle -- so the response-speed ceiling stays; do not expect
     # sub-100ms attitude response at this baseline.
     prop_base_thrust_ratio: float = 0.02
-    # Pure-leg test mode: hard-disable prop allocation in both stance and flight.
-    # This keeps stance balance/hopping evaluation independent from propeller hardware state.
-    pure_leg_mode: bool = False
+    # NOTE (2026-07-09): the old pure_leg_mode flag / control_mode 1 are DELETED.
+    # "Pure leg" is now simply mode 2 with the props not armed (A not pressed):
+    # the LCM layer feeds the A-switch state into set_props_armed() every cycle,
+    # and everything that used to key off mode 1 (no prop demands, correct g_eff,
+    # liftoff omega gate) keys off that runtime state instead.
     # Enable propeller modulation in stance for disturbance recovery.
     stance_use_props: bool = True
     thrust_total_ratio_max: float = 3.50  # QP cap on sum(thrust) <= ratio*m*g (higher prop authority)
@@ -726,20 +738,19 @@ class ModeEConfig:
     # Keep min >= mg to avoid collapse during early compression.
     stance_fz_min: float = 0.0
     stance_fz_max: float = 260.0   # raised 240->260 for more vertical headroom in stance
-    # Stance horizontal (attitude) force limits, applied by PROPORTIONAL scaling
-    # (direction preserved) in the closed-form allocation:
-    #   |fxy| <= stance_mu * fz   (friction cone: right at touchdown fz is still
-    #                              small, so fxy ramps up WITH the normal force
-    #                              instead of slamming in and slipping)
-    #   |fxy| <= stance_fxy_max   (absolute ceiling independent of fz)
-    # Set either to <=0 to disable that limit.
+    # Stance horizontal (attitude) force limit, applied by PROPORTIONAL scaling
+    # (direction preserved) in the closed-form allocation. 2026-07-09 user
+    # decision: ONE friction cone with a 20 N ceiling,
+    #   |fxy| <= min(stance_mu * fz, stance_fxy_max)
+    # The cone (mu*fz) is what protects right at touchdown while fz is still
+    # ramping; the 20 N ceiling bounds it once fz is large (0.3*fz would allow
+    # 45+ N at push peak). Set either to <=0 to disable that part.
     stance_mu: float = 0.3
-    # 15 -> 30 (2026-07-05): the fxy allocation now feeds forward the fz
-    # lever-arm moment (foot 5-9 cm off-center @ fz~130 N needs ~20 N of fxy
-    # just to cancel the tipping torque); 15 N clipped that cancellation and
-    # 25% of stance #0 sat on the cap. The friction cone mu*fz above remains
-    # the anti-slip bound (it is what protects right at touchdown).
-    stance_fxy_max: float = 30.0
+    # 30 -> 20 (2026-07-09, user): tighter ceiling; measured hops 1-2 peaked at
+    # |fxy| ~ 19 N, so 20 N keeps normal operation untouched and only trims the
+    # extremes (the old 15 N cap clipped the fz lever-arm feedforward, 30 N
+    # never engaged).
+    stance_fxy_max: float = 20.0
 
     # PWM limits
     pwm_min_us: float = 1000.0
@@ -871,7 +882,8 @@ class ModeEConfig:
     prop_vel_tilt_max_deg: float = 1.0
 
     # ===== Control mode switch =====
-    # 1 = pure_leg:          closed-form leg, propellers OFF (stance & flight)
+    # (mode 1 pure_leg was DELETED 2026-07-09 -- run mode 2 without arming the
+    #  props (A off) instead; the runtime A-state drives all no-prop behavior)
     # 2 = decouple_leg_prop: closed-form leg + lstsq prop overlay (stance & flight)
     # 3 = MODE 3 (2026-07-07): same leg/prop pipeline as 2, but the flight foot
     #     placement is replaced by the HLIP step-to-step (S2S) discrete control
@@ -930,10 +942,10 @@ class ModeEConfig:
     # 2026-07-01: RESTORED to ACTUAL CASE values (kpp=100, kpd=1) from the CASE zip; had been
     # cut to 5/0 (20x weaker stance attitude, no damping) -> couldn't arrest tip-over.
     # User-tuned values (2026-07-05: keep these, do NOT bulk-restore CASE).
-    stance_kpp_x: float = 27.0    # leg stance kR roll
-    stance_kpp_y: float = 27.0    # leg stance kR pitch
-    stance_kpd_x: float = 4    # leg stance kW roll
-    stance_kpd_y: float = 4    # leg stance kW pitch
+    stance_kpp_x: float = 80.0    # leg stance kR roll
+    stance_kpp_y: float = 80.0    # leg stance kR pitch
+    stance_kpd_x: float = 1    # leg stance kW roll
+    stance_kpd_y: float = 1    # leg stance kW pitch
     # ===== Stance D-term gyro conditioning: NOTCH + light LPF =====
     # We consume PX4 /fmu/out/sensor_combined = RAW gyro (PX4's own filter
     # pipeline only applies to vehicle_angular_velocity, which is not in the
@@ -948,11 +960,15 @@ class ModeEConfig:
     # (gain 0.95 vs 0.79) -> kpd can be raised without push-phase twitching.
     # Filters run CONTINUOUSLY (flight too) so touchdown sees no warm-up
     # transient. Set notch_hz <= 0 to disable the notch.
-    # 2026-07-07: strengthened per user request -- notch BW 25->32 Hz (covers
-    # ~11-43 Hz, the full measured noise band) and LPF 8->15 ms. Cost: phase
-    # loss at 5 Hz grows back to roughly the old -38 deg level; if the push
-    # phase starts twitching or D feels sluggish, revert to BW 25 / tau 0.008.
-    stance_gyro_notch_hz: float = 25.0
+    # 2026-07-09 USER DECISION: stance D-term gyro is now UNFILTERED (all three
+    # stages set to 0 = disabled). Context: the IMU chain was upgraded the same
+    # day from 100 Hz fresh data (repeated 5x at the 500 Hz loop) to 400 Hz
+    # (PX4 dds rate_limit + IMU_INTEG_RATE 400), so the old notch/LPF tuning --
+    # measured against the 100 Hz held signal -- no longer applies, and the
+    # user wants zero phase loss on the D-term. The filter code path is kept;
+    # re-enable by setting notch_hz / notch2_hz / lpf_tau > 0 (previous tuned
+    # values: notch 25 Hz BW 32, notch2 13 Hz BW 10, LPF 8 ms).
+    stance_gyro_notch_hz: float = 0.0
     stance_gyro_notch_bw_hz: float = 32.0
     # Second cascaded notch (2026-07-09): the pure-leg log showed the stance
     # gyro noise is dominated by the touchdown impact RING at ~13 Hz (57% of
@@ -961,11 +977,9 @@ class ModeEConfig:
     # 0.28->0.21 (x) / 0.17->0.11 (y) rad/s while the 3 Hz phase lag (body
     # rocking band) only grows 24->28 deg -- strictly better than fattening the
     # LPF (25-40 ms costs 53-66 deg at 5 Hz). Set hz<=0 to disable.
-    stance_gyro_notch2_hz: float = 13.0
+    stance_gyro_notch2_hz: float = 0.0
     stance_gyro_notch2_bw_hz: float = 10.0
-    # Light first-order LPF after the notches (residual >45 Hz content).
-    # 15->8 ms (2026-07-09): phase budget moved into the second notch above.
-    stance_gyro_lpf_tau: float = 0.008
+    stance_gyro_lpf_tau: float = 0.0
     stance_tau_rp_max: float = 20.0
 
     # ===== WBC-QP slack weights (stance vs flight) =====
@@ -1154,6 +1168,13 @@ class ModeECore:
         self._shift_lpf_init: bool = False
         self._td_debounce_count: int = 0
         self._lo_debounce_count: int = 0
+
+        # Runtime prop armed state (gamepad A/B switch, fed by the LCM layer via
+        # set_props_armed every cycle). Replaces the deleted mode-1/pure_leg_mode:
+        # False = pure-leg behavior (no prop demands, true g_eff, liftoff omega
+        # gate). Defaults True so headless/sim use without the LCM layer keeps
+        # the old mode-2 behavior.
+        self._props_armed_rt: bool = True
 
         # ===== MIT SRB MPC (stance force planning) =====
         if bool(cfg.use_mpc):
@@ -1508,6 +1529,11 @@ class ModeECore:
         self._lidar_yaw_map = float(yaw_map)
         self._lidar_quality = int(quality)
         self._lidar_rx_walltime = float(rx_walltime)
+
+    def set_props_armed(self, armed: bool) -> None:
+        """Runtime prop armed state (gamepad A/B). False = pure-leg behavior:
+        no prop force/torque demands, un-assisted g_eff, liftoff omega gate."""
+        self._props_armed_rt = bool(armed)
 
     @staticmethod
     def _pinv_ridge(A: np.ndarray, lambda_rel: float) -> np.ndarray:
@@ -2423,7 +2449,9 @@ class ModeECore:
             cond_lo = (float(q_shift) >= lo_thr) and (t_in_stance >= phase_min_t)
             # No-prop mode: do not leave stance with large roll/pitch rates.
             # This prevents "looks balanced in stance but falls in flight" failures.
-            no_prop_mode = bool(getattr(self.cfg, "pure_leg_mode", False)) or (
+            # 2026-07-09: keys off the RUNTIME armed state (A switch) -- pure-leg
+            # runs are now just "mode 2, A off", and this gate must protect them.
+            no_prop_mode = (not bool(self._props_armed_rt)) or (
                 (not bool(self.cfg.stance_use_props)) and (float(self.cfg.prop_base_thrust_ratio) <= 1e-9)
             )
             if bool(no_prop_mode) and bool(getattr(self.cfg, "lo_use_omega_gate_no_prop", True)):
@@ -2804,13 +2832,15 @@ class ModeECore:
         # Upstream: desired net wrench (F_des from f_ref, Tau from SO(3) PD).
         # Downstream: closed-form leg forces + lstsq prop thrust (no WBC-QP).
         #   f_contact_w: GRF in world frame; z_thrust_w = -R_wb[:, 2] for prop thrust direction.
-        pure_leg_mode = bool(getattr(self.cfg, "pure_leg_mode", False))
         thrust_sum_ref = float(self.mass * self.gravity * float(self.cfg.prop_base_thrust_ratio))
-        # Global propeller enable gate (for single-leg/no-prop tuning).
-        props_enabled_ctrl = (not bool(pure_leg_mode)) and (
+        # Global propeller enable gate. 2026-07-09: keyed off the RUNTIME armed
+        # state (A switch) instead of the deleted pure_leg_mode -- when the user
+        # never presses A, the controller must not assume prop assist anywhere
+        # (g_eff, flight attitude demands, prop overlays all shut off here).
+        props_enabled_ctrl = bool(self._props_armed_rt) and (
             bool(self.cfg.stance_use_props) or (float(self.cfg.prop_base_thrust_ratio) > 1e-9)
         )
-        if bool(pure_leg_mode) or not bool(props_enabled_ctrl):
+        if not bool(props_enabled_ctrl):
             thrust_sum_ref = 0.0
         # ===== Compute SO(3) attitude error EARLY =====
         # Use the quaternion published in hopper_imu_lcmt (q_hat -> R_wb_hat), and
@@ -3210,6 +3240,8 @@ class ModeECore:
         if bool(self._stance):
             tau_rp_max = float(self.cfg.stance_tau_rp_max)
             omega_b = omega_raw
+            # 2026-07-09: with the filter config zeroed (user: no gyro filtering
+            # now that the IMU delivers 400 Hz fresh data) omega_flt == omega_raw.
             omega_d = omega_flt
             kR_x = float(self.cfg.stance_kpp_x)
             kR_y = float(self.cfg.stance_kpp_y)
@@ -3226,8 +3258,6 @@ class ModeECore:
                 tau_b_stance_des[:] = 0.0
         else:
             # Flight phase: separate roll/pitch gains (for propeller control).
-            # NOTE: notch+LPF keep running above (no reset) so the D-term gyro
-            # is already warm when the next touchdown arrives.
             omega_b = omega_raw
             if not bool(props_enabled_ctrl):
                 # No propellers physically available: do not request flight attitude torques.
@@ -3329,9 +3359,19 @@ class ModeECore:
                 self._s2s_gain_dbg = gain_v
                 target_xy_w = (gain_v * v_xy_w - gain_vdes * vdes_xy_w).astype(float)
             else:
-                # Mode 1/2 (or mode 3 before the first measured stance):
+                # Mode 2 (or mode 3 before the first measured stance):
                 # classic Raibert with hand-tuned kv/kr.
                 target_xy_w = (kv * v_xy_w + kr * vdes_xy_w).astype(float)
+            # Neutral-point forward bias (kills the one-signed rx*fz pitch lever,
+            # see flight_foot_x_bias_m docs): shift the target along the BODY +x
+            # heading projected to the horizontal plane.
+            x_bias = float(getattr(self.cfg, "flight_foot_x_bias_m", 0.0))
+            if abs(x_bias) > 1e-9:
+                bx_w = np.asarray(R_wb_hat, dtype=float).reshape(3, 3)[:, 0]
+                n_bx = float(np.hypot(float(bx_w[0]), float(bx_w[1])))
+                if n_bx > 1e-6:
+                    target_xy_w[0] += x_bias * float(bx_w[0]) / n_bx
+                    target_xy_w[1] += x_bias * float(bx_w[1]) / n_bx
             if bool(self.cfg.mode_1d):
                 target_xy_w[0] = 0.0
                 target_xy_w[1] = 0.0
@@ -3420,10 +3460,9 @@ class ModeECore:
                     tau_ref = None
 
         # ===== Force allocation (closed-form leg + lstsq prop, no WBC-QP) =====
-        # control_mode: 1=pure_leg, 2/3=decouple (lstsq prop overlay)
-        _cmode = int(self.cfg.control_mode)
+        # control_mode 2/3 = decouple (lstsq prop overlay); pure leg = A not armed
         thrust_sum_max = float(self.mass * self.gravity * float(self.cfg.thrust_total_ratio_max))
-        props_on = bool(props_enabled_ctrl) and (_cmode != 1)
+        props_on = bool(props_enabled_ctrl)
         if not props_on:
             thrust_sum_max = 0.0
 

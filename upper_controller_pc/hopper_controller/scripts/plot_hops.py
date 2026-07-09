@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Plot stance diagnostics from a ModeE csv log on ONE continuous timeline
+(x = log time t_s), all hops together, stance windows shaded + numbered.
+
+Rows:
+  1. BODY-frame fx/fy with the +/-20 N cap lines
+  2. fz_b, the friction cone 0.3*fz, and |fxy_b| (shows which limit binds)
+  3. roll / pitch
+Contact force is logged in world frame; it is rotated back to body with
+rpy_hat so tilt does not leak fz into fx/fy (a -38 deg roll makes world fx
+look like -100 N while body |fxy| is really capped at 20 N).
+
+Usage (from hopper_controller/):
+    python3 scripts/plot_hops.py                # latest log, ALL hops
+    python3 scripts/plot_hops.py --hops 1 2 3   # only these hops (1-based)
+    python3 scripts/plot_hops.py --log logs/modee_2116_snapshot.csv
+
+Output: logs/hops_combined.png
+"""
+import argparse
+import csv
+import os
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LOG = os.path.join(HERE, "..", "logs", "modee_latest.csv")
+
+FXY_CAP_N = 20.0   # stance_fxy_max (core.py); drawn as the red dashed line
+STANCE_MU = 0.3    # stance_mu (core.py); drawn as the cone 0.3*fz
+
+
+def rot_wb(r, p, y):
+    """World-from-body rotation for ZYX (yaw-pitch-roll) Euler angles."""
+    cr, sr, cp, sp, cy, sy = np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp,     cp * sr,                cp * cr],
+    ])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--log", default=DEFAULT_LOG)
+    ap.add_argument("--hops", type=int, nargs="+", default=None,
+                    help="1-based hop indices to include (default: ALL hops)")
+    ap.add_argument("--margin-s", type=float, default=0.3,
+                    help="extra time plotted before first TD / after last LO")
+    args = ap.parse_args()
+
+    log_path = os.path.abspath(args.log)
+    rows = list(csv.DictReader(open(log_path)))
+    if not rows:
+        raise SystemExit(f"empty log: {log_path}")
+
+    col = lambda name: np.array([float(r[name]) for r in rows])
+    t = col("t_s")
+    st = np.array([int(float(r["stance"])) for r in rows])
+    roll = col("rpy_hat_roll")
+    pitch = col("rpy_hat_pitch")
+
+    if "f_contact_b0" in rows[0]:
+        # New logs carry the controller's own BODY-frame GRF directly.
+        fb = np.stack([col("f_contact_b0"), col("f_contact_b1"), col("f_contact_b2")], axis=1)
+    else:
+        # Old logs only have world frame: reconstruct body via R(rpy_hat)^T.
+        fw = np.stack([col("f_contact_w0"), col("f_contact_w1"), col("f_contact_w2")], axis=1)
+        yaw = col("rpy_hat_yaw")
+        fb = np.empty_like(fw)
+        for i in range(len(rows)):
+            fb[i] = rot_wb(roll[i], pitch[i], yaw[i]).T @ fw[i]
+        print("(old log: f_contact_b not logged, reconstructed from world + rpy_hat)")
+
+    d = np.diff(st)
+    tds = np.where(d == 1)[0] + 1
+    los = np.where(d == -1)[0] + 1
+    if st[0] == 1:
+        tds = np.r_[0, tds]
+    n_hops = len(tds)
+    print(f"log: {log_path}\n{n_hops} touchdowns found")
+
+    hops = list(range(1, n_hops + 1)) if args.hops is None \
+        else [k for k in args.hops if 1 <= k <= n_hops]
+    if not hops:
+        raise SystemExit(f"no hops to plot (log has {n_hops}, asked {args.hops})")
+
+    # (hop#, td_idx, lo_idx) for each selected hop
+    segs = []
+    for k in hops:
+        a = int(tds[k - 1])
+        b_cand = los[los > a]
+        segs.append((k, a, int(b_cand[0]) if len(b_cand) else len(t) - 1))
+
+    m0 = max(0, np.searchsorted(t, t[segs[0][1]] - args.margin_s))
+    m1 = min(len(t), np.searchsorted(t, t[segs[-1][2]] + args.margin_s))
+    sl = slice(m0, m1)
+    ts = t[sl]
+
+    fig, axs = plt.subplots(3, 1, figsize=(max(12, 3 * len(segs)), 9), sharex=True)
+
+    def shade(ax, label_hops=False):
+        for k, a, b in segs:
+            ax.axvspan(t[a], t[b], color="tab:blue", alpha=0.10)
+            if label_hops:
+                ax.text((t[a] + t[b]) / 2, ax.get_ylim()[1] * 0.92, f"hop {k}",
+                        ha="center", va="top", fontsize=9, color="tab:blue")
+
+    ax = axs[0]
+    ax.plot(ts, fb[sl, 0], label="fx_b", color="tab:blue")
+    ax.plot(ts, fb[sl, 1], label="fy_b", color="tab:orange")
+    ax.axhline(FXY_CAP_N, ls="--", c="r", lw=0.8)
+    ax.axhline(-FXY_CAP_N, ls="--", c="r", lw=0.8)
+    ax.axhline(0, color="k", lw=0.5)
+    shade(ax, label_hops=True)
+    ax.set_ylabel("body force [N]")
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(alpha=0.3)
+    ax.set_title(f"hops {hops[0]}..{hops[-1]} (shaded = stance, white = flight)")
+
+    ax = axs[1]
+    ax.plot(ts, fb[sl, 2], label="fz_b", color="tab:green")
+    cone = STANCE_MU * np.clip(fb[sl, 2], 0.0, None)
+    cone[st[sl] == 0] = np.nan     # cone only meaningful in stance
+    ax.plot(ts, cone, ls=":", color="k", label=f"{STANCE_MU}*fz (cone)")
+    ax.plot(ts, np.hypot(fb[sl, 0], fb[sl, 1]), color="tab:red", label="|fxy_b|")
+    ax.axhline(FXY_CAP_N, ls="--", c="r", lw=0.8)
+    shade(ax)
+    ax.set_ylabel("N")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(alpha=0.3)
+
+    ax = axs[2]
+    ax.plot(ts, np.degrees(roll[sl]), label="roll", color="tab:purple")
+    ax.plot(ts, np.degrees(pitch[sl]), label="pitch", color="tab:brown")
+    ax.axhline(0, color="k", lw=0.5)
+    shade(ax)
+    ax.set_ylabel("deg")
+    ax.set_xlabel("log time t_s [s]")
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(alpha=0.3)
+
+    for k, a, b in segs:
+        seg = slice(a, b)
+        print(f"hop {k}: TD@{t[a]:7.3f}s Ts={(t[b]-t[a])*1000:4.0f}ms  "
+              f"fx_b[{fb[seg,0].min():+6.1f}..{fb[seg,0].max():+6.1f} mean {fb[seg,0].mean():+6.1f}]  "
+              f"fy_b[{fb[seg,1].min():+6.1f}..{fb[seg,1].max():+6.1f} mean {fb[seg,1].mean():+6.1f}]  "
+              f"roll {np.degrees(roll[a]):+.1f}->{np.degrees(roll[b]):+.1f}deg  "
+              f"pitch {np.degrees(pitch[a]):+.1f}->{np.degrees(pitch[b]):+.1f}deg")
+
+    plt.tight_layout()
+    out = os.path.join(os.path.dirname(log_path), "hops_combined.png")
+    plt.savefig(out, dpi=110)
+    plt.close(fig)
+    print(f"-> {out}")
+
+
+if __name__ == "__main__":
+    main()

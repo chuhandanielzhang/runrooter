@@ -756,6 +756,11 @@ class ModeELCMController:
                 "f_contact_w0",
                 "f_contact_w1",
                 "f_contact_w2",
+                # GRF in BODY frame (core computes it; log it directly so plots
+                # never have to reconstruct body force from rpy + world force)
+                "f_contact_b0",
+                "f_contact_b1",
+                "f_contact_b2",
                 "thrust0",
                 "thrust1",
                 "thrust2",
@@ -1116,6 +1121,7 @@ class ModeELCMController:
 
             f_tau_delta = np.asarray(info.get("f_tau_delta", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
             f_contact_w = np.asarray(info.get("f_contact_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
+            f_contact_b = np.asarray(info.get("f_contact_b", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
             thrusts_arm = np.asarray(info.get("thrusts_arm", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
             pwm_us = np.asarray(pwm_us, dtype=float).reshape(6)
 
@@ -1212,6 +1218,9 @@ class ModeELCMController:
                 float(f_contact_w[0]),
                 float(f_contact_w[1]),
                 float(f_contact_w[2]),
+                float(f_contact_b[0]),
+                float(f_contact_b[1]),
+                float(f_contact_b[2]),
                 float(thrusts_arm[0]),
                 float(thrusts_arm[1]),
                 float(thrusts_arm[2]),
@@ -1527,6 +1536,9 @@ class ModeELCMController:
                     last_print = time.time()
                     continue
 
+                # Runtime prop armed state -> core (replaces the deleted mode 1:
+                # A off = pure-leg behavior incl. the liftoff omega gate).
+                self.core.set_props_armed(bool(self._prop_enable))
                 # Always compute and send commands; underlying driver handles mode switching and safety
                 tau_raw, pwm_us, info = self.core.step(
                     joint_pos=q,

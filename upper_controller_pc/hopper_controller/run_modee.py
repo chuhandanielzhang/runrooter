@@ -165,10 +165,11 @@ Examples:
         "--control-mode",
         type=int,
         default=None,
-        choices=[1, 2, 3],
-        help="Control mode: 1=pure_leg (no props), 2=decouple (lstsq prop, stance+flight), "
+        choices=[2, 3],
+        help="Control mode: 2=decouple (lstsq prop, stance+flight), "
         "3=mode2 + HLIP S2S foot placement (gain derived from measured Ts/z0 each hop, "
-        "deadbeat-family; falls back to Raibert until the first stance is measured). Default: 2",
+        "deadbeat-family; falls back to Raibert until the first stance is measured). "
+        "Pure leg = mode 2 without pressing A (props never armed). Default: 2",
     )
     ap.add_argument(
         "--stance-use-props",
@@ -352,7 +353,7 @@ Examples:
         if args.demo_vy is not None:
             lcm_cfg.demo_vy_mps = float(args.demo_vy)
 
-    _mode_names = {1: "PURE LEG (no props)", 2: "DECOUPLE (lstsq prop)",
+    _mode_names = {2: "DECOUPLE (lstsq prop; pure leg = don't press A)",
                    3: "MODE 3: DECOUPLE + HLIP S2S foot placement (measured Ts/z0, pole beta)"}
     print("=" * 58)
     print("HOPPER-AERO  |  Right stick → v_des  |  Y → log")
