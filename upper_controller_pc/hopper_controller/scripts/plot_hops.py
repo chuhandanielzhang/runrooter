@@ -29,8 +29,18 @@ import matplotlib.pyplot as plt
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOG = os.path.join(HERE, "..", "logs", "modee_latest.csv")
 
-FXY_CAP_N = 20.0   # stance_fxy_max (core.py); drawn as the red dashed line
-STANCE_MU = 0.3    # stance_mu (core.py); drawn as the cone 0.3*fz
+# Pull the actual limits from the controller config so the plotted limit is
+# always the one the controller enforced (|fxy| <= min(mu*fz, cap)).
+try:
+    import sys
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    from modee.core import ModeEConfig
+    _cfg = ModeEConfig()
+    FXY_CAP_N = float(_cfg.stance_fxy_max)
+    STANCE_MU = float(_cfg.stance_mu)
+except Exception:
+    FXY_CAP_N = 20.0
+    STANCE_MU = 0.3
 
 
 def rot_wb(r, p, y):
@@ -109,11 +119,23 @@ def main():
                 ax.text((t[a] + t[b]) / 2, ax.get_ylim()[1] * 0.92, f"hop {k}",
                         ha="center", va="top", fontsize=9, color="tab:blue")
 
+    # The enforced limit is fz-dependent: lim(t) = min(mu*fz(t), cap).
+    # Only meaningful in stance; NaN elsewhere so nothing is drawn in flight.
+    lim = np.full(len(t), np.inf)
+    if STANCE_MU > 0.0:
+        lim = np.minimum(lim, STANCE_MU * np.clip(fb[:, 2], 0.0, None))
+    if FXY_CAP_N > 0.0:
+        lim = np.minimum(lim, FXY_CAP_N)
+    lim[~np.isfinite(lim)] = np.nan
+    lim[st == 0] = np.nan
+    lim_lbl = (f"limit min({STANCE_MU}*fz, {FXY_CAP_N:.0f}N)" if STANCE_MU > 0.0
+               else f"limit {FXY_CAP_N:.0f}N")
+
     ax = axs[0]
     ax.plot(ts, fb[sl, 0], label="fx_b", color="tab:blue")
     ax.plot(ts, fb[sl, 1], label="fy_b", color="tab:orange")
-    ax.axhline(FXY_CAP_N, ls="--", c="r", lw=0.8)
-    ax.axhline(-FXY_CAP_N, ls="--", c="r", lw=0.8)
+    ax.plot(ts, lim[sl], ls="--", c="r", lw=1.0, label=lim_lbl)
+    ax.plot(ts, -lim[sl], ls="--", c="r", lw=1.0)
     ax.axhline(0, color="k", lw=0.5)
     shade(ax, label_hops=True)
     ax.set_ylabel("body force [N]")
@@ -123,11 +145,8 @@ def main():
 
     ax = axs[1]
     ax.plot(ts, fb[sl, 2], label="fz_b", color="tab:green")
-    cone = STANCE_MU * np.clip(fb[sl, 2], 0.0, None)
-    cone[st[sl] == 0] = np.nan     # cone only meaningful in stance
-    ax.plot(ts, cone, ls=":", color="k", label=f"{STANCE_MU}*fz (cone)")
+    ax.plot(ts, lim[sl], ls="--", c="r", lw=1.0, label=lim_lbl)
     ax.plot(ts, np.hypot(fb[sl, 0], fb[sl, 1]), color="tab:red", label="|fxy_b|")
-    ax.axhline(FXY_CAP_N, ls="--", c="r", lw=0.8)
     shade(ax)
     ax.set_ylabel("N")
     ax.legend(loc="upper right", fontsize=8)

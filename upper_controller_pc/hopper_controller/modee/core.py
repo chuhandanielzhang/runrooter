@@ -740,14 +740,15 @@ class ModeEConfig:
     stance_fz_max: float = 260.0   # raised 240->260 for more vertical headroom in stance
     # Stance horizontal (attitude) force limit, applied by PROPORTIONAL scaling
     # (direction preserved) in the closed-form allocation. 2026-07-09 user
-    # decision (v2, 08:38): friction cone DISABLED (mu=0), replaced by a plain
-    # hard cut:  |fxy| <= stance_fxy_max = 10 N  at every instant of stance,
-    # including touchdown. Set stance_mu > 0 to bring the mu*fz cone back.
-    stance_mu: float = 0.0
-    # 20 -> 10 (2026-07-09, user): note the 08:32 run needed up to ~16 N on its
-    # good hops, so this cap WILL clip the fz lever-arm feedforward and part of
-    # the attitude torque; raise it back if roll/pitch stops converging.
-    stance_fxy_max: float = 10.0
+    # decision (v3, 08:44): back to the FRICTION CONE (the 10 N hard-cut
+    # experiment is dropped),
+    #   |fxy| <= min(stance_mu * fz, stance_fxy_max)
+    # The cone scales the allowed tangential force WITH the normal force, so
+    # touchdown (small fz) is protected while mid-push (fz ~ 150 N) keeps
+    # authority; the 20 N ceiling bounds the cone once fz is large. Set either
+    # to <= 0 to disable that part.
+    stance_mu: float = 0.1
+    stance_fxy_max: float = 20.0
 
     # PWM limits
     pwm_min_us: float = 1000.0
@@ -939,8 +940,8 @@ class ModeEConfig:
     # 2026-07-01: RESTORED to ACTUAL CASE values (kpp=100, kpd=1) from the CASE zip; had been
     # cut to 5/0 (20x weaker stance attitude, no damping) -> couldn't arrest tip-over.
     # User-tuned values (2026-07-05: keep these, do NOT bulk-restore CASE).
-    stance_kpp_x: float = 43.0    # leg stance kR roll
-    stance_kpp_y: float = 43.0    # leg stance kR pitch
+    stance_kpp_x: float = 60.0    # leg stance kR roll
+    stance_kpp_y: float = 60.0    # leg stance kR pitch
     stance_kpd_x: float = 1.4    # leg stance kW roll
     stance_kpd_y: float = 1.4    # leg stance kW pitch
     # ===== Stance D-term gyro conditioning: NOTCH + light LPF =====
