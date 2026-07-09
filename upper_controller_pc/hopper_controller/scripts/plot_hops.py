@@ -72,6 +72,8 @@ def main():
     st = np.array([int(float(r["stance"])) for r in rows])
     roll = col("rpy_hat_roll")
     pitch = col("rpy_hat_pitch")
+    # Base height above ground: estimator position, world +Z DOWN -> negate.
+    height = -col("p_hat_w2")
 
     if "f_contact_b0" in rows[0]:
         # New logs carry the controller's own BODY-frame GRF directly.
@@ -110,7 +112,7 @@ def main():
     sl = slice(m0, m1)
     ts = t[sl]
 
-    fig, axs = plt.subplots(3, 1, figsize=(max(12, 3 * len(segs)), 9), sharex=True)
+    fig, axs = plt.subplots(4, 1, figsize=(max(12, 3 * len(segs)), 11), sharex=True)
 
     def shade(ax, label_hops=False):
         for k, a, b in segs:
@@ -158,17 +160,41 @@ def main():
     ax.axhline(0, color="k", lw=0.5)
     shade(ax)
     ax.set_ylabel("deg")
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # Row 4: base height, with the apex of each flight annotated.
+    ax = axs[3]
+    ax.plot(ts, height[sl], color="tab:cyan", label="base height (-p_hat_w z)")
+    shade(ax)
+    apexes = []
+    for j, (k, a, b) in enumerate(segs):
+        f_end = segs[j + 1][1] if j + 1 < len(segs) else m1 - 1
+        if f_end <= b:
+            continue
+        i_apex = b + int(np.argmax(height[b:f_end]))
+        z_td = height[a]                      # height when this stance began
+        apex_rise = height[i_apex] - z_td     # hop height above touchdown level
+        apexes.append((k, t[i_apex], height[i_apex], apex_rise))
+        ax.plot(t[i_apex], height[i_apex], "v", color="tab:red", ms=7)
+        ax.annotate(f"apex +{100*apex_rise:.1f}cm",
+                    (t[i_apex], height[i_apex]),
+                    textcoords="offset points", xytext=(0, 8),
+                    ha="center", fontsize=8, color="tab:red")
+    ax.set_ylabel("height [m]")
     ax.set_xlabel("log time t_s [s]")
     ax.legend(loc="lower right", fontsize=8)
     ax.grid(alpha=0.3)
 
     for k, a, b in segs:
         seg = slice(a, b)
+        ap = next((x for x in apexes if x[0] == k), None)
+        ap_s = f"apex +{100*ap[3]:.1f}cm (abs {ap[2]:.3f}m)" if ap else "apex n/a"
         print(f"hop {k}: TD@{t[a]:7.3f}s Ts={(t[b]-t[a])*1000:4.0f}ms  "
               f"fx_b[{fb[seg,0].min():+6.1f}..{fb[seg,0].max():+6.1f} mean {fb[seg,0].mean():+6.1f}]  "
               f"fy_b[{fb[seg,1].min():+6.1f}..{fb[seg,1].max():+6.1f} mean {fb[seg,1].mean():+6.1f}]  "
               f"roll {np.degrees(roll[a]):+.1f}->{np.degrees(roll[b]):+.1f}deg  "
-              f"pitch {np.degrees(pitch[a]):+.1f}->{np.degrees(pitch[b]):+.1f}deg")
+              f"pitch {np.degrees(pitch[a]):+.1f}->{np.degrees(pitch[b]):+.1f}deg  {ap_s}")
 
     plt.tight_layout()
     out = os.path.join(os.path.dirname(log_path), "hops_combined.png")
