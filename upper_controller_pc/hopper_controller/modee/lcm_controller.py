@@ -851,14 +851,6 @@ class ModeELCMController:
                 "omega_b_used0",
                 "omega_b_used1",
                 "omega_b_used2",
-                # Mode 2/3 stance attitude upgrade debug (2026-07-09):
-                # TD-latched attitude reference, scheduled kW, KF rate estimate
-                "att_e_ref0",
-                "att_e_ref1",
-                "att_kw_eff0",
-                "att_kw_eff1",
-                "omega_kf0",
-                "omega_kf1",
                 # solver debug
                 "slack0",
                 "slack1",
@@ -1169,9 +1161,6 @@ class ModeELCMController:
                 info.get("tau_b_stance_des", [np.nan, np.nan, np.nan]), dtype=float
             ).reshape(3)
             omega_b_used = np.asarray(info.get("omega_b_used", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            att_e_ref = np.asarray(info.get("att_e_ref", [np.nan, np.nan]), dtype=float).reshape(2)
-            att_kw_eff = np.asarray(info.get("att_kw_eff", [np.nan, np.nan]), dtype=float).reshape(2)
-            omega_kf_xy = np.asarray(info.get("omega_kf_xy", [np.nan, np.nan]), dtype=float).reshape(2)
             F_des_w = np.asarray(info.get("F_des_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
             f_ref_w = np.asarray(info.get("f_ref_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
             thrust_sum_ref = float(info.get("thrust_sum_ref", float("nan")))
@@ -1314,12 +1303,6 @@ class ModeELCMController:
                 float(omega_b_used[0]),
                 float(omega_b_used[1]),
                 float(omega_b_used[2]),
-                float(att_e_ref[0]),
-                float(att_e_ref[1]),
-                float(att_kw_eff[0]),
-                float(att_kw_eff[1]),
-                float(omega_kf_xy[0]),
-                float(omega_kf_xy[1]),
                 float(slack[0]),
                 float(slack[1]),
                 float(slack[2]),
