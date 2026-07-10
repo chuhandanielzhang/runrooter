@@ -642,7 +642,11 @@ class ModeEConfig:
     # (c) this is also the first step of the planned thrust-lift
     #     compensation (base lift reduces effective weight; g_eff already
     #     accounts for it via prop_base_thrust_ratio).
-    prop_base_thrust_ratio: float = 0.25
+    # With calibrated k=1.24e-5 the physical ceiling is ~0.89 kg total thrust
+    # at pwm 1500 (ratio ~0.24 of m=3.75 kg). 0.25 base would idle at pwm~1498
+    # with zero differential headroom -> saturation/chatter. 0.15 -> pwm~1386,
+    # ~1.8 N/arm base, ~110 us headroom to 1500 for attitude differential.
+    prop_base_thrust_ratio: float = 0.15
     # FLIGHT allocation floor: never command reverse in flight. Large
     # corrective torques come from collective lift (spool the other arms UP)
     # instead of reversing the low arm -- torque direction is preserved by
@@ -656,12 +660,14 @@ class ModeEConfig:
     # liftoff omega gate) keys off that runtime state instead.
     # Enable propeller modulation in stance for disturbance recovery.
     stance_use_props: bool = True
-    thrust_total_ratio_max: float = 3.50  # QP cap on sum(thrust) <= ratio*m*g (higher prop authority)
-    # Per-arm thrust cap passed to WBC-QP (N).
-    # NOTE: 10N/arm was not enough roll authority in logs (roll diverged while saturated).
-    # Per-arm thrust cap passed to WBC-QP (N).
-    # With PWM capped at 1400us (see below), keep this conservative to avoid mapping saturation.
-    thrust_max_each_n: float = 55.0
+    # 2026-07-10 recomputed from CALIBRATED k=1.24e-5: physical max per arm at
+    # pwm_max=1600 is k*600^2 = 4.5 N -> total 13.5 N = 0.37*m*g. The old caps
+    # (3.5*m*g / 55 N) were pure fiction: the allocator believed it had 10x
+    # the real authority, so its direction-preserving scaling never engaged
+    # and the PWM clip distorted the torque direction instead.
+    thrust_total_ratio_max: float = 0.36
+    # Per-arm thrust cap (N) = physical ceiling at pwm_max with calibrated k.
+    thrust_max_each_n: float = 4.5
 
     # Stance prop policy
     stance_thrust_sum_min_ratio: float = 0.02
@@ -778,8 +784,12 @@ class ModeEConfig:
 
     # PWM limits
     pwm_min_us: float = 1000.0
-    # PWM cap. Raised for stronger prop authority.
-    pwm_max_us: float = 1700.0
+    # PWM cap. 2026-07-10: 1700 -> 1600. Load-cell calibration only covered
+    # up to 1500 us and the per-point k already sags there (1.16e-5 vs the
+    # 1.24e-5 fit): the quadratic OVERESTIMATES thrust beyond 1500. Keep the
+    # command range inside (slightly above) the region where the mapping is
+    # trustworthy; re-raise only after calibrating 1500-1700.
+    pwm_max_us: float = 1600.0
 
     # ===== Bidirectional props (2026-07-06) =====
     # ESCs (T-Motor 4in1) run in 3D mode; the DDS bridge maps LCM pwm as:
@@ -794,9 +804,10 @@ class ModeEConfig:
     # correction. The differential solution is zero-sum by geometry (symmetric tri-rotor
     # => sum of attitude thrusts == 0), so the sum only changes when an arm hits this
     # floor and collective lift kicks in. Set the budget to the physical ceiling the
-    # pwm mapping can deliver (pwm_rev_floor_us): k*(1000-700)^2 = 1.1e-4*300^2 ~ 9.9N,
-    # so the floor practically never binds and the sum stays at the baseline.
-    prop_reverse_max_n: float = 10.0
+    # pwm mapping can deliver (pwm_rev_floor_us): with CALIBRATED k=1.24e-5,
+    # k*(1000-700)^2 = 1.24e-5*300^2 ~ 1.1 N per arm (the old 10 N assumed the
+    # wrong k and let the allocator promise reverse thrust that doesn't exist).
+    prop_reverse_max_n: float = 1.1
     # Lowest reverse pwm command (us). 300us of reverse range; reverse thrust per us is
     # aerodynamically weaker than forward anyway (fixed-pitch prop) -- calibrate before
     # deepening this.
@@ -838,7 +849,13 @@ class ModeEConfig:
     # Formula: thrust = k_thrust * (pwm - 1000)^2
     # Inverse: pwm = 1000 + sqrt(thrust / k_thrust)
     # NOTE: 1.47e-5 makes even ~5N/arm saturate at pwm_max=1300 (sqrt mapping), starving attitude torque.
-    prop_k_thrust: float = 1.10e-4
+    # CALIBRATED 2026-07-10 (load cell, 3 arms same PWM, kg reading):
+    #   1000:0.01 1050:0.02 1100:0.03 1150:0.09 1200:0.19 1250:0.29
+    #   1300:0.38 1350:0.52 1400:0.64 1450:0.78 1500:0.89 kg (total thrust)
+    # LSQ fit (minus 0.01kg idle, pwm>=1100): k = 1.24e-5 N/us^2 per arm.
+    # OLD 1.10e-4 was ~9x too large -> controller commanded pwm~1170 for
+    # 25% base lift but actual thrust was only ~0.1 kg total.
+    prop_k_thrust: float = 1.24e-5
 
     # Use FC quaternion directly (recommended for real robot) vs. re-estimate from gyro+acc
     use_fc_quat: bool = True
@@ -883,28 +900,36 @@ class ModeEConfig:
     # because anything higher self-oscillates and destabilizes the hops.
     # 2026-07-10 BENCH MEASUREMENT (gimbal, bench_step_0710_180657): motor
     # time constant tau_m ~= 105 ms (63% rise, n=10). At 90/35 the prop loop
-    # limit-cycled at ~8 Hz with 37% of samples PWM-railed (700/1600) --
-    # the gains demanded a bandwidth the props physically cannot deliver
-    # (at 8 Hz the actuator alone lags ~80 deg). Cut to 45/14 as the new
-    # bench-informed starting point; halve again if the limit cycle
-    # persists (tune on the gimbal: lower until the oscillation dies, then
-    # back off 30%). Real fix for more bandwidth = lag compensation (INDI)
-    # or faster ESC ramp, NOT higher PD gains.
-    flight_kR_roll: float = 45.0
-    flight_kW_roll: float = 14.0
-    flight_kR_pitch: float = 45.0
-    flight_kW_pitch: float = 14.0
-    # Cap matched to torque the arms can actually sustain around the working
-    # point (was 25 -> allocator lived rail-to-rail, bang-bang sustained the
-    # limit cycle).
-    flight_tau_rp_max: float = 8.0
+    # limit-cycled at ~8 Hz with 37% of samples PWM-railed.
+    # 2026-07-10 RESCALED for the CALIBRATED k=1.24e-5: the old k (1.10e-4)
+    # made the pwm mapping deliver only ~11% of the commanded torque, so the
+    # PHYSICAL loop gains were really 90*0.113~10 / 35*0.113~4 -- and that
+    # already oscillated. With k fixed, commanded torque = delivered torque,
+    # so the numbers must drop ~9x to keep the same physical loop. Start
+    # slightly BELOW the old oscillating point (the new pwm~1385 working
+    # point also responds faster: no direction flips, steeper sqrt slope):
+    #   kR 8 / kW 3  (~= old physical 10/4 minus margin).
+    # Gimbal procedure unchanged: if it still limit-cycles, halve; if sluggish
+    # and clean, raise kR toward 10-12 first, kW last. More bandwidth than
+    # this needs lag compensation (INDI), not higher PD.
+    flight_kR_roll: float = 8.0
+    flight_kW_roll: float = 3.0
+    flight_kR_pitch: float = 8.0
+    flight_kW_pitch: float = 3.0
+    # Cap = real deliverable torque around the base point (down-headroom
+    # ~1.7 N/arm from base 1.84 N -> roll ~1.5 Nm, pitch ~1.7 Nm with
+    # L=0.57 m). The old 8 Nm let the demand live 5x beyond physics.
+    flight_tau_rp_max: float = 1.5
     # ===== Stance propeller attitude SO(3) PD (separate from flight) =====
     # Stance leg fxy uses stance_kpp/kpd above; props get their own weak overlay
     # so they assist attitude without fighting the leg. Flight keeps flight_kR/kW.
-    stance_prop_kR_roll: float = 10.0
-    stance_prop_kW_roll: float = 10.0
-    stance_prop_kR_pitch: float = 10.0
-    stance_prop_kW_pitch: float = 10.0
+    # 2026-07-10 rescaled with the calibrated k (see flight gains above):
+    # the user-tuned 10/10 physically delivered ~1.1/1.1 Nm-per-rad through
+    # the wrong mapping; keep that DELIVERED behavior with honest numbers.
+    stance_prop_kR_roll: float = 1.2
+    stance_prop_kW_roll: float = 1.2
+    stance_prop_kR_pitch: float = 1.2
+    stance_prop_kW_pitch: float = 1.2
 
     # ===== Flight velocity -> attitude tilt (Raibert-style pull-back) =====
     # 2026-07-05 user request: props should NOT hold level; they should TILT
