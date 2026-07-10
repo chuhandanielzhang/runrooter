@@ -344,7 +344,13 @@ class ModeEConfig:
     # the forced-liftoff escapes (q_shift 3 cm / 0.4 s stance timeout), the
     # q_shift/qd_shift 5 ms LPFs and the (never-wired) debounce counters were
     # all DELETED per user. Phase detection runs on the RAW shift coordinate.
-    hopper4_td_threshold_m: float = 0.020
+    # 2026-07-11 user: 0.020 -> 0.010 to shrink the contact->TD-flag blind
+    # window (measured 20-80 ms at 2 cm; stance attitude control starts only
+    # at the flag). CAUTION: pure flight-phase q_shift was measured dipping to
+    # -1.84 cm (swing PD pulls the leg in), so 1 cm sits BELOW the swing
+    # excursion -- if mid-air false touchdowns show up, revert to 0.020 or
+    # add a compression-speed condition (qd_shift < -0.3 m/s).
+    hopper4_td_threshold_m: float = 0.010
     hopper4_lo_threshold_m: float = 0.0
     hopper4_phase_min_steps: int = 50  # ~100ms at 500Hz
     # Kinematics qd source. 2026-07-07 user decision (REVERSED from 07-06):
