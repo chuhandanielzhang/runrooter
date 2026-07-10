@@ -630,7 +630,25 @@ class ModeEConfig:
     # the low arm has no thrust to shed (one-sided differential). User chose to
     # KEEP the low idle -- so the response-speed ceiling stays; do not expect
     # sub-100ms attitude response at this baseline.
-    prop_base_thrust_ratio: float = 0.02
+    # 2026-07-10 RAISED 0.02 -> 0.25 (user request: 提高 base 的力):
+    # (a) at ratio 0.02 each arm idled ~0.25 N (pwm ~1048); ANY attitude
+    #     differential >0.25 N pushed the low arm through zero -> constant
+    #     forward/reverse direction flips around level = the chatter seen on
+    #     the bench (direction change through 1000 us is the SLOWEST thing
+    #     an ESC does: stop + re-spin, >>105 ms).
+    # (b) at 0.25 each arm idles ~3 N (pwm ~1170): +-3 N of symmetric
+    #     differential authority WITHOUT any direction change, and the sqrt
+    #     pwm curve is steeper there -> faster torque response.
+    # (c) this is also the first step of the planned thrust-lift
+    #     compensation (base lift reduces effective weight; g_eff already
+    #     accounts for it via prop_base_thrust_ratio).
+    prop_base_thrust_ratio: float = 0.25
+    # FLIGHT allocation floor: never command reverse in flight. Large
+    # corrective torques come from collective lift (spool the other arms UP)
+    # instead of reversing the low arm -- torque direction is preserved by
+    # the allocator either way, but this path has no ESC direction change.
+    # Stance keeps the bidir floor (downforce needs reverse).
+    prop_flight_no_reverse: bool = True
     # NOTE (2026-07-09): the old pure_leg_mode flag / control_mode 1 are DELETED.
     # "Pure leg" is now simply mode 2 with the props not armed (A not pressed):
     # the LCM layer feeds the A-switch state into set_props_armed() every cycle,
@@ -1657,6 +1675,7 @@ class ModeECore:
         z_thrust_w: np.ndarray,
         thrust_sum_ref: float,
         thrust_sum_max: float,
+        no_reverse: bool = False,
     ) -> np.ndarray:
         """
         Tri-rotor thrust allocation, DIRECTION-PRESERVING with collective lift.
@@ -1686,10 +1705,14 @@ class ModeECore:
         # zero instead of only spooling the others up -> less collective-lift
         # coupling, faster attitude response at low baseline. Same math: the
         # collective-lift/scaling logic below only assumes t_min <= t_max.
-        if bool(getattr(self.cfg, "prop_bidir", False)):
+        if bool(getattr(self.cfg, "prop_bidir", False)) and not bool(no_reverse):
             t_min = -abs(float(self.cfg.prop_reverse_max_n))
         else:
             t_min = float(self.cfg.wbc_thrust_min_each_n)
+        if bool(no_reverse):
+            # Flight no-reverse floor (see prop_flight_no_reverse): stay
+            # strictly on the forward side so the ESC never crosses 1000 us.
+            t_min = max(0.0, t_min)
         t_max = float(self.cfg.thrust_max_each_n)
         tsum_cap = float(max(0.0, float(thrust_sum_max)))
 
@@ -3765,6 +3788,7 @@ class ModeECore:
                         z_thrust_w=z_thrust_w,
                         thrust_sum_ref=float(thrust_sum_ref),
                         thrust_sum_max=float(thrust_sum_max),
+                        no_reverse=bool(getattr(self.cfg, "prop_flight_no_reverse", False)),
                     )
                 except Exception:
                     thrusts = np.zeros(3, dtype=float)
