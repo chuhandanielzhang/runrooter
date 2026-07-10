@@ -651,17 +651,18 @@ class ModeEConfig:
     # use the collective-lift path (spool the other arms UP) so attitude
     # authority stays ~1.5 Nm transiently without raising steady lift.
     prop_base_thrust_ratio: float = 0.08
-    # FLIGHT reverse policy (2026-07-10 log review):
-    # - SMALL |e_R|: stay forward-only (no pwm crossing 1000) -> no direction
-    #   flips / 6-8 Hz chatter around level.
-    # - LARGE |e_R|: allow bidir so the low arm can REVERSE instead of only
-    #   spooling the others up (collective-lift path pegs one arm on the
-    #   1090 floor and still cannot recover -- user saw +17 deg with pwm3
-    #   stuck at 1090 while pwm2 at 1497, zero reverse).
-    # When max(|e_R_roll|, |e_R_pitch|) >= this threshold, flight allocation
-    # uses the bidir floor (-prop_reverse_max_n). Below it: forward-only.
-    # <=0 disables the gate (always bidir in flight).
-    prop_flight_rev_e_rad: float = 0.08   # ~4.6 deg
+    # FLIGHT reverse policy (2026-07-10, v2 -- feasibility-based, replaces
+    # the |e_R| angle-threshold gate):
+    #   "fwd"   never reverse in flight (old prop_flight_no_reverse=True).
+    #   "auto"  prioritized (daisy-chain) allocation: solve forward-only
+    #           first; open the reverse floor ONLY when that solution cannot
+    #           realize the demanded torque (allocator s < 1), with
+    #           hysteresis so the low arm does not flip across 1000 us at
+    #           the boundary. Criterion = actuator feasibility, not angle:
+    #           small disturbances never cross the stop, big ones get the
+    #           full bidir authority automatically.
+    #   "bidir" reverse always available (old behavior before 07-10).
+    prop_flight_reverse: str = "auto"
     # NOTE (2026-07-09): the old pure_leg_mode flag / control_mode 1 are DELETED.
     # "Pure leg" is now simply mode 2 with the props not armed (A not pressed):
     # the LCM layer feeds the A-switch state into set_props_armed() every cycle,
@@ -935,10 +936,14 @@ class ModeEConfig:
     flight_kW_roll: float = 1.0
     flight_kR_pitch: float = 50.0
     flight_kW_pitch: float = 1.0
-    # Cap = real deliverable torque around the base point (down-headroom
-    # ~1.7 N/arm from base 1.84 N -> roll ~1.5 Nm, pitch ~1.7 Nm with
-    # L=0.57 m). The old 8 Nm let the demand live 5x beyond physics.
-    flight_tau_rp_max: float = 1.5
+    # Cap = deliverable torque with the "auto" reverse policy. Verified
+    # numerically (2026-07-10): forward-only realizes up to ~2 Nm (with a
+    # collective-lift sum spike); the reverse path extends the ceiling to
+    # ~3 Nm at base 0.08. 2.5 leaves margin below the hard ceiling so the
+    # allocator's s-scaling (not the PWM clip) stays in charge. NOTE: at
+    # 1.5 the auto policy would never engage reverse -- the cap must sit
+    # above the forward-only ceiling for the bidir authority to be usable.
+    flight_tau_rp_max: float = 2.5
     # ===== Stance propeller attitude SO(3) PD (separate from flight) =====
     # Stance leg fxy uses stance_kpp/kpd above; props get their own weak overlay
     # so they assist attitude without fighting the leg. Flight keeps flight_kR/kW.
@@ -1269,6 +1274,8 @@ class ModeECore:
         # Filtered gyro for the stance attitude D-term (see stance_gyro_lpf_tau).
         self._stance_gyro_lpf = np.zeros(3, dtype=float)
         self._stance_gyro_lpf_init: bool = False
+        # "auto" reverse-policy hysteresis latch (see _allocate_prop_thrust).
+        self._prop_rev_on: bool = False
         # Mode 2/3 stance attitude upgrades (see stance_att_kf_k etc.):
         # model-based rate filter state (roll/pitch), last sent attitude torque
         # for its prediction step, and the touchdown-latched reference.
@@ -1543,6 +1550,7 @@ class ModeECore:
         self._energy_vel_lpf_init = False
         self._stance_gyro_lpf[:] = 0.0
         self._stance_gyro_lpf_init = False
+        self._prop_rev_on = False
         self._att_kf_omega[:] = 0.0
         self._att_kf_init = False
         self._tau_att_prev[:] = 0.0
@@ -1719,7 +1727,7 @@ class ModeECore:
         z_thrust_w: np.ndarray,
         thrust_sum_ref: float,
         thrust_sum_max: float,
-        no_reverse: bool = False,
+        reverse_policy: str = "bidir",
     ) -> np.ndarray:
         """
         Tri-rotor thrust allocation, DIRECTION-PRESERVING with collective lift.
@@ -1734,7 +1742,21 @@ class ModeECore:
           - s < 1 only when the per-arm max or the total-sum cap binds
             (whole differential scaled together -> direction exact, never
             per-arm clipping).
-        Same policy in stance and flight; thrust_sum_max = thrust_total_ratio_max * m * g.
+        thrust_sum_max = thrust_total_ratio_max * m * g.
+
+        reverse_policy (prioritized a.k.a. daisy-chain allocation, cf.
+        Johansen & Fossen 2013):
+          "fwd"   forward-only floor (never cross the 1000 us stop).
+          "bidir" reverse floor always available (stance downforce path).
+          "auto"  solve forward-only FIRST; open the reverse floor only when
+                  that solution cannot realize the demanded torque (s < 1).
+                  The Case-1 math then reverses the low arm only by the
+                  amount actually needed. Hysteresis: once engaged, reverse
+                  stays available until the bidir solution naturally returns
+                  to the forward side (all arms >= forward floor), so the
+                  low arm does not flip back and forth across 1000 us at the
+                  engagement boundary. This replaces the angle-threshold
+                  gate: the criterion is actuator FEASIBILITY, not |e_R|.
         """
         tau_des_w = np.asarray(tau_des_w, dtype=float).reshape(3)
         prop_r_w = np.asarray(prop_r_w, dtype=float).reshape(3, 3)
@@ -1744,19 +1766,6 @@ class ModeECore:
         ]).astype(float)
         thrusts_att = _lstsq_minnorm(M_prop[:2, :], tau_des_w[:2]).astype(float)
         base_each = float(thrust_sum_ref) / 3.0
-        # Bidirectional ESCs: the per-arm floor becomes NEGATIVE (reverse thrust),
-        # so a large corrective torque can also come from pushing the low arm below
-        # zero instead of only spooling the others up -> less collective-lift
-        # coupling, faster attitude response at low baseline. Same math: the
-        # collective-lift/scaling logic below only assumes t_min <= t_max.
-        if bool(getattr(self.cfg, "prop_bidir", False)) and not bool(no_reverse):
-            t_min = -abs(float(self.cfg.prop_reverse_max_n))
-        else:
-            t_min = float(self.cfg.wbc_thrust_min_each_n)
-        if bool(no_reverse):
-            # Flight small-angle floor (see prop_flight_rev_e_rad): stay
-            # strictly on the forward side so the ESC never crosses 1000 us.
-            t_min = max(0.0, t_min)
         t_max = float(self.cfg.thrust_max_each_n)
         tsum_cap = float(max(0.0, float(thrust_sum_max)))
 
@@ -1765,31 +1774,59 @@ class ModeECore:
         a_max = max(a)
         a_sum = a[0] + a[1] + a[2]
 
-        # Largest s in [0,1] such that thrusts = base + c(s) + s*att is feasible,
-        # where c(s) = max(0, t_min - (base + s*a_min)) is the collective lift.
-        # Case 1: no lift needed (base + s*a_min >= t_min).
-        s = 1.0
-        if a_max > 1e-9:
-            s = min(s, max(0.0, t_max - base_each) / a_max)
-        if tsum_cap > 1e-9 and a_sum > 1e-9:
-            s = min(s, max(0.0, tsum_cap - 3.0 * base_each) / a_sum)
-        if (base_each + s * a_min) < t_min - 1e-12:
-            # Case 2: lift engaged. Arm ceiling: t_min + s*(a_max - a_min) <= t_max.
-            # Sum cap: 3*t_min + s*(a_sum - 3*a_min) <= tsum_cap.
+        def _solve(t_min: float) -> tuple[np.ndarray, float]:
+            # Largest s in [0,1] such that thrusts = base + c(s) + s*att is
+            # feasible, where c(s) = max(0, t_min - (base + s*a_min)) is the
+            # collective lift. Case 1: no lift needed (base + s*a_min >= t_min).
             s = 1.0
-            d = a_max - a_min
-            if d > 1e-9:
-                s = min(s, max(0.0, t_max - t_min) / d)
-            dsum = a_sum - 3.0 * a_min
-            if tsum_cap > 1e-9 and dsum > 1e-9:
-                s = min(s, max(0.0, tsum_cap - 3.0 * t_min) / dsum)
-            s = max(0.0, min(1.0, s))
+            if a_max > 1e-9:
+                s = min(s, max(0.0, t_max - base_each) / a_max)
+            if tsum_cap > 1e-9 and a_sum > 1e-9:
+                s = min(s, max(0.0, tsum_cap - 3.0 * base_each) / a_sum)
+            if (base_each + s * a_min) < t_min - 1e-12:
+                # Case 2: lift engaged. Arm ceiling: t_min + s*(a_max - a_min) <= t_max.
+                # Sum cap: 3*t_min + s*(a_sum - 3*a_min) <= tsum_cap.
+                s = 1.0
+                d = a_max - a_min
+                if d > 1e-9:
+                    s = min(s, max(0.0, t_max - t_min) / d)
+                dsum = a_sum - 3.0 * a_min
+                if tsum_cap > 1e-9 and dsum > 1e-9:
+                    s = min(s, max(0.0, tsum_cap - 3.0 * t_min) / dsum)
+                s = max(0.0, min(1.0, s))
+            c = max(0.0, t_min - (base_each + s * a_min))
+            return (
+                np.array(
+                    [base_each + c + s * a[0], base_each + c + s * a[1], base_each + c + s * a[2]],
+                    dtype=float,
+                ),
+                float(s),
+            )
 
-        c = max(0.0, t_min - (base_each + s * a_min))
-        thrusts = np.array(
-            [base_each + c + s * a[0], base_each + c + s * a[1], base_each + c + s * a[2]],
-            dtype=float,
-        )
+        bidir_ok = bool(getattr(self.cfg, "prop_bidir", False))
+        t_min_fwd = max(0.0, float(self.cfg.wbc_thrust_min_each_n))
+        t_min_rev = -abs(float(self.cfg.prop_reverse_max_n)) if bidir_ok \
+            else float(self.cfg.wbc_thrust_min_each_n)
+        pol = str(reverse_policy)
+        if (not bidir_ok) or pol == "fwd":
+            thrusts, _ = _solve(t_min_fwd if bidir_ok else t_min_rev)
+        elif pol == "bidir":
+            thrusts, _ = _solve(t_min_rev)
+        else:  # "auto"
+            thr_f, s_f = _solve(t_min_fwd)
+            if (not self._prop_rev_on) and s_f < 1.0 - 1e-6:
+                self._prop_rev_on = True
+            if self._prop_rev_on:
+                thr_b, _ = _solve(t_min_rev)
+                if float(np.min(thr_b)) >= t_min_fwd - 1e-9:
+                    # Demand shrank: bidir solution is already all-forward,
+                    # identical to the fwd one -> disengage with no jump.
+                    self._prop_rev_on = False
+                    thrusts = thr_f
+                else:
+                    thrusts = thr_b
+            else:
+                thrusts = thr_f
         return thrusts
 
     def _pwm_from_arm_thrusts(self, thrusts: np.ndarray) -> np.ndarray:
@@ -3826,19 +3863,13 @@ class ModeECore:
 
             if props_on:
                 try:
-                    rev_thr = float(getattr(self.cfg, "prop_flight_rev_e_rad", 0.08))
-                    if rev_thr <= 0.0:
-                        flight_no_rev = False
-                    else:
-                        e_mag = max(abs(float(e_R[0])), abs(float(e_R[1])))
-                        flight_no_rev = e_mag < rev_thr
                     thrusts = self._allocate_prop_thrust(
                         tau_des_w=Tau_prop_des,
                         prop_r_w=prop_r_w,
                         z_thrust_w=z_thrust_w,
                         thrust_sum_ref=float(thrust_sum_ref),
                         thrust_sum_max=float(thrust_sum_max),
-                        no_reverse=bool(flight_no_rev),
+                        reverse_policy=str(getattr(self.cfg, "prop_flight_reverse", "auto")),
                     )
                 except Exception:
                     thrusts = np.zeros(3, dtype=float)
