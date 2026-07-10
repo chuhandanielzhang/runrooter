@@ -651,12 +651,17 @@ class ModeEConfig:
     # use the collective-lift path (spool the other arms UP) so attitude
     # authority stays ~1.5 Nm transiently without raising steady lift.
     prop_base_thrust_ratio: float = 0.08
-    # FLIGHT allocation floor: never command reverse in flight. Large
-    # corrective torques come from collective lift (spool the other arms UP)
-    # instead of reversing the low arm -- torque direction is preserved by
-    # the allocator either way, but this path has no ESC direction change.
-    # Stance keeps the bidir floor (downforce needs reverse).
-    prop_flight_no_reverse: bool = True
+    # FLIGHT reverse policy (2026-07-10 log review):
+    # - SMALL |e_R|: stay forward-only (no pwm crossing 1000) -> no direction
+    #   flips / 6-8 Hz chatter around level.
+    # - LARGE |e_R|: allow bidir so the low arm can REVERSE instead of only
+    #   spooling the others up (collective-lift path pegs one arm on the
+    #   1090 floor and still cannot recover -- user saw +17 deg with pwm3
+    #   stuck at 1090 while pwm2 at 1497, zero reverse).
+    # When max(|e_R_roll|, |e_R_pitch|) >= this threshold, flight allocation
+    # uses the bidir floor (-prop_reverse_max_n). Below it: forward-only.
+    # <=0 disables the gate (always bidir in flight).
+    prop_flight_rev_e_rad: float = 0.08   # ~4.6 deg
     # NOTE (2026-07-09): the old pure_leg_mode flag / control_mode 1 are DELETED.
     # "Pure leg" is now simply mode 2 with the props not armed (A not pressed):
     # the LCM layer feeds the A-switch state into set_props_armed() every cycle,
@@ -926,10 +931,10 @@ class ModeEConfig:
     # gimbal: counterweight the rig until it hangs level with props off,
     # then re-tune (12-18 should become usable once the constant moment is
     # gone). NEVER push kW past ~5 while tau_m ~ 100 ms.
-    flight_kR_roll: float = 10.0
-    flight_kW_roll: float = 4.0
-    flight_kR_pitch: float = 10.0
-    flight_kW_pitch: float = 4.0
+    flight_kR_roll: float = 50.0
+    flight_kW_roll: float = 1.0
+    flight_kR_pitch: float = 50.0
+    flight_kW_pitch: float = 1.0
     # Cap = real deliverable torque around the base point (down-headroom
     # ~1.7 N/arm from base 1.84 N -> roll ~1.5 Nm, pitch ~1.7 Nm with
     # L=0.57 m). The old 8 Nm let the demand live 5x beyond physics.
@@ -1749,7 +1754,7 @@ class ModeECore:
         else:
             t_min = float(self.cfg.wbc_thrust_min_each_n)
         if bool(no_reverse):
-            # Flight no-reverse floor (see prop_flight_no_reverse): stay
+            # Flight small-angle floor (see prop_flight_rev_e_rad): stay
             # strictly on the forward side so the ESC never crosses 1000 us.
             t_min = max(0.0, t_min)
         t_max = float(self.cfg.thrust_max_each_n)
@@ -3821,13 +3826,19 @@ class ModeECore:
 
             if props_on:
                 try:
+                    rev_thr = float(getattr(self.cfg, "prop_flight_rev_e_rad", 0.08))
+                    if rev_thr <= 0.0:
+                        flight_no_rev = False
+                    else:
+                        e_mag = max(abs(float(e_R[0])), abs(float(e_R[1])))
+                        flight_no_rev = e_mag < rev_thr
                     thrusts = self._allocate_prop_thrust(
                         tau_des_w=Tau_prop_des,
                         prop_r_w=prop_r_w,
                         z_thrust_w=z_thrust_w,
                         thrust_sum_ref=float(thrust_sum_ref),
                         thrust_sum_max=float(thrust_sum_max),
-                        no_reverse=bool(getattr(self.cfg, "prop_flight_no_reverse", False)),
+                        no_reverse=bool(flight_no_rev),
                     )
                 except Exception:
                     thrusts = np.zeros(3, dtype=float)
