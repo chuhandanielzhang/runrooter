@@ -568,23 +568,9 @@ class ModeEConfig:
 
     # ===== Flight foot placement =====
     # Raibert (Kv/Kr) in WORLD (+Z down), then foot_des_b = R_wb^T @ target_w (quaternion).
-    flight_kv: float = 0.16
+    flight_kv: float = 0.11
     flight_kr: float = 0.0
-    # Neutral-point forward bias (BODY +x, meters), added to the Raibert/S2S
-    # XY target. Motivation (2026-07-09 log, 5 pure-leg hops): the foot touches
-    # down near the CoM (+3 cm) and, as the body passes over the pivot, leaves
-    # at -7 cm BEHIND it -> the stance-mean lever arm rx*fz is a one-signed
-    # ~+8 Nm pitch torque that the attitude PD (kR=27, demand peaked -8 Nm)
-    # can only just cancel, so pitch ratchets +8..10 deg every hop. Shifting
-    # the touchdown ahead makes the swept interval symmetric (e.g. +5..-5 cm),
-    # so the early-stance and late-stance lever torques cancel over the hop.
-    # Start at +0.03..+0.05 on the real robot; 0 = off (old behavior).
-    # 2026-07-10 22:10 log: fz-weighted stance-mean rx was -3..-9 cm on all
-    # 5 hops (foot behind CoM the whole push) -> one-signed nose-up lever
-    # impulse -0.5..-1.7 Nms/hop -> flight pitch systematically +7..+16 deg,
-    # and the swing leg mirrors that tilt (the "big leg swing" at near-zero
-    # velocity). +0.05 centers the swept lever interval.
-    flight_foot_x_bias_m: float = 0.05
+    # (2026-07-10: flight_foot_x_bias_m neutral-point bias DELETED per user.)
     # If you see "摆腿太小" (world/heading XY step is small), increase this cap first.
     flight_stepper_lim_m: float = 0.2
     # swing (flight) foot-space torque reference (passed via QP tau_ref)
@@ -595,7 +581,7 @@ class ModeEConfig:
     # Hopper4-like baseline for this controller:
     #   Khp ~= 50, Khd ~= 1, with axial spring/damping kept conservative for hardware bring-up.
     swing_kp_xy: float = 50.0
-    swing_kd_xy: float = 1.3
+    swing_kd_xy: float = 1
     # Axial (virtual spring) stiffness and damping for flight leg control.
     # BALANCE: High kd prevents over-extension but amplifies velocity noise → jitter.
     # Use moderate kd (8-12) with strong LPF filtering instead of high kd.
@@ -990,7 +976,7 @@ class ModeEConfig:
     #     the "Mode 3" config block below). Raibert kv/kr are NOT used in
     #     mode 3 -- the placement gain is DERIVED each hop from the measured
     #     stance duration and pivot height.
-    control_mode: int = 2
+    control_mode: int = 3
 
     # ===== Mode 3: HLIP S2S foot placement (2026-07-07) =====
     # Model: stance = Linear Inverted Pendulum (LIP) about the foot pivot,
@@ -1016,7 +1002,7 @@ class ModeEConfig:
     # - Ts and z0 are MEASURED online (EMA over hops, seeded on the first
     #   completed stance). Until the first stance completes, mode 3 falls back
     #   to the mode-2 Raibert law.
-    s2s_pole_beta: float = 0.45
+    s2s_pole_beta: float = 0.6
     # Print the derived S2S quantities (Ts, z0, gain) once per hop at liftoff.
     s2s_print_debug: bool = True
 
@@ -1048,10 +1034,10 @@ class ModeEConfig:
     # old 40/1 -> zeta 0.46 underdamped, body leaves ground still rotating.
     # 20/1.5 -> zeta ~1.0 (critical), wn ~26 rad/s (plenty for a 180 ms
     # stance). If retuning, keep zeta ~= 1: kW = 2*sqrt(kR*0.0297).
-    stance_kpp_x: float = 30.0    # leg stance kR roll
-    stance_kpp_y: float = 30.0    # leg stance kR pitch
-    stance_kpd_x: float = 1.2    # leg stance kW roll
-    stance_kpd_y: float = 1.2    # leg stance kW pitch
+    stance_kpp_x: float = 35.0    # leg stance kR roll
+    stance_kpp_y: float = 35.0    # leg stance kR pitch
+    stance_kpd_x: float = 1    # leg stance kW roll
+    stance_kpd_y: float = 1    # leg stance kW pitch
     # NOTE 2026-07-10: ALL stance attitude signal conditioning DELETED per
     # user (gyro notches, first-order LPF, model-based KF rate filter,
     # touchdown Hermite reference shaping, error-scheduled damping). Stance
@@ -3367,16 +3353,6 @@ class ModeECore:
                 # Mode 2 (or mode 3 before the first measured stance):
                 # classic Raibert with hand-tuned kv/kr.
                 target_xy_w = (kv * v_xy_w + kr * vdes_xy_w).astype(float)
-            # Neutral-point forward bias (kills the one-signed rx*fz pitch lever,
-            # see flight_foot_x_bias_m docs): shift the target along the BODY +x
-            # heading projected to the horizontal plane.
-            x_bias = float(getattr(self.cfg, "flight_foot_x_bias_m", 0.0))
-            if abs(x_bias) > 1e-9:
-                bx_w = np.asarray(R_wb_hat, dtype=float).reshape(3, 3)[:, 0]
-                n_bx = float(np.hypot(float(bx_w[0]), float(bx_w[1])))
-                if n_bx > 1e-6:
-                    target_xy_w[0] += x_bias * float(bx_w[0]) / n_bx
-                    target_xy_w[1] += x_bias * float(bx_w[1]) / n_bx
             if bool(self.cfg.mode_1d):
                 target_xy_w[0] = 0.0
                 target_xy_w[1] = 0.0
