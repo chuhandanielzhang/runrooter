@@ -512,8 +512,14 @@ class ModeEConfig:
     use_vel_kf: bool = True
     vel_kf_sigma_acc: float = 0.6       # accel white noise -> velocity Q [m/s^2]
     vel_kf_sigma_bias: float = 0.03     # accel bias random walk [m/s^2/sqrt(s)]
-    vel_kf_meas_std: float = 0.12       # leg-kinematics velocity noise [m/s]
-    vel_kf_meas_std_push: float = 0.30  # inflated during push (fast leg, worst SNR)
+    # 2026-07-10 20:33 log: measured leg-kinematics noise inside the TRUSTED
+    # stance windows is 0.5-0.9 m/s rms (CAN qd through the Jacobian + the
+    # omega x r term while the body rocks). The old 0.12 made the KF chase
+    # those bursts; whatever value the burst had at liftoff was carried into
+    # flight as a phantom drift and the swing leg "caught" it (left-right
+    # hunting on an in-place hop). Match the filter to the REAL noise:
+    vel_kf_meas_std: float = 0.30       # leg-kinematics velocity noise [m/s]
+    vel_kf_meas_std_push: float = 0.50  # inflated during push (fast leg, worst SNR)
     vel_kf_bias_max: float = 1.5        # |b_a| clamp per axis [m/s^2]
     # ---- Leg-kinematics measurement TRUST GATE ("foot planted" assumption) ----
     # The v_base_from_foot_w formula assumes the foot is pinned to the ground.
@@ -1011,7 +1017,7 @@ class ModeEConfig:
     # - Ts and z0 are MEASURED online (EMA over hops, seeded on the first
     #   completed stance). Until the first stance completes, mode 3 falls back
     #   to the mode-2 Raibert law.
-    s2s_pole_beta: float = 0.6
+    s2s_pole_beta: float = 0.5
     # Print the derived S2S quantities (Ts, z0, gain) once per hop at liftoff.
     s2s_print_debug: bool = True
 
@@ -1043,8 +1049,8 @@ class ModeEConfig:
     # old 40/1 -> zeta 0.46 underdamped, body leaves ground still rotating.
     # 20/1.5 -> zeta ~1.0 (critical), wn ~26 rad/s (plenty for a 180 ms
     # stance). If retuning, keep zeta ~= 1: kW = 2*sqrt(kR*0.0297).
-    stance_kpp_x: float = 20.0    # leg stance kR roll
-    stance_kpp_y: float = 20.0    # leg stance kR pitch
+    stance_kpp_x: float = 30.0    # leg stance kR roll
+    stance_kpp_y: float = 30.0    # leg stance kR pitch
     stance_kpd_x: float = 1.5    # leg stance kW roll
     stance_kpd_y: float = 1.5    # leg stance kW pitch
     # NOTE 2026-07-10: ALL stance attitude signal conditioning DELETED per
@@ -2949,8 +2955,10 @@ class ModeECore:
         if (not bool(self._stance)) and bool(props_enabled_ctrl) and \
            bool(getattr(self.cfg, "prop_vel_tilt", False)):
             kv_t = float(getattr(self.cfg, "prop_vel_tilt_kv", 0.0))
-            a_des_x = kv_t * (float(desired_v_xy_w[0]) - float(self._flight_vel[0]))
-            a_des_y = kv_t * (float(desired_v_xy_w[1]) - float(self._flight_vel[1]))
+            # 2026-07-10: KF velocity, same source as the Raibert placement
+            # (the stance latch/extrapolation is legacy-estimator only now).
+            a_des_x = kv_t * (float(desired_v_xy_w[0]) - float(self._v_hat_w[0]))
+            a_des_y = kv_t * (float(desired_v_xy_w[1]) - float(self._v_hat_w[1]))
             g_t = float(self.gravity)
             a_cap = g_t * math.tan(math.radians(float(getattr(self.cfg, "prop_vel_tilt_max_deg", 10.0))))
             a_n = float(math.hypot(a_des_x, a_des_y))
