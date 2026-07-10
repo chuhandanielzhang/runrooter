@@ -913,20 +913,23 @@ class ModeEConfig:
     # slightly BELOW the old oscillating point (the new pwm~1385 working
     # point also responds faster: no direction flips, steeper sqrt slope):
     #   kR 8 / kW 3  (~= old physical 10/4 minus margin).
-    # 2026-07-10 19:00 gimbal log AT 8/3: NO oscillation left (dominant
-    # 0.5 Hz wander, pwm jitter 0.4us/tick) but far too weak -- roll parked
-    # at +6.2 deg, exactly the P-only steady error against the ~0.9 Nm
-    # gimbal pivot-offset gravity moment (e_ss = 0.9/8 = 6.4 deg), and
-    # tau_des railed at the 1.5 Nm cap 36% of the time. The old oscillation
-    # lived at the pwm~1030 working point with constant direction flips;
-    # the new base has neither, so raise: kR 18 / kW 5. Expect ~3 deg
-    # residual on the gimbal (it is a CONSTANT moment; flight disturbances
-    # are transient) -- do NOT chase it to zero with more kR, and do NOT
-    # add integral action for a bench artifact.
-    flight_kR_roll: float = 18.0
-    flight_kW_roll: float = 5.0
-    flight_kR_pitch: float = 18.0
-    flight_kW_pitch: float = 5.0
+    # 2026-07-10 19:00 gimbal log AT 8/3: clean (no limit cycle, 0.4us/tick
+    # pwm jitter) but roll parked at +6.2 deg = P-only steady error against
+    # the gimbal pivot-offset gravity moment (~1 Nm).
+    # 2026-07-10 19:06 AT 18/15 (kW manually raised): 6.4 Hz limit cycle --
+    # tau_des at the 1.5 Nm cap 67% of the time, pwm3 on the 1090 floor
+    # 49%, roll parked at +10.4 deg. TWO drivers: (a) kW=15 turns the
+    # 105 ms actuator lag into positive feedback (D on a lagged plant),
+    # (b) the bench pivot moment eats ~2/3 of the total prop authority, so
+    # strong gains bang-bang between cap and floor. 10/4 = just under the
+    # observed boundary. DO NOT tune flight gains further on the unbalanced
+    # gimbal: counterweight the rig until it hangs level with props off,
+    # then re-tune (12-18 should become usable once the constant moment is
+    # gone). NEVER push kW past ~5 while tau_m ~ 100 ms.
+    flight_kR_roll: float = 10.0
+    flight_kW_roll: float = 4.0
+    flight_kR_pitch: float = 10.0
+    flight_kW_pitch: float = 4.0
     # Cap = real deliverable torque around the base point (down-headroom
     # ~1.7 N/arm from base 1.84 N -> roll ~1.5 Nm, pitch ~1.7 Nm with
     # L=0.57 m). The old 8 Nm let the demand live 5x beyond physics.
