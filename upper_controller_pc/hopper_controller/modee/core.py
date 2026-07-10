@@ -643,10 +643,14 @@ class ModeEConfig:
     #     compensation (base lift reduces effective weight; g_eff already
     #     accounts for it via prop_base_thrust_ratio).
     # With calibrated k=1.24e-5 the physical ceiling is ~0.89 kg total thrust
-    # at pwm 1500 (ratio ~0.24 of m=3.75 kg). 0.25 base would idle at pwm~1498
-    # with zero differential headroom -> saturation/chatter. 0.15 -> pwm~1386,
-    # ~1.8 N/arm base, ~110 us headroom to 1500 for attitude differential.
-    prop_base_thrust_ratio: float = 0.15
+    # at pwm 1500 (ratio ~0.24 of m=3.75 kg).
+    # 2026-07-10 19:00 log review (base 0.15): user verdict -- constant 15%
+    # lift is too much for hopping (energy/apex coupling) and all arms feel
+    # strong. Cut to 0.08: ~1 N/arm idle (pwm ~1281), still far from the
+    # 1000 us direction-flip zone, ~0.9 N/arm down-headroom; large torques
+    # use the collective-lift path (spool the other arms UP) so attitude
+    # authority stays ~1.5 Nm transiently without raising steady lift.
+    prop_base_thrust_ratio: float = 0.08
     # FLIGHT allocation floor: never command reverse in flight. Large
     # corrective torques come from collective lift (spool the other arms UP)
     # instead of reversing the low arm -- torque direction is preserved by
@@ -909,13 +913,20 @@ class ModeEConfig:
     # slightly BELOW the old oscillating point (the new pwm~1385 working
     # point also responds faster: no direction flips, steeper sqrt slope):
     #   kR 8 / kW 3  (~= old physical 10/4 minus margin).
-    # Gimbal procedure unchanged: if it still limit-cycles, halve; if sluggish
-    # and clean, raise kR toward 10-12 first, kW last. More bandwidth than
-    # this needs lag compensation (INDI), not higher PD.
-    flight_kR_roll: float = 8.0
-    flight_kW_roll: float = 3.0
-    flight_kR_pitch: float = 8.0
-    flight_kW_pitch: float = 3.0
+    # 2026-07-10 19:00 gimbal log AT 8/3: NO oscillation left (dominant
+    # 0.5 Hz wander, pwm jitter 0.4us/tick) but far too weak -- roll parked
+    # at +6.2 deg, exactly the P-only steady error against the ~0.9 Nm
+    # gimbal pivot-offset gravity moment (e_ss = 0.9/8 = 6.4 deg), and
+    # tau_des railed at the 1.5 Nm cap 36% of the time. The old oscillation
+    # lived at the pwm~1030 working point with constant direction flips;
+    # the new base has neither, so raise: kR 18 / kW 5. Expect ~3 deg
+    # residual on the gimbal (it is a CONSTANT moment; flight disturbances
+    # are transient) -- do NOT chase it to zero with more kR, and do NOT
+    # add integral action for a bench artifact.
+    flight_kR_roll: float = 18.0
+    flight_kW_roll: float = 5.0
+    flight_kR_pitch: float = 18.0
+    flight_kW_pitch: float = 5.0
     # Cap = real deliverable torque around the base point (down-headroom
     # ~1.7 N/arm from base 1.84 N -> roll ~1.5 Nm, pitch ~1.7 Nm with
     # L=0.57 m). The old 8 Nm let the demand live 5x beyond physics.
