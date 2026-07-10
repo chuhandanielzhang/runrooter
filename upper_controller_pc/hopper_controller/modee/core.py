@@ -863,11 +863,23 @@ class ModeEConfig:
     # stay at 60 until the ~134 ms actuation lag is reduced (ActuatorMotors
     # direct channel / higher prop idle), NOT because 60 is "enough" but
     # because anything higher self-oscillates and destabilizes the hops.
-    flight_kR_roll: float = 90.0
-    flight_kW_roll: float = 35.0
-    flight_kR_pitch: float = 90.0
-    flight_kW_pitch: float = 35.0
-    flight_tau_rp_max: float = 25.0
+    # 2026-07-10 BENCH MEASUREMENT (gimbal, bench_step_0710_180657): motor
+    # time constant tau_m ~= 105 ms (63% rise, n=10). At 90/35 the prop loop
+    # limit-cycled at ~8 Hz with 37% of samples PWM-railed (700/1600) --
+    # the gains demanded a bandwidth the props physically cannot deliver
+    # (at 8 Hz the actuator alone lags ~80 deg). Cut to 45/14 as the new
+    # bench-informed starting point; halve again if the limit cycle
+    # persists (tune on the gimbal: lower until the oscillation dies, then
+    # back off 30%). Real fix for more bandwidth = lag compensation (INDI)
+    # or faster ESC ramp, NOT higher PD gains.
+    flight_kR_roll: float = 45.0
+    flight_kW_roll: float = 14.0
+    flight_kR_pitch: float = 45.0
+    flight_kW_pitch: float = 14.0
+    # Cap matched to torque the arms can actually sustain around the working
+    # point (was 25 -> allocator lived rail-to-rail, bang-bang sustained the
+    # limit cycle).
+    flight_tau_rp_max: float = 8.0
     # ===== Stance propeller attitude SO(3) PD (separate from flight) =====
     # Stance leg fxy uses stance_kpp/kpd above; props get their own weak overlay
     # so they assist attitude without fighting the leg. Flight keeps flight_kR/kW.
