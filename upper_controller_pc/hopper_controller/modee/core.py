@@ -423,7 +423,7 @@ class ModeEConfig:
     swing_kd_xy: float = 1
     # Axial (virtual spring) stiffness and damping for flight leg control.
     swing_kp_z: float = 1000.0
-    stance_kp_z: float = 1300.0   # RESTORED to Cao original (was drifted to 1100)
+    stance_kp_z: float = 1450.0   # RESTORED to Cao original (was drifted to 1100)
     stance_kd_z: float = 10.0    # RESTORED to Cao original (was drifted to 20)
     swing_kd_z: float = 10.0
     # (2026-07-10: the swing deadband/clip params -- l0 deadband, axial/xdot/
@@ -859,16 +859,31 @@ class ModeEConfig:
     # old 40/1 -> zeta 0.46 underdamped, body leaves ground still rotating.
     # 20/1.5 -> zeta ~1.0 (critical), wn ~26 rad/s (plenty for a 180 ms
     # stance). If retuning, keep zeta ~= 1: kW = 2*sqrt(kR*0.0297).
-    stance_kpp_x: float = 35.0    # leg stance kR roll
-    stance_kpp_y: float = 35.0    # leg stance kR pitch
+    stance_kpp_x: float = 33.0    # leg stance kR roll
+    stance_kpp_y: float = 33.0    # leg stance kR pitch
     stance_kpd_x: float = 1    # leg stance kW roll
     stance_kpd_y: float = 1    # leg stance kW pitch
-    # NOTE 2026-07-10: ALL stance attitude signal conditioning DELETED per
-    # user (gyro notches, first-order LPF, model-based KF rate filter,
-    # touchdown Hermite reference shaping, error-scheduled damping). Stance
-    # attitude is a plain PD on the RAW gyro in every control mode:
-    #   tau = -kR * e_R - kW * omega_raw
     stance_tau_rp_max: float = 20.0
+    # ===== Stance D-term rate OBSERVER (inverted-pendulum-paper style) =====
+    # 2026-07-11 per user: allow a HIGH stance kW without gyro-noise chatter.
+    # NOT a low-pass (an LPF adds phase lag, and lag is exactly what limits
+    # kW). This is the standard balancing/inverted-pendulum structure: a
+    # steady-state Kalman (Luenberger) RATE OBSERVER driven by the KNOWN
+    # commanded body torque through the inertia model:
+    #   predict:  w_hat += (tau_cmd_prev / J_xy) * dt
+    #             (flight, props off: tau=0 -> torque-free body, exact)
+    #   correct:  w_hat += k_obs * (w_gyro_raw - w_hat)
+    # The D-term sees the controller's OWN action instantly through the model
+    # (zero lag on commanded dynamics); sensor noise only enters via the
+    # correction at gain k_obs (noise bandwidth ~ k_obs/(2*pi*dt): 0.15 at
+    # 500 Hz ~ 12 Hz). Runs EVERY tick so it is warm at touchdown.
+    # k_obs = 1.0 -> passthrough (raw gyro, observer transparent).
+    # Applies ONLY to the leg stance kW. e_R (P) and the prop D stay raw.
+    # With the observer on, kW can go well past the old chatter limit
+    # (~1.3-1.4 raw): start 2.5-3.5, keep zeta = kW/(2*sqrt(kR*J)) ~ 1
+    # (J~0.0716: kR=33 -> critical kW ~ 3.1).
+    stance_kw_obs_en: bool = True
+    stance_kw_obs_k: float = 0.15
 
     # ===== WBC-QP slack weights (stance vs flight) =====
     # These weights decide whether the QP would rather:
@@ -1027,6 +1042,11 @@ class ModeECore:
         self._q_diff_prev: np.ndarray | None = None
         # "auto" reverse-policy hysteresis latch (see _allocate_prop_thrust).
         self._prop_rev_on: bool = False
+        # Stance kW rate observer state (see stance_kw_obs_* config):
+        # roll/pitch rate estimate + the body attitude torque commanded LAST tick.
+        self._kw_obs_w = np.zeros(2, dtype=float)
+        self._kw_obs_tau_prev = np.zeros(2, dtype=float)
+        self._kw_obs_init: bool = False
 
         # Runtime prop armed state (gamepad A/B switch, fed by the LCM layer via
         # set_props_armed every cycle). Replaces the deleted mode-1/pure_leg_mode:
@@ -1237,6 +1257,9 @@ class ModeECore:
         self._v_hat_w[:] = 0.0
         self._q_diff_prev = None
         self._prop_rev_on = False
+        self._kw_obs_w[:] = 0.0
+        self._kw_obs_tau_prev[:] = 0.0
+        self._kw_obs_init = False
         self._v_hat_inited = False
         self._kf_v_w[:] = 0.0
         self._kf_b_a[:] = 0.0
@@ -2662,9 +2685,34 @@ class ModeECore:
         tau_b_stance_des = np.zeros(3, dtype=float)
         tau_b_att_des = np.zeros(3, dtype=float)
 
-        # Raw gyro, no signal conditioning (all stance filtering DELETED
-        # 2026-07-10 per user: plain PD on the raw physical measurement).
+        # Raw gyro for P-error frames and the prop D-term.
         omega_raw = np.asarray(imu_gyro_b, dtype=float).reshape(3)
+
+        # ---- Stance kW rate OBSERVER (see stance_kw_obs_* in ModeEConfig) ----
+        # Runs EVERY tick (stance + flight) so it is warm at touchdown:
+        #   predict with last tick's commanded body torque through J,
+        #   correct toward the raw gyro at gain k_obs.
+        # Flight with props off predicts tau=0 (torque-free body) -- exact.
+        omega_obs_xy = np.array([float(omega_raw[0]), float(omega_raw[1])], dtype=float)
+        kw_obs_on = bool(getattr(self.cfg, "stance_kw_obs_en", False))
+        if kw_obs_on and np.isfinite(omega_obs_xy).all():
+            k_obs = float(_clipf(float(getattr(self.cfg, "stance_kw_obs_k", 0.15)), 0.0, 1.0))
+            J_diag = np.asarray(self.cfg.I_body_diag, dtype=float).reshape(3)
+            if not bool(self._kw_obs_init):
+                self._kw_obs_w[0] = float(omega_raw[0])
+                self._kw_obs_w[1] = float(omega_raw[1])
+                self._kw_obs_init = True
+            else:
+                self._kw_obs_w[0] += float(self._kw_obs_tau_prev[0]) / max(1e-6, float(J_diag[0])) * float(self.dt)
+                self._kw_obs_w[1] += float(self._kw_obs_tau_prev[1]) / max(1e-6, float(J_diag[1])) * float(self.dt)
+                self._kw_obs_w[0] += k_obs * (float(omega_raw[0]) - float(self._kw_obs_w[0]))
+                self._kw_obs_w[1] += k_obs * (float(omega_raw[1]) - float(self._kw_obs_w[1]))
+            if np.isfinite(self._kw_obs_w).all():
+                omega_obs_xy = self._kw_obs_w.copy()
+            else:
+                self._kw_obs_w[0] = float(omega_raw[0])
+                self._kw_obs_w[1] = float(omega_raw[1])
+                omega_obs_xy = self._kw_obs_w.copy()
 
         if bool(self._stance):
             tau_rp_max = float(self.cfg.stance_tau_rp_max)
@@ -2674,8 +2722,9 @@ class ModeECore:
             kW_x = float(self.cfg.stance_kpd_x)
             kW_y = float(self.cfg.stance_kpd_y)
             tau_b_stance = np.zeros(3, dtype=float)
-            tau_b_stance[0] = -kR_x * float(e_R[0]) - kW_x * float(omega_raw[0])
-            tau_b_stance[1] = -kR_y * float(e_R[1]) - kW_y * float(omega_raw[1])
+            # kW acts on the OBSERVER rate (zero-lag on own dynamics); kR on raw e_R.
+            tau_b_stance[0] = -kR_x * float(e_R[0]) - kW_x * float(omega_obs_xy[0])
+            tau_b_stance[1] = -kR_y * float(e_R[1]) - kW_y * float(omega_obs_xy[1])
             tau_b_stance_des = tau_b_stance.copy()
             tau_b_att_des = tau_b_stance.copy()
             # DEBUG: kill stance attitude torque so QP produces NO horizontal contact force (fxfy=0).
@@ -2745,7 +2794,17 @@ class ModeECore:
         tau_prop_w = (R_wb_hat @ tau_b_prop_des.reshape(3)).reshape(3)
         Tau_prop_des = np.array([float(tau_prop_w[0]), float(tau_prop_w[1]), 0.0], dtype=float)
         Tau_des_dbg = Tau_des.copy()
+        # Observer prediction input for NEXT tick: total commanded body
+        # attitude torque this tick (leg contact demand in stance + props when
+        # armed; flight with props off leaves it 0 = torque-free prediction).
+        self._kw_obs_tau_prev[0] = float(tau_b_att_des[0]) + float(tau_b_prop_des[0])
+        self._kw_obs_tau_prev[1] = float(tau_b_att_des[1]) + float(tau_b_prop_des[1])
+        # Log the rate the stance D-term actually consumed (observer output
+        # when enabled, raw gyro otherwise).
         omega_b_used_dbg = omega_b.copy()
+        if kw_obs_on:
+            omega_b_used_dbg[0] = float(omega_obs_xy[0])
+            omega_b_used_dbg[1] = float(omega_obs_xy[1])
 
         # ===== Flight swing torque reference (only after apex) =====
         tau_ref = None
