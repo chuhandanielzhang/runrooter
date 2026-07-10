@@ -350,7 +350,7 @@ class ModeEConfig:
     # -1.84 cm (swing PD pulls the leg in), so 1 cm sits BELOW the swing
     # excursion -- if mid-air false touchdowns show up, revert to 0.020 or
     # add a compression-speed condition (qd_shift < -0.3 m/s).
-    hopper4_td_threshold_m: float = 0.010
+    hopper4_td_threshold_m: float = 0.01
     hopper4_lo_threshold_m: float = 0.0
     hopper4_phase_min_steps: int = 50  # ~100ms at 500Hz
     # Kinematics qd source. 2026-07-07 user decision (REVERSED from 07-06):
@@ -358,6 +358,14 @@ class ModeEConfig:
     # now publishes the AK60 internal velocity estimate); the upper layer does
     # NOT differentiate q itself. Set True to go back to PC-side dq/dt.
     qd_kin_from_q_diff: bool = False
+    # CASE/Simulink forgetting-factor smoothing on the kinematics qd
+    # (2026-07-11 per user): qd = a*qd_prev + (1-a)*qd_raw, a = this value.
+    # 0.95 at 500 Hz ~ 38 ms time constant -- the same "forgetting number"
+    # as the old SimulinkVelocityFilter. <=0 disables (raw passthrough).
+    # Feeds EVERYTHING downstream of the kinematics: Jacobian foot velocity,
+    # qd_shift phase detection, the KF leg-velocity measurement, stance
+    # energy velocity and swing PD.
+    qd_kin_forgetting: float = 0.95
     # ---- Velocity Kalman filter (Cheetah-style: velocity + accel bias) ----
     # State x = [v_w (3, world); b_a (3, accel bias, body frame)].
     # Predict every tick with the IMU: v_w += (R_wb @ (f_b - b_a) + g_w) * dt.
@@ -865,10 +873,10 @@ class ModeEConfig:
     # old 40/1 -> zeta 0.46 underdamped, body leaves ground still rotating.
     # 20/1.5 -> zeta ~1.0 (critical), wn ~26 rad/s (plenty for a 180 ms
     # stance). If retuning, keep zeta ~= 1: kW = 2*sqrt(kR*0.0297).
-    stance_kpp_x: float = 33.0    # leg stance kR roll
-    stance_kpp_y: float = 33.0    # leg stance kR pitch
-    stance_kpd_x: float = 1    # leg stance kW roll
-    stance_kpd_y: float = 1    # leg stance kW pitch
+    stance_kpp_x: float = 40.0    # leg stance kR roll
+    stance_kpp_y: float = 40.0    # leg stance kR pitch
+    stance_kpd_x: float = 2    # leg stance kW roll
+    stance_kpd_y: float = 2    # leg stance kW pitch
     stance_tau_rp_max: float = 20.0
     # ===== Stance D-term rate OBSERVER (inverted-pendulum-paper style) =====
     # 2026-07-11 per user: allow a HIGH stance kW without gyro-noise chatter.
@@ -1046,6 +1054,9 @@ class ModeECore:
 
         # Previous q sample for the dq/dt kinematics velocity (qd_kin_from_q_diff).
         self._q_diff_prev: np.ndarray | None = None
+        # Forgetting-factor qd filter state (see qd_kin_forgetting).
+        self._qd_forget = np.zeros(3, dtype=float)
+        self._qd_forget_init: bool = False
         # "auto" reverse-policy hysteresis latch (see _allocate_prop_thrust).
         self._prop_rev_on: bool = False
         # Stance kW rate observer state (see stance_kw_obs_* config):
@@ -1262,6 +1273,8 @@ class ModeECore:
         # Estimator/integrator states
         self._v_hat_w[:] = 0.0
         self._q_diff_prev = None
+        self._qd_forget[:] = 0.0
+        self._qd_forget_init = False
         self._prop_rev_on = False
         self._kw_obs_w[:] = 0.0
         self._kw_obs_tau_prev[:] = 0.0
@@ -1922,9 +1935,20 @@ class ModeECore:
         else:
             qd_src = joint_vel.copy()
 
-        # RAW qd into the kinematics (all qd filtering deleted 2026-07-10; the
-        # velocity KF absorbs measurement noise with its honest meas_std).
-        joint_vel_kin = qd_src.copy()
+        # CASE/Simulink forgetting-factor filter on the kinematics qd
+        # (2026-07-11 per user: 用这个 -- the proven 0.95 EWMA from the old
+        # Simulink velocity path):  qd = a*qd_prev + (1-a)*qd_raw.
+        # Set qd_kin_forgetting <= 0 for raw passthrough.
+        a_ff = float(_clipf(float(getattr(self.cfg, "qd_kin_forgetting", 0.0)), 0.0, 0.999))
+        if a_ff > 0.0 and np.all(np.isfinite(qd_src)):
+            if not bool(self._qd_forget_init):
+                self._qd_forget = qd_src.copy()
+                self._qd_forget_init = True
+            else:
+                self._qd_forget = a_ff * self._qd_forget + (1.0 - a_ff) * qd_src
+            joint_vel_kin = self._qd_forget.copy()
+        else:
+            joint_vel_kin = qd_src.copy()
 
         # --- Foot kinematics (native delta FK, same FRD frame as IMU) ---
         # - foot_vicon / foot_vdot_vicon: used for leg PD & Jacobian
