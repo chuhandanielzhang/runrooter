@@ -23,6 +23,8 @@ static inline float wrap_to_pi(float a) {
 //   2nd: same rule again           => {1,2,0}
 //   (2026-06-27) identity mapping {0,1,2}: LCM q0->motor 0, q1->motor 1, q2->motor 2
 static constexpr int kDeltaAk60MotorIdFromJointIdx[3] = {0, 1, 2};
+// LCM q = -motor_pos + offset. Full extension -> q_lcm = 0 when motor_pos = offset.
+static constexpr float kAk60LcmQOffsetRad = static_cast<float>(M_PI / 2.0);  // +90 deg
 
 HopperHardware::HopperHardware(bool is_publish_lcm_data):
         Controller2Robot("udpm://239.255.76.67:7667?ttl=255"),
@@ -232,7 +234,7 @@ void HopperHardware::step_with_pd_control(){
         //   motor_pos_des = -q_des + offset
         //   motor_vel_des = -qd_des
         //   motor_tau_ff  = -tau_ff
-        const float offset = +1.4835f;  // +85 deg at full extension: q_lcm = -motor_pos + offset
+        const float offset = kAk60LcmQOffsetRad;
         const float q_des_motor = -hopper_cmd_lcmt_.q_des[j] + offset;
         const float qd_des_motor = -hopper_cmd_lcmt_.qd_des[j];
         const float tau_ff_motor = -hopper_cmd_lcmt_.tau_ff[j];
@@ -270,7 +272,7 @@ void HopperHardware::step_with_pd_pwm_control(){
     for (int j = 0; j < 3; j++) {
         const int motor_id = kDeltaAk60MotorIdFromJointIdx[j];
         // Same sign/offset conversion as in `step_with_pd_control()`.
-        const float offset = +1.4835f;  // +85 deg at full extension: q_lcm = -motor_pos + offset
+        const float offset = kAk60LcmQOffsetRad;
         const float q_des_motor = -hopper_cmd_lcmt_.q_des[j] + offset;
         const float qd_des_motor = -hopper_cmd_lcmt_.qd_des[j];
         const float tau_ff_motor = -hopper_cmd_lcmt_.tau_ff[j];
@@ -550,7 +552,7 @@ void HopperHardware::_fill_in_imu_data_to_lcm(){
 
 void HopperHardware::_fill_in_motor_data_to_lcm(){
 
-    const float offset = +1.4835f;  // +85 deg at full extension: q_lcm = -motor_pos + offset
+    const float offset = kAk60LcmQOffsetRad;
     // Copy motor state under lock to ensure a consistent snapshot.
     // qd on LCM = the AK60 CAN-REPORTED velocity (motor internal estimate).
     // 2026-07-07 user decision (reversed from 07-06): publish the CAN qd and
