@@ -1011,7 +1011,7 @@ class ModeEConfig:
     # - Ts and z0 are MEASURED online (EMA over hops, seeded on the first
     #   completed stance). Until the first stance completes, mode 3 falls back
     #   to the mode-2 Raibert law.
-    s2s_pole_beta: float = 0.5
+    s2s_pole_beta: float = 0.6
     # Print the derived S2S quantities (Ts, z0, gain) once per hop at liftoff.
     s2s_print_debug: bool = True
 
@@ -1036,11 +1036,17 @@ class ModeEConfig:
     # the previous 100 for authority.
     # 2026-07-01: RESTORED to ACTUAL CASE values (kpp=100, kpd=1) from the CASE zip; had been
     # cut to 5/0 (20x weaker stance attitude, no damping) -> couldn't arrest tip-over.
-    # User-tuned values (2026-07-05: keep these, do NOT bulk-restore CASE).
-    stance_kpp_x: float = 40.0    # leg stance kR roll
-    stance_kpp_y: float = 40.0    # leg stance kR pitch
-    stance_kpd_x: float = 1    # leg stance kW roll
-    stance_kpd_y: float = 1    # leg stance kW pitch
+    # 2026-07-10 pole placement (J=body_ixx~0.0297 kg m^2):
+    #   wn = sqrt(kR/J), zeta = kW / (2*sqrt(kR*J)).
+    # Log 20:27 showed the hop-to-hop divergence is driven by the LIFTOFF
+    # RATE, not the liftoff angle (w_LO*T_flight ~ -24 deg vs e_LO ~ +8 deg):
+    # old 40/1 -> zeta 0.46 underdamped, body leaves ground still rotating.
+    # 20/1.5 -> zeta ~1.0 (critical), wn ~26 rad/s (plenty for a 180 ms
+    # stance). If retuning, keep zeta ~= 1: kW = 2*sqrt(kR*0.0297).
+    stance_kpp_x: float = 20.0    # leg stance kR roll
+    stance_kpp_y: float = 20.0    # leg stance kR pitch
+    stance_kpd_x: float = 1.5    # leg stance kW roll
+    stance_kpd_y: float = 1.5    # leg stance kW pitch
     # NOTE 2026-07-10: ALL stance attitude signal conditioning DELETED per
     # user (gyro notches, first-order LPF, model-based KF rate filter,
     # touchdown Hermite reference shaping, error-scheduled damping). Stance
