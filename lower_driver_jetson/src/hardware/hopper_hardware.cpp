@@ -24,7 +24,7 @@ static inline float wrap_to_pi(float a) {
 //   (2026-06-27) identity mapping {0,1,2}: LCM q0->motor 0, q1->motor 1, q2->motor 2
 static constexpr int kDeltaAk60MotorIdFromJointIdx[3] = {0, 1, 2};
 // LCM q = -motor_pos + offset. Full extension -> q_lcm = 0 when motor_pos = offset.
-static constexpr float kAk60LcmQOffsetRad = static_cast<float>(M_PI / 2.0);  // +90 deg
+static constexpr float kAk60LcmQOffsetRad = 1.4835f;  // +85 deg (reverted from +90 per user 2026-07-10)
 
 HopperHardware::HopperHardware(bool is_publish_lcm_data):
         Controller2Robot("udpm://239.255.76.67:7667?ttl=255"),

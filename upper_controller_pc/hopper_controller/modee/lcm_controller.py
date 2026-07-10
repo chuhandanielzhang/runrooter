@@ -73,7 +73,7 @@ class ModeELCMConfig:
     #   and pause the Python controller loop for a few seconds.
     safe_rp_deg: float = 50.0
     safe_q_min: float = -0.8553   # -49 deg (normal mechanical retract limit)
-    safe_q_max: float = 1.5707963267948966  # +90 deg (mechanical extend limit; matches kAk60LcmQOffsetRad)
+    safe_q_max: float = 1.4835  # +85 deg (mechanical extend limit; matches kAk60LcmQOffsetRad)
     # 2026-07-07: the old LB "parking" leg-retraction loop (P1 approach / P2
     # continue / P3 settle + reverse-prop stages) was DELETED per user request.
     # LT is now: press -> RM pre-zero + arm; at the NEXT push end (liftoff edge)
