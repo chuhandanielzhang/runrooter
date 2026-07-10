@@ -201,49 +201,6 @@ def _clipf(x, lo: float, hi: float) -> float:
     return x
 
 
-def _robust_fit_eval(ts: np.ndarray, ys: np.ndarray, t_eval: float) -> float:
-    """
-    Robust linear fit y(t) = c0 + c1*t over one stance, evaluated at t_eval.
-
-    Used to latch the takeoff velocity: v_meas is noisy (dq/dt + body shaking spikes
-    of several m/s) and the horizontal velocity keeps CHANGING during stance, so a
-    plain mean reports the mid-stance velocity (~3x low at liftoff, log-verified).
-    A line fit with MAD outlier rejection captures the trend and extrapolates to
-    the liftoff instant while ignoring spikes.
-    """
-    ts = np.asarray(ts, dtype=float).reshape(-1)
-    ys = np.asarray(ys, dtype=float).reshape(-1)
-    n = int(ts.size)
-    if n == 0:
-        return float("nan")
-    if n < 8:
-        return float(np.median(ys))
-    mask = np.isfinite(ys) & np.isfinite(ts)
-    if int(mask.sum()) < 8:
-        return float(np.median(ys[np.isfinite(ys)])) if np.any(np.isfinite(ys)) else float("nan")
-    c0, c1 = 0.0, 0.0
-    for _ in range(3):
-        tm = ts[mask]
-        ym = ys[mask]
-        A = np.column_stack([np.ones(tm.size), tm])
-        try:
-            sol, *_ = np.linalg.lstsq(A, ym, rcond=None)
-        except np.linalg.LinAlgError:
-            return float(np.median(ym))
-        c0, c1 = float(sol[0]), float(sol[1])
-        resid = ys - (c0 + c1 * ts)
-        med = float(np.median(resid[mask]))
-        mad = float(np.median(np.abs(resid[mask] - med)))
-        if mad < 1e-9:
-            break
-        new_mask = np.abs(resid - med) < (3.0 * 1.4826 * mad)
-        new_mask &= np.isfinite(ys)
-        if int(new_mask.sum()) < 8 or bool(np.array_equal(new_mask, mask)):
-            break
-        mask = new_mask
-    return float(c0 + c1 * float(t_eval))
-
-
 def _quat_from_omega_dt(omega_b: np.ndarray, dt: float) -> np.ndarray:
     w = np.asarray(omega_b, dtype=float).reshape(3)
     th = float(np.linalg.norm(w) * float(dt))
@@ -281,33 +238,21 @@ class SimpleIMUAttitudeEstimator:
       - correct tilt using accelerometer (no mag)
     """
 
-    def __init__(self, kp_acc: float = 0.6, acc_g_min: float = 0.90, acc_g_max: float = 1.10, acc_lpf_tau: float = 0.25):
+    def __init__(self, kp_acc: float = 0.6, acc_g_min: float = 0.90, acc_g_max: float = 1.10):
         self.kp_acc = float(kp_acc)
         self.acc_g_min = float(acc_g_min)
         self.acc_g_max = float(acc_g_max)
-        self.acc_lpf_tau = float(acc_lpf_tau)
         self._q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)  # wxyz, body->world
-        self._acc_f = np.zeros(3, dtype=float)
-        self._inited = False
 
     def reset(self) -> None:
         self._q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
-        self._acc_f = np.zeros(3, dtype=float)
-        self._inited = False
 
     def update(self, *, omega_b: np.ndarray, acc_b: np.ndarray, dt: float) -> np.ndarray:
+        # (2026-07-10: the 250 ms accel LPF was DELETED per user; the tilt
+        # correction consumes the RAW specific force, still gated by |a|~g.)
         dt = float(dt)
         omega_b = np.asarray(omega_b, dtype=float).reshape(3)
         acc_b = np.asarray(acc_b, dtype=float).reshape(3)
-
-        # LPF accel (for tilt correction gate)
-        if not bool(self._inited):
-            self._acc_f = acc_b.copy()
-            self._inited = True
-        else:
-            tau = float(max(1e-6, self.acc_lpf_tau))
-            a = float(_clipf(dt / (tau + dt), 0.0, 1.0))
-            self._acc_f = (1.0 - a) * self._acc_f + a * acc_b
 
         # gyro integration
         dq = _quat_from_omega_dt(omega_b, dt)
@@ -315,14 +260,14 @@ class SimpleIMUAttitudeEstimator:
         self._q = _quat_normalize_wxyz(self._q)
 
         # accel correction (tilt only)
-        a_norm = float(np.linalg.norm(self._acc_f))
+        a_norm = float(np.linalg.norm(acc_b))
         if a_norm > 1e-9:
             g = 9.81
             g_ratio = float(a_norm / g)
             if float(self.acc_g_min) <= g_ratio <= float(self.acc_g_max):
                 # Measured UP direction in body: normalized specific force
                 # (at rest in FRD: [0,0,-1] = -Z_frd = up).
-                a_b = (self._acc_f / a_norm).astype(float)
+                a_b = (acc_b / a_norm).astype(float)
                 R_wb = _quat_to_R_wb(self._q)
                 up_b = (R_wb.T @ _up_dir_w(g)).reshape(3)
                 e = _cross3(up_b, a_b)
@@ -360,38 +305,15 @@ class ModeEConfig:
     use_energy_compensation: bool = True
     # Hopper4-style energy loop (scaled conservative for real-robot bring-up).
     energy_comp_kp: float = 6
-    # TRUE desired apex height above liftoff (m). 2026-07-05: this is now a real
-    # closed-loop target -- see apex_fb_* below. Set what you actually want.
-    hop_height_m: float = 0.06
-    # ===== Per-hop apex feedback (closes the height loop) =====
-    # The energy pump above is a P-only law: fz ~ Kp*(E_tgt - E_now). Its
-    # steady-state height sits FAR below hop_height_m (0.39 commanded ->
-    # ~0.09 achieved; 0.09 commanded -> no liftoff at all, log 18:05).
-    # Fix: integrate the measured apex error each hop and feed the energy
-    # target with h_eff = hop_height_m + apex_fb_int, so the ACTUAL apex
-    # converges to hop_height_m within a few hops.
-    #   apex_fb_ki:      integrator gain (m of h_eff per m of apex error/hop)
-    #   apex_fb_int_init: initial boost seed. 0.25 puts the first hop at
-    #                     h_eff~0.35, near the operating point that gave
-    #                     ~9 cm on hardware, so hop #1 already lifts off.
-    #   apex_fb_int_max: clamp on the accumulated boost.
-    apex_fb_ki: float = 1.0
-    apex_fb_int_init: float = 0.25
-    apex_fb_int_max: float = 0.60
-    # Measure the actual apex from the FLIGHT TIME between liftoff and the next
-    # touchdown: h = g_eff * T^2 / 8. Needs only the phase-machine timestamps, so
-    # it is immune to the vz_lo estimation error that corrupted the p_hat-based
-    # apex (log 15:00: identical push forces but vz_lo -1.05/-0.86/-0.14 -> the
-    # integrator wound up on phantom shortfall). The integrator then updates at
-    # touchdown instead of at the in-flight apex event.
-    apex_meas_flight_time: bool = True
-    # LPF (seconds) on the leg-extension velocity used INSIDE the energy term only.
-    # The 0.5*m*v^2 term has dF/dv = Kp*m*v ~= 28-53 N/(m/s) at push speeds, so the
-    # dq/dt velocity noise (HF std ~0.5 m/s in stance) became +-15 N of fz command
-    # noise and closed a ~30 Hz self-excited loop (2026-07-05 log). Energy pumping
-    # is a low-bandwidth objective; a 20 ms filter kills the noise gain without
-    # affecting the stance stroke. Set <=0 to use the raw kinematic velocity.
-    energy_vel_lpf_tau: float = 0.02
+    # Height fed to the P-only energy pump: E_tgt = m*g*(l0 + hop_height_m).
+    # 2026-07-10: the per-hop apex-feedback INTEGRATOR (apex_fb_ki / seed 0.25 /
+    # clamp 0.6) was DELETED per user -- it was a patch hiding the energy-model
+    # error. With a P-only pump the ACTUAL apex sits well below this value, so
+    # set hop_height_m to the ENERGY target, not the apex you expect to see
+    # (previously integrator-boosted h_eff ran at ~0.3 for a ~10 cm apex).
+    hop_height_m: float = 0.30
+    # (2026-07-10: energy_vel_lpf_tau 20 ms LPF DELETED per user; the energy
+    # term consumes the raw axial extension velocity.)
     # physical params
     mass_kg: float = 3.75
     gravity: float = 9.81
@@ -415,124 +337,41 @@ class ModeEConfig:
     stance_min_T: float = 0.08
     flight_min_T: float = 0.10
 
-    # touchdown/liftoff detection on equivalent shift coordinate:
-    #   q_shift = leg_length - leg_l0_m
-    #   negative: compressed (stance phase, allow up to -0.02 m compression)
-    #   positive: extended (flight phase)
-    td_q_shift_gate: float = -0.01  # touchdown when leg compressed by ≥1cm
-    td_qd_shift_gate: float = -0.01  # touchdown when qd_shift < -0.01 (compressing)
-    td_dq_shift_gate: float = -5e-5  # touchdown when dq < -5e-5 (compression increasing)
-    # Hopper4-style phase thresholds:
+    # Hopper4-style phase thresholds (the ONLY touchdown/liftoff detection):
     # - Flight -> Stance when leg compresses below (l0 - threshold)
     # - Stance -> Flight when leg extends above (l0 + threshold)
+    # 2026-07-10: legacy td_*/lo_* gate params, the no-prop omega liftoff gate,
+    # the forced-liftoff escapes (q_shift 3 cm / 0.4 s stance timeout), the
+    # q_shift/qd_shift 5 ms LPFs and the (never-wired) debounce counters were
+    # all DELETED per user. Phase detection runs on the RAW shift coordinate.
     hopper4_td_threshold_m: float = 0.020
     hopper4_lo_threshold_m: float = 0.0
     hopper4_phase_min_steps: int = 50  # ~100ms at 500Hz
-
-    # Liftoff: switch to flight when q_shift/qd_shift gates are met.
-    # Enforce a minimum stance duration so the first hop has enough time
-    # to reduce attitude rate before leaving contact.
-    stance_lo_min_T: float = 0.08  # shorter 1D stance to avoid over-extension before LO
-    # Liftoff hysteresis (use filtered shift/velocity for robustness).
-    # Prevents premature FLIGHT switch caused by raw q_shift jitter around zero.
-    lo_q_shift_gate: float = 0.003
-    lo_qd_shift_gate: float = 0.05
-    # No-prop 3D takeoff quality gate:
-    # Require low roll/pitch angular rate before liftoff so the first hop does not
-    # leave stance with large residual body spin.
-    lo_use_omega_gate_no_prop: bool = False
-    lo_omega_gate_dps: float = 15.0
-    lo_no_prop_max_stance_T: float = 0.40
-    # Safety: if stance leg extends beyond this filtered shift (m), force liftoff
-    # regardless of omega gate to avoid over-extension while still in PUSH.
-    lo_force_liftoff_q_shift_m: float = 0.030
-    # ===== Signal conditioning (real-robot robustness) =====
-    # 3-RSR delta Jacobian can amplify encoder noise near workspace edges, which shows up as:
-    #   - jitter in foot velocity estimate (foot_vdot)
-    #   - jitter in q_shift / qd_shift (phase machine chattering)
-    #   - jitter in force->torque mapping (inv(J_inv^T))
-    #
-    # These simple filters make the controller much more tolerant to noisy qd/Jacobian.
-    #
-    # 2026-07-10: the whole qd conditioning chain (first-order LPF, CASE-style
-    # EMA + moving average) was DELETED per user -- the kinematics/Jacobian
-    # consume the RAW CAN-reported joint velocity. The velocity KF is the one
-    # place measurement noise is handled (its meas_std is set to the real
-    # measured noise level).
     # Kinematics qd source. 2026-07-07 user decision (REVERSED from 07-06):
     # use the CAN-reported qd carried in hopper_data_lcmt.qd (the Jetson driver
     # now publishes the AK60 internal velocity estimate); the upper layer does
     # NOT differentiate q itself. Set True to go back to PC-side dq/dt.
     qd_kin_from_q_diff: bool = False
-    # Low-pass on q_shift / qd_shift used for touchdown/liftoff detection (seconds). Set <=0 to disable.
-    q_shift_lpf_tau: float = 0.005
-    qd_shift_lpf_tau: float = 0.005
-    # ===== Liftoff XY latch (Raibert flight_vel) =====
-    # Instantaneous leg kinematics AT the liftoff sample (last point only).
-    use_mid_stance_vel: bool = False
-    vel_clean_td_skip_s: float = 0.03      # skip this long after touchdown (impact transient)
-    vel_clean_push_qd_thresh: float = 0.10 # stop accumulating once leg extends faster than this (push-off, m/s)
-    vel_clean_min_samples: int = 5         # need at least this many clean samples, else fall back to window avg
-    # 2026-07-05: the clean-window mean alone reports the MID-STANCE velocity;
-    # any horizontal delta-v gained during push-off (where leg kinematics is
-    # unusable: extension projects into XY through body tilt) was lost -- the
-    # latch under-read a moving takeoff by ~3x, yet using leg kinematics there
-    # latched phantom velocity when hopping in place. Fix: anchor on the clean
-    # window (leg kinematics, drift-free) and add the IMU specific-force XY
-    # integral from anchor to liftoff. <=0.2 s of integration re-anchored every
-    # stance: no drift accumulation; zero for in-place hops (accel measures the
-    # REAL motion), so no phantom either.
-    vel_latch_push_dv: bool = True
-    # Hard cap (m/s) on the |XY| velocity latched at liftoff for the Raibert
-    # flight target (proportional scaling, direction preserved). Safety net
-    # against phantom-velocity latches (push-off leg-extension projection);
-    # 0.5 m/s caps the Raibert foot offset at kv*0.5 ~ 9 cm. Set <=0 to disable.
-    vel_latch_clamp_mps: float = 0.5
-    # ---- Liftoff XY latch: PUSH-phase LINEAR FIT extrapolated to t_LO ----
-    # Least-squares line v(t) over the push-phase samples, evaluated at the
-    # liftoff instant: full-window smoothing WITHOUT the mean's lag (XY velocity
-    # ramps up during push, so a plain average systematically under-estimates
-    # the takeoff velocity). One 3-sigma outlier-rejection pass. Fallback chain:
-    # fit -> push-phase mean -> instantaneous kinematics.
-    vel_latch_fit: bool = True
-    vel_latch_fit_min_n: int = 8
     # ---- Velocity Kalman filter (Cheetah-style: velocity + accel bias) ----
     # State x = [v_w (3, world); b_a (3, accel bias, body frame)].
     # Predict every tick with the IMU: v_w += (R_wb @ (f_b - b_a) + g_w) * dt.
-    # Update with the leg-kinematics base velocity on valid stance ticks.
+    # Update with the leg-kinematics base velocity on every finite stance tick.
     # The stance updates make the accel bias observable, so IMU integration is
-    # safe in flight (this replaces the flight XY-latch-hold + ballistic vz).
-    # Set False to fall back to the legacy leg-only estimator.
-    use_vel_kf: bool = True
+    # safe in flight. This is the ONLY velocity estimator (2026-07-10: the
+    # legacy leg-only estimator, the whole liftoff XY latch chain -- push-phase
+    # linear fit, push mean, IMU dv add-back, 0.5 m/s clamp -- and the
+    # "foot planted" trust gate were all DELETED per user; foot placement
+    # consumes the KF velocity directly).
     vel_kf_sigma_acc: float = 0.6       # accel white noise -> velocity Q [m/s^2]
     vel_kf_sigma_bias: float = 0.03     # accel bias random walk [m/s^2/sqrt(s)]
-    # 2026-07-10 20:33 log: measured leg-kinematics noise inside the TRUSTED
-    # stance windows is 0.5-0.9 m/s rms (CAN qd through the Jacobian + the
-    # omega x r term while the body rocks). The old 0.12 made the KF chase
-    # those bursts; whatever value the burst had at liftoff was carried into
-    # flight as a phantom drift and the swing leg "caught" it (left-right
-    # hunting on an in-place hop). Match the filter to the REAL noise:
+    # 2026-07-10 20:33 log: measured leg-kinematics noise inside stance is
+    # 0.5-0.9 m/s rms (CAN qd through the Jacobian + the omega x r term while
+    # the body rocks). The old 0.12 made the KF chase those bursts; whatever
+    # value the burst had at liftoff was carried into flight as a phantom
+    # drift and the swing leg "caught" it. Match the filter to the REAL noise:
     vel_kf_meas_std: float = 0.30       # leg-kinematics velocity noise [m/s]
     vel_kf_meas_std_push: float = 0.50  # inflated during push (fast leg, worst SNR)
     vel_kf_bias_max: float = 1.5        # |b_a| clamp per axis [m/s^2]
-    # ---- Leg-kinematics measurement TRUST GATE ("foot planted" assumption) ----
-    # The v_base_from_foot_w formula assumes the foot is pinned to the ground.
-    # That fails (a) in the touchdown impact transient and (b) near liftoff:
-    # once the leg extends fast the normal load -> 0 and the foot SKATES
-    # sideways (2026-07-06 logs: 1-2 m/s phantom XY at LO on an IN-PLACE hop;
-    # gated samples averaged (0.05, 0.03) m/s -- correct). Trust the sample
-    # only when BOTH:  t_since_td >= vel_meas_td_skip_s
-    #           AND    qd_shift   <  vel_meas_qd_max_mps (extension speed).
-    # Compression (qd_shift < 0, foot pressed hard) stays trusted. Gated ticks:
-    # KF runs predict-only and nothing enters the liftoff-latch buffers.
-    vel_meas_td_skip_s: float = 0.03
-    vel_meas_qd_max_mps: float = 0.25
-    # Debounce: require N consecutive samples to declare touchdown/liftoff.
-    # IMPORTANT (real robot): q_shift_raw can jitter around 0 near liftoff, and qd_shift can be noisy.
-    # If liftoff triggers on a single noisy sample, the stance can end *way too early* (no PUSH impulse),
-    # which destroys hop height and makes swing timing inconsistent.
-    td_debounce_steps: int = 1
-    lo_debounce_steps: int = 1
 
     # DLS / ridge regularization for delta Jacobian inversions.
     # When enabled, we compute a damped pseudo-inverse:
@@ -583,27 +422,13 @@ class ModeEConfig:
     swing_kp_xy: float = 50.0
     swing_kd_xy: float = 1
     # Axial (virtual spring) stiffness and damping for flight leg control.
-    # BALANCE: High kd prevents over-extension but amplifies velocity noise → jitter.
-    # Use moderate kd (8-12) with strong LPF filtering instead of high kd.
-    # Over-extension is also limited by the axial_coeff clamp logic (line ~2169).
     swing_kp_z: float = 1000.0
     stance_kp_z: float = 1300.0   # RESTORED to Cao original (was drifted to 1100)
     stance_kd_z: float = 10.0    # RESTORED to Cao original (was drifted to 20)
     swing_kd_z: float = 10.0
-    # Baseline anti-chatter around nominal length (flight):
-    # - Near l0, hard spring sign flips can cause leg "back-and-forth" jitter.
-    # - Use a small deadband + velocity clip to keep motion spring-like and continuous.
-    swing_l0_deadband_m: float = 0.025
-    swing_l0_vel_deadband_mps: float = 0.35
-    swing_axial_vel_clip_mps: float = 0.6
-    # Over-length recovery in flight (l > l0):
-    # keep pull-back stronger than near-l0 deadband behavior to avoid lingering extension.
-    swing_overextend_kp_scale: float = 1.35
-    # Extra noise guards for flight PD loop:
-    # - clip xdot before Khd term
-    # - clip roll/pitch gyro used in omega×x coupling
-    swing_xdot_clip_mps: float = 0.6
-    swing_omega_xy_clip_radps: float = 1.2
+    # (2026-07-10: the swing deadband/clip params -- l0 deadband, axial/xdot/
+    # omega clips, overextend kp scale -- were DEAD config (never read by any
+    # runtime code) and were DELETED per user.)
 
     # props / thrust
     # Treat 3 QP thrust variables as "per-arm total thrust" (N).
@@ -1200,19 +1025,8 @@ class ModeECore:
 
         # Previous q sample for the dq/dt kinematics velocity (qd_kin_from_q_diff).
         self._q_diff_prev: np.ndarray | None = None
-        # Heavily-filtered leg-extension velocity for the stance energy term
-        # (anti-twitch: see energy_vel_lpf_tau).
-        self._energy_vel_lpf: float = 0.0
-        self._energy_vel_lpf_init: bool = False
         # "auto" reverse-policy hysteresis latch (see _allocate_prop_thrust).
         self._prop_rev_on: bool = False
-
-        # Shift-coordinate LPF + debounce (phase robustness)
-        self._q_shift_lpf: float = 0.0
-        self._qd_shift_lpf: float = 0.0
-        self._shift_lpf_init: bool = False
-        self._td_debounce_count: int = 0
-        self._lo_debounce_count: int = 0
 
         # Runtime prop armed state (gamepad A/B switch, fed by the LCM layer via
         # set_props_armed every cycle). Replaces the deleted mode-1/pure_leg_mode:
@@ -1267,43 +1081,21 @@ class ModeECore:
             self.motor_table = None
 
         # attitude estimator
-        self.att = SimpleIMUAttitudeEstimator(kp_acc=0.6, acc_g_min=0.90, acc_g_max=1.10, acc_lpf_tau=0.25)
+        self.att = SimpleIMUAttitudeEstimator(kp_acc=0.6, acc_g_min=0.90, acc_g_max=1.10)
 
         # estimator state
+        # (2026-07-10: the whole liftoff XY latch chain -- push-fit buffers,
+        # push/clean-window accumulators, IMU dv integral, _flight_vel -- and
+        # the legacy non-KF estimator were DELETED per user. The velocity KF
+        # is the only estimator.)
         self._v_hat_w = np.zeros(3, dtype=float)
         self._p_hat_w = np.array([0.0, 0.0, float(cfg.hop_z0)], dtype=float)
         self._v_hat_inited = False
-        self._z_hat_contact_filt: float | None = None
-        # com_filter.py style: rolling 10-sample window, no push/comp distinction
-        self._vel_window_size: int = 10
-        self._foot_vel_window = np.zeros((self._vel_window_size, 3), dtype=float)
-        self._foot_pos_window = np.zeros((self._vel_window_size, 3), dtype=float)
-        self._vel_window_count: int = 0
-        # CASE-style push-phase average for the liftoff XY latch:
-        # running sum of v_meas over the PUSH phase (after max compression).
-        self._push_v_sum_w = np.zeros(3, dtype=float)
-        self._push_v_sum_b = np.zeros(3, dtype=float)
-        self._push_v_cnt: int = 0
-        # Mid-stance clean-window accumulator (running sum of v_meas_w over the clean phase).
-        self._vmeas_clean_sum = np.zeros(3, dtype=float)
-        self._vmeas_clean_cnt: int = 0
-        self._vmeas_clean_sum_b = np.zeros(3, dtype=float)
-        # IMU XY delta-v integral since touchdown (world). The clean-window sums
-        # store (v_meas - dv) anchors; the liftoff latch adds dv back at LO.
-        self._stance_dv_w = np.zeros(3, dtype=float)
-        # Per-stance sample buffers for the liftoff robust-fit latch (t, v_xy_w, v_xy_b).
-        self._stance_v_t: list[float] = []
-        self._stance_v_w: list[tuple[float, float]] = []
-        self._stance_v_b: list[tuple[float, float]] = []
-        # Liftoff latch source for debugging: 2=linear fit, 1=push mean, 0=instantaneous.
-        self._lo_latch_src: int = 0
-        # Velocity KF state (cfg.use_vel_kf): x = [v_w(3); b_a(3, body-frame accel bias)].
+        # Velocity KF state: x = [v_w(3); b_a(3, body-frame accel bias)].
         # Generous initial bias covariance so b_a converges within the first ~10 hops.
         self._kf_v_w = np.zeros(3, dtype=float)
         self._kf_b_a = np.zeros(3, dtype=float)
         self._kf_P = np.diag([0.5, 0.5, 0.5, 0.25, 0.25, 0.25]).astype(float)
-        self._flight_vel = np.zeros(3, dtype=float)
-        self._flight_vel_b = np.zeros(3, dtype=float)
         # User override: freeze internal velocity estimate to zero (used to stop drift on demand).
         self._user_zero_vel_hold: bool = False
 
@@ -1326,15 +1118,12 @@ class ModeECore:
         self._stance = False
         self._td_t: float | None = None
         self._lo_t: float | None = None
-        self._q_shift_prev: float | None = None
-        self._qd_shift_prev: float | None = None
         self._q_shift_td: float | None = None
         self._prev_vz: float | None = None
 
-        # Per-hop apex feedback state (see apex_fb_* in ModeEConfig)
-        self._apex_fb_int: float = float(getattr(cfg, "apex_fb_int_init", 0.0))
+        # (2026-07-10: per-hop apex feedback INTEGRATOR deleted per user.
+        # Only the flight-time apex MEASUREMENT h = g*T^2/8 remains, for logs.)
         self._z_apex_actual: float = float("nan")  # last measured apex h (m, for log)
-        self._apex_err_last: float = float("nan")  # last apex error (m, for log)
 
         # Mode 3 (HLIP S2S) measured hybrid-model quantities, updated every hop:
         # Ts = last measured stance duration (s), z0 = mean pivot (base) height
@@ -1361,10 +1150,6 @@ class ModeECore:
         self._stance_T2: float = 0.0
         self._v_to_cmd = float(cfg.v_to_min)
 
-        # apex + swing gating
-        self._apex_reached = False
-        self._z_lo: float | None = None  # liftoff height (base z, world frame)
-        self._vz_lo: float | None = None  # liftoff vertical velocity (world frame)
         # last solution hold (robustness)
         self._wbc_last_t = np.zeros(3, dtype=float)
         self._wbc_last_f = np.zeros(3, dtype=float)
@@ -1451,39 +1236,13 @@ class ModeECore:
         # Estimator/integrator states
         self._v_hat_w[:] = 0.0
         self._q_diff_prev = None
-        self._energy_vel_lpf = 0.0
-        self._energy_vel_lpf_init = False
         self._prop_rev_on = False
-        self._q_shift_lpf = 0.0
-        self._qd_shift_lpf = 0.0
-        self._shift_lpf_init = False
-        self._td_debounce_count = 0
-        self._lo_debounce_count = 0
         self._v_hat_inited = False
-        self._z_hat_contact_filt = None
-        self._foot_vel_window[:] = 0.0
-        self._foot_pos_window[:] = 0.0
-        self._vel_window_count = 0
-        self._push_v_sum_w[:] = 0.0
-        self._push_v_sum_b[:] = 0.0
-        self._push_v_cnt = 0
-        self._vmeas_clean_sum[:] = 0.0
-        self._vmeas_clean_cnt = 0
-        self._vmeas_clean_sum_b[:] = 0.0
-        self._stance_dv_w[:] = 0.0
-        self._stance_v_t.clear()
-        self._stance_v_w.clear()
-        self._stance_v_b.clear()
-        self._lo_latch_src = 0
         self._kf_v_w[:] = 0.0
         self._kf_b_a[:] = 0.0
         self._kf_P = np.diag([0.5, 0.5, 0.5, 0.25, 0.25, 0.25]).astype(float)
-        self._flight_vel[:] = 0.0
-        self._flight_vel_b[:] = 0.0
         self._prev_vz = None
-        self._apex_fb_int = float(getattr(self.cfg, "apex_fb_int_init", 0.0))
         self._z_apex_actual = float("nan")
-        self._apex_err_last = float("nan")
         self._s2s_ts_meas = float("nan")
         self._s2s_z0_meas = float("nan")
         self._s2s_z0_acc = 0.0
@@ -1510,11 +1269,6 @@ class ModeECore:
         # LiDAR fusion: re-snap to the next healthy fix after a rebase (a slow
         # pull from the rebased origin would fight the fresh lidar position).
         self._lidar_pos_inited = False
-
-        # Reset swing placement memory/gating
-        self._apex_reached = False
-        self._z_lo = None
-        self._vz_lo = None
 
         # Reset attitude estimator state (only used if use_fc_quat=False)
         try:
@@ -1908,16 +1662,6 @@ class ModeECore:
         J_body = np.stack([J0, J1, J2], axis=1).astype(float)
         return foot_b, J_body
 
-    def _touchdown_ok(self) -> bool:
-        # placeholder for future gating; keep always true in this minimal core.
-        return True
-
-    def _liftoff_ok(self) -> bool:
-        if not bool(self._stance):
-            return False
-        t_td = float(self._td_t) if self._td_t is not None else float(self.sim_time)
-        return (float(self.sim_time) - t_td) >= float(self.cfg.stance_lo_min_T)
-
     @staticmethod
     def _quintic_coeff(p0: float, v0: float, a0: float, p1: float, v1: float, a1: float, T: float) -> np.ndarray:
         """
@@ -2100,54 +1844,6 @@ class ModeECore:
         else:
             return self._quintic_eval(self._stance_poly2, min(t - T1, T2))
 
-    def _latch_fit_push_vxy(self, t_lo: float):
-        """
-        Liftoff XY latch via least-squares LINE FIT over the push-phase stance
-        samples (self._stance_v_t / _v_w / _v_b), evaluated at t = t_lo (time
-        since touchdown). XY velocity ramps up during push, so extrapolating a
-        fit to the liftoff instant avoids the systematic lag of a plain mean
-        while still smoothing over all samples. One 3-sigma outlier-rejection
-        pass per axis. Returns (v_w_xy, v_b_xy) as 2-vectors, or None when
-        there are not enough samples for a trustworthy fit.
-        """
-        min_n = int(max(4, int(getattr(self.cfg, "vel_latch_fit_min_n", 8))))
-        n_all = len(self._stance_v_t)
-        if n_all < min_n:
-            return None
-        t = np.asarray(self._stance_v_t, dtype=float)
-        if bool(self._stance_prof_inited) and (self._stance_t_comp is not None):
-            m = t >= float(self._stance_t_comp)
-        else:
-            m = t >= 0.5 * float(t_lo)  # profile not inited: second half of stance
-        if int(np.count_nonzero(m)) < min_n:
-            m = np.ones(t.shape, dtype=bool)
-        t_f = t[m]
-        if float(np.max(t_f) - np.min(t_f)) < 5.0 * float(self.dt):
-            return None  # push window too short to define a slope
-        # The buffers hold only TRUSTED samples (foot-planted gate), which end
-        # before liftoff once the extension speed crosses the gate. Do not
-        # extrapolate the fit beyond the last trusted sample: evaluate there.
-        t_lo = float(min(float(t_lo), float(np.max(t_f))))
-        v_w = np.asarray(self._stance_v_w, dtype=float).reshape(-1, 2)[m]
-        v_b = np.asarray(self._stance_v_b, dtype=float).reshape(-1, 2)[m]
-        out_w = np.zeros(2, dtype=float)
-        out_b = np.zeros(2, dtype=float)
-        for arr, out in ((v_w, out_w), (v_b, out_b)):
-            for k in range(2):
-                y = arr[:, k]
-                c = np.polyfit(t_f, y, 1)
-                r = y - np.polyval(c, t_f)
-                s = float(np.std(r))
-                if s > 1e-9:
-                    keep = np.abs(r) <= 3.0 * s
-                    nk = int(np.count_nonzero(keep))
-                    if min_n <= nk < len(y):
-                        c = np.polyfit(t_f[keep], y[keep], 1)
-                out[k] = float(np.polyval(c, float(t_lo)))
-        if not (np.all(np.isfinite(out_w)) and np.all(np.isfinite(out_b))):
-            return None
-        return out_w, out_b
-
     def step(
         self,
         *,
@@ -2266,36 +1962,8 @@ class ModeECore:
             else:
                 qd_shift = 0.0
 
-        # --- LPF q_shift / qd_shift for phase detection robustness ---
-        q_shift_raw = float(q_shift)
-        qd_shift_raw = float(qd_shift)
-        try:
-            tau_q = float(getattr(self.cfg, "q_shift_lpf_tau", 0.0))
-        except Exception:
-            tau_q = 0.0
-        try:
-            tau_qd = float(getattr(self.cfg, "qd_shift_lpf_tau", 0.0))
-        except Exception:
-            tau_qd = 0.0
-        if (float(tau_q) > 0.0) or (float(tau_qd) > 0.0):
-            if not bool(self._shift_lpf_init):
-                self._q_shift_lpf = q_shift_raw
-                self._qd_shift_lpf = qd_shift_raw
-                self._shift_lpf_init = True
-            else:
-                if float(tau_q) > 0.0:
-                    a = float(_clipf(float(self.dt) / (float(tau_q) + float(self.dt)), 0.0, 1.0))
-                    self._q_shift_lpf = float((1.0 - a) * float(self._q_shift_lpf) + a * q_shift_raw)
-                else:
-                    self._q_shift_lpf = q_shift_raw
-                if float(tau_qd) > 0.0:
-                    a = float(_clipf(float(self.dt) / (float(tau_qd) + float(self.dt)), 0.0, 1.0))
-                    self._qd_shift_lpf = float((1.0 - a) * float(self._qd_shift_lpf) + a * qd_shift_raw)
-                else:
-                    self._qd_shift_lpf = qd_shift_raw
-            # overwrite for downstream phase machine
-            q_shift = float(self._q_shift_lpf) if float(tau_q) > 0.0 else q_shift_raw
-            qd_shift = float(self._qd_shift_lpf) if float(tau_qd) > 0.0 else qd_shift_raw
+        # (2026-07-10: the 5 ms q_shift/qd_shift phase-detection LPFs were
+        # DELETED per user -- the phase machine runs on the RAW shift coord.)
 
         # --- Attitude estimate (body->world) ---
         if bool(self.cfg.use_fc_quat) and (imu_quat_wxyz is not None):
@@ -2342,19 +2010,9 @@ class ModeECore:
             -foot_vrel_b.reshape(3) - _cross3(imu_gyro_b.reshape(3), foot_b.reshape(3))
         )).reshape(3)
 
-        # --- Base velocity: LEG KINEMATICS ONLY (NO IMU accel integration) ---
-        # User request (2026-07): never integrate IMU acceleration -- accel bias made the
-        # estimate drift. Instead:
-        #   STANCE: all 3 axes from leg kinematics (foot stationary in world), see below;
-        #   FLIGHT: XY held at the liftoff average; vz propagated with the BALLISTIC model
-        #           (vz += g_eff*dt), deterministic and re-anchored by the leg at every TD.
         if not bool(self._v_hat_inited):
             self._v_hat_w = np.zeros(3, dtype=float)
             self._v_hat_inited = True
-
-        # cache previous shift/qd (used for debounce / retiming)
-        q_shift_prev = self._q_shift_prev
-        qd_shift_prev = self._qd_shift_prev
 
         touchdown_evt = False
         liftoff_evt = False
@@ -2378,45 +2036,18 @@ class ModeECore:
                 touchdown_evt = True
                 self._stance = True
                 self._td_t = float(self.sim_time)
-                # ---- Flight-time apex measurement (estimator-independent) ----
-                # h = g_eff * T^2 / 8 for a symmetric ballistic arc (same takeoff
-                # and landing height -- true for in-place hopping). Uses ONLY the
-                # LO->TD timestamps, so a bad vz_lo latch cannot corrupt the
-                # height loop (see apex_meas_flight_time).
-                if bool(getattr(self.cfg, "apex_meas_flight_time", True)) and \
-                   bool(getattr(self.cfg, "apex_use_feedback", True)) and \
-                   (self._lo_t is not None):
+                # ---- Flight-time apex measurement (log-only telemetry) ----
+                # h = g_eff * T^2 / 8 for a symmetric ballistic arc. 2026-07-10:
+                # the per-hop apex INTEGRATOR that used to consume this was
+                # DELETED per user; the measurement remains for the CSV log.
+                if self._lo_t is not None:
                     T_fl = float(self.sim_time) - float(self._lo_t)
                     if 0.06 <= T_fl <= 1.5:
                         g_eff_fl_m = float(self.gravity) * (
                             1.0 + float(z_thrust_w[2]) * float(self.cfg.prop_base_thrust_ratio)
                         )
                         g_eff_fl_m = float(max(1e-3, g_eff_fl_m))
-                        h_act_ft = g_eff_fl_m * T_fl * T_fl / 8.0
-                        self._z_apex_actual = float(h_act_ft)
-                        err_ft = float(self.cfg.hop_height_m) - float(h_act_ft)
-                        self._apex_err_last = float(err_ft)
-                        ki_ft = float(getattr(self.cfg, "apex_fb_ki", 0.0))
-                        i_max_ft = float(getattr(self.cfg, "apex_fb_int_max", 0.6))
-                        self._apex_fb_int = float(_clipf(
-                            float(self._apex_fb_int) + ki_ft * err_ft, 0.0, i_max_ft))
-                self._apex_reached = False
-                self._td_debounce_count = 0
-                self._lo_debounce_count = 0
-                # com_filter.py: do NOT clear window at touchdown (rolling)
-                # Push-phase average accumulator IS per-stance: clear at touchdown.
-                self._push_v_sum_w[:] = 0.0
-                self._push_v_sum_b[:] = 0.0
-                self._push_v_cnt = 0
-                # Mid-stance clean velocity accumulator IS per-stance: clear it at touchdown.
-                self._vmeas_clean_sum[:] = 0.0
-                self._vmeas_clean_sum_b[:] = 0.0
-                self._vmeas_clean_cnt = 0
-                self._stance_dv_w[:] = 0.0
-                # Per-stance sample buffers for the liftoff robust-fit latch.
-                self._stance_v_t.clear()
-                self._stance_v_w.clear()
-                self._stance_v_b.clear()
+                        self._z_apex_actual = float(g_eff_fl_m * T_fl * T_fl / 8.0)
                 # Trigger MPC solve on the very first stance step.
                 self._mpc_counter = max(1, int(self.cfg.mpc_decimation)) - 1
                 self._mpc_f_ref_cache[:] = 0.0
@@ -2432,7 +2063,6 @@ class ModeECore:
                 # touchdown z estimate from kinematics (assume foot at ground z=0).
                 # World +Z DOWN: the body above the ground has NEGATIVE z (p_z = -height).
                 z_td_est = -float((R_wb_hat @ foot_b.reshape(3))[2])
-                self._z_hat_contact_filt = float(z_td_est)
                 self._p_hat_w[2] = float(z_td_est)
 
                 # Mode 3 (HLIP S2S): start the per-stance pivot-height average
@@ -2446,7 +2076,7 @@ class ModeECore:
                 # baseline prop thrust REDUCES effective gravity: g_eff = g*(1 - rho).
                 g_eff = float(self.gravity + (float(z_thrust_w[2]) * float(self.mass) * float(self.gravity) * float(self.cfg.prop_base_thrust_ratio)) / max(1e-6, float(self.mass)))
                 g_eff = float(max(1e-3, g_eff))
-                dz_tgt = float(max(0.05, float(self.cfg.hop_height_m) + float(self._apex_fb_int)))
+                dz_tgt = float(max(0.05, float(self.cfg.hop_height_m)))
                 g_eff_log = float(g_eff)
                 dz_tgt_log = float(dz_tgt)
                 v_to_nominal = float(np.sqrt(2.0 * g_eff * dz_tgt))
@@ -2467,12 +2097,6 @@ class ModeECore:
                     print(f"FAILED TO INIT UNIFIED STANCE: {e}")
                     self._stance_prof_inited = False
 
-        # track previous shift for debounce
-        if np.isfinite(q_shift):
-            self._q_shift_prev = float(q_shift)
-        if np.isfinite(qd_shift):
-            self._qd_shift_prev = float(qd_shift)
-
         # ===== Hopper4-style liftoff =====
         if bool(self._stance) and np.isfinite(float(q_shift)):
             td_t = float(self._td_t) if self._td_t is not None else float(self.sim_time)
@@ -2485,32 +2109,14 @@ class ModeECore:
             if np.isfinite(h_pivot) and (h_pivot > 0.05):
                 self._s2s_z0_acc += float(h_pivot)
                 self._s2s_z0_cnt += 1
+            # (2026-07-10: the no-prop omega liftoff gate and the forced-liftoff
+            # escapes (q_shift 3 cm / stance timeout) were DELETED per user --
+            # liftoff is the plain leg-extension threshold + min phase time.)
             cond_lo = (float(q_shift) >= lo_thr) and (t_in_stance >= phase_min_t)
-            # No-prop mode: do not leave stance with large roll/pitch rates.
-            # This prevents "looks balanced in stance but falls in flight" failures.
-            # 2026-07-09: keys off the RUNTIME armed state (A switch) -- pure-leg
-            # runs are now just "mode 2, A off", and this gate must protect them.
-            no_prop_mode = (not bool(self._props_armed_rt)) or (
-                (not bool(self.cfg.stance_use_props)) and (float(self.cfg.prop_base_thrust_ratio) <= 1e-9)
-            )
-            if bool(no_prop_mode) and bool(getattr(self.cfg, "lo_use_omega_gate_no_prop", True)):
-                gate_dps = float(max(0.0, float(getattr(self.cfg, "lo_omega_gate_dps", 20.0))))
-                wx_dps = abs(float(np.rad2deg(float(imu_gyro_b[0])))) if np.isfinite(float(imu_gyro_b[0])) else 0.0
-                wy_dps = abs(float(np.rad2deg(float(imu_gyro_b[1])))) if np.isfinite(float(imu_gyro_b[1])) else 0.0
-                omega_ok = (wx_dps <= gate_dps) and (wy_dps <= gate_dps)
-                # Safety escape: if the leg extends too much, force LO to avoid over-extension.
-                q_force = float(max(float(lo_thr), float(getattr(self.cfg, "lo_force_liftoff_q_shift_m", 0.020))))
-                force_lo = float(q_shift) >= q_force
-                lo_tmax = float(max(float(phase_min_t), float(getattr(self.cfg, "lo_no_prop_max_stance_T", 0.32))))
-                if bool(force_lo):
-                    cond_lo = True
-                else:
-                    cond_lo = bool(cond_lo) and (bool(omega_ok) or (t_in_stance >= lo_tmax))
             if bool(cond_lo):
                 liftoff_evt = True
                 self._stance = False
                 self._lo_t = float(self.sim_time)
-                self._lo_debounce_count = 0
                 # Mode 3 (HLIP S2S): latch the measured hybrid-model quantities.
                 # Ts = this stance's duration; z0 = mean pivot height over it.
                 self._s2s_ts_meas = float(t_in_stance)
@@ -2522,154 +2128,39 @@ class ModeECore:
                     print("[s2s] LO: Ts=%.3fs z0=%.3fm lam=%.2f -> gain=%.3f (beta=%.2f)"
                           % (float(self._s2s_ts_meas), float(self._s2s_z0_meas), lam_dbg,
                              float(self._s2s_gain_dbg), float(getattr(self.cfg, "s2s_pole_beta", 0.2))))
-                # ---- Horizontal takeoff velocity for the Raibert flight target ----
-                # Preferred: push-phase LINEAR FIT extrapolated to t_LO (smooth,
-                # no mean-lag). Fallbacks: push-phase mean, then instantaneous.
-                fit_res = None
-                if bool(getattr(self.cfg, "vel_latch_fit", True)):
-                    try:
-                        fit_res = self._latch_fit_push_vxy(float(t_in_stance))
-                    except Exception:
-                        fit_res = None
-                if fit_res is not None:
-                    self._lo_latch_src = 2
-                    v_fw, v_fb = fit_res
-                    self._flight_vel = np.array([float(v_fw[0]), float(v_fw[1]), 0.0], dtype=float)
-                    self._flight_vel_b = np.array([float(v_fb[0]), float(v_fb[1]), 0.0], dtype=float)
-                elif int(self._push_v_cnt) > 0:
-                    self._lo_latch_src = 1
-                    inv_n = 1.0 / float(self._push_v_cnt)
-                    self._flight_vel = (self._push_v_sum_w * inv_n).astype(float).reshape(3)
-                    self._flight_vel_b = (self._push_v_sum_b * inv_n).astype(float).reshape(3)
-                else:
-                    self._lo_latch_src = 0
-                    self._flight_vel_b = (
-                        (-foot_vrel_b.reshape(3))
-                        - _cross3(imu_gyro_b.reshape(3), foot_b.reshape(3))
-                    ).astype(float).reshape(3)
-                    self._flight_vel = (R_wb_hat @ self._flight_vel_b.reshape(3)).reshape(3).copy()
-                self._flight_vel[2] = 0.0
-                self._flight_vel_b[2] = 0.0
-                # Safety clamp on the latched |XY| velocity (phantom-latch guard),
-                # proportional scaling so the direction is preserved.
-                v_clamp = float(getattr(self.cfg, "vel_latch_clamp_mps", 0.0))
-                if v_clamp > 0.0:
-                    n_w = float(np.hypot(float(self._flight_vel[0]), float(self._flight_vel[1])))
-                    if n_w > v_clamp and n_w > 1e-9:
-                        s_v = v_clamp / n_w
-                        self._flight_vel[0] = float(self._flight_vel[0]) * s_v
-                        self._flight_vel[1] = float(self._flight_vel[1]) * s_v
-                    n_b = float(np.hypot(float(self._flight_vel_b[0]), float(self._flight_vel_b[1])))
-                    if n_b > v_clamp and n_b > 1e-9:
-                        s_vb = v_clamp / n_b
-                        self._flight_vel_b[0] = float(self._flight_vel_b[0]) * s_vb
-                        self._flight_vel_b[1] = float(self._flight_vel_b[1]) * s_vb
-                # Record liftoff state for apex prediction (used by apex feedback loop)
-                if bool(getattr(self.cfg, "apex_use_feedback", True)):
-                    self._z_lo = float(self._p_hat_w[2])
-                    self._vz_lo = float(self._v_hat_w[2])
+                # (2026-07-10: the liftoff XY velocity latch -- push-phase
+                # linear fit, push mean, instantaneous fallback, 0.5 m/s clamp,
+                # z_lo/vz_lo record -- was DELETED per user. Flight foot
+                # placement consumes the KF velocity directly.)
 
-        # ===== Velocity estimator =====
-        # use_vel_kf=True (default): Cheetah-style KF -- IMU prediction every tick
-        #   (accel bias estimated online), leg-kinematics velocity update in stance.
-        # use_vel_kf=False (legacy): stance = instantaneous leg kinematics;
-        #   flight = XY held at latched flight_vel, vz ballistic.
+        # ===== Velocity estimator (Cheetah-style KF, the only estimator) =====
+        # IMU prediction every tick (accel bias estimated online),
+        # leg-kinematics velocity update on every finite stance sample.
         v_meas_w = None
         in_push_now = False
-        meas_trusted = False
-        use_kf = bool(getattr(self.cfg, "use_vel_kf", True))
         if bool(getattr(self, "_user_zero_vel_hold", False)):
             # User "hard stop": freeze the estimate at exactly zero.
             self._v_hat_w[:] = 0.0
             self._kf_v_w[:] = 0.0
         elif bool(self._stance):
+            # (2026-07-10: the "foot planted" trust gate (TD skip 30 ms +
+            # extension-speed gate), the rolling foot windows, and every
+            # liftoff-latch accumulator were DELETED per user. Every finite
+            # leg-kinematics sample updates the KF; its meas_std carries the
+            # real measurement noise.)
             v_meas_w = v_base_from_foot_w.reshape(3).copy()
             if np.all(np.isfinite(v_meas_w)):
-                # "Foot planted" trust gate (see vel_meas_* in ModeEConfig):
-                # reject the TD impact transient and the fast-extension phase
-                # where the unloaded foot skates (phantom XY velocity).
-                _td_t_g = float(self._td_t) if self._td_t is not None else float(self.sim_time)
-                _t_st_g = float(self.sim_time) - _td_t_g
-                meas_trusted = (
-                    (_t_st_g >= float(getattr(self.cfg, "vel_meas_td_skip_s", 0.03)))
-                    and np.isfinite(float(qd_shift))
-                    and (float(qd_shift) < float(getattr(self.cfg, "vel_meas_qd_max_mps", 0.25)))
-                )
-                self._foot_vel_window[:-1] = self._foot_vel_window[1:]
-                self._foot_vel_window[-1] = foot_vdot_vicon.copy()
-                self._foot_pos_window[:-1] = self._foot_pos_window[1:]
-                self._foot_pos_window[-1] = foot_vicon.copy()
-                self._vel_window_count = min(self._vel_window_count + 1, self._vel_window_size)
-                if not use_kf:
-                    # Legacy estimator: XY only from trusted samples (hold last
-                    # value through gated ticks); z (leg axial) tracks always.
-                    if meas_trusted:
-                        self._v_hat_w[0] = float(v_meas_w[0])
-                        self._v_hat_w[1] = float(v_meas_w[1])
-                    self._v_hat_w[2] = float(v_meas_w[2])
-                # Collect TRUSTED stance samples (with time) for the liftoff
-                # latch buffers. Gated samples (TD impact / fast-extension foot
-                # skating) are excluded: on an in-place hop they read 1-2 m/s
-                # of phantom XY, which no fit or average can reject.
+                # Push detection (KF inflates meas noise during push).
                 td_t_acc = float(self._td_t) if self._td_t is not None else float(self.sim_time)
                 t_in_st_acc = float(self.sim_time) - td_t_acc
-                v_meas_b_now = (
-                    (-foot_vrel_b.reshape(3))
-                    - _cross3(imu_gyro_b.reshape(3), foot_b.reshape(3))
-                ).astype(float).reshape(3)
-                if meas_trusted and len(self._stance_v_t) < 2000:
-                    self._stance_v_t.append(float(t_in_st_acc))
-                    self._stance_v_w.append((float(v_meas_w[0]), float(v_meas_w[1])))
-                    self._stance_v_b.append((float(v_meas_b_now[0]), float(v_meas_b_now[1])))
-                # PUSH-phase average accumulator for the liftoff XY latch
-                # (trusted samples only; with the skate gate active this covers
-                # early push, before the extension speed crosses the gate).
                 if bool(self._stance_prof_inited) and (self._stance_t_comp is not None):
-                    in_push_acc = t_in_st_acc >= float(self._stance_t_comp)
+                    in_push_now = t_in_st_acc >= float(self._stance_t_comp)
                 else:
                     # Profile not initialized: fall back to "leg extending".
-                    in_push_acc = np.isfinite(float(qd_shift)) and (float(qd_shift) > 0.0)
-                if in_push_acc and meas_trusted:
-                    self._push_v_sum_w += v_meas_w
-                    self._push_v_sum_b += v_meas_b_now
-                    self._push_v_cnt += 1
-                in_push_now = bool(in_push_acc)
-                if bool(getattr(self.cfg, "use_mid_stance_vel", False)):
-                    # IMU XY delta-v since touchdown (world). Gravity is z-only in
-                    # the +Z-down world, so world-XY accel = (R_wb @ specific_force)_xy.
-                    if bool(getattr(self.cfg, "vel_latch_push_dv", False)):
-                        a_w_now = (R_wb_hat @ imu_acc_b.reshape(3)).reshape(3)
-                        if np.isfinite(a_w_now[0]) and np.isfinite(a_w_now[1]):
-                            self._stance_dv_w[0] += float(a_w_now[0]) * float(self.dt)
-                            self._stance_dv_w[1] += float(a_w_now[1]) * float(self.dt)
-                    # Clean mid-stance accumulator (only when use_mid_stance_vel).
-                    if (t_in_st_acc >= float(self.cfg.vel_clean_td_skip_s)) and \
-                       (float(qd_shift) < float(self.cfg.vel_clean_push_qd_thresh)):
-                        dv0 = float(self._stance_dv_w[0])
-                        dv1 = float(self._stance_dv_w[1])
-                        if not bool(getattr(self.cfg, "vel_latch_push_dv", False)):
-                            dv0 = 0.0
-                            dv1 = 0.0
-                        self._vmeas_clean_sum[0] += float(v_meas_w[0]) - dv0
-                        self._vmeas_clean_sum[1] += float(v_meas_w[1]) - dv1
-                        self._vmeas_clean_sum[2] += float(v_meas_w[2])
-                        self._vmeas_clean_sum_b[0] += float(v_meas_b_now[0])
-                        self._vmeas_clean_sum_b[1] += float(v_meas_b_now[1])
-                        self._vmeas_clean_sum_b[2] += float(v_meas_b_now[2])
-                        self._vmeas_clean_cnt += 1
+                    in_push_now = np.isfinite(float(qd_shift)) and (float(qd_shift) > 0.0)
             else:
-                # Invalid kinematics this tick: hold the previous estimate.
+                # Invalid kinematics this tick: predict-only.
                 v_meas_w = None
-        elif not use_kf:
-            # LEGACY FLIGHT: ballistic vz (deterministic, no sensor drift; re-anchored
-            # by the leg at every touchdown). Baseline prop thrust reduces effective
-            # gravity: g_eff = g * (1 + z_thrust_w[2] * rho), level: z_thrust_w[2] ~= -1.
-            g_eff_fl = float(self.gravity) * (
-                1.0 + float(z_thrust_w[2]) * float(self.cfg.prop_base_thrust_ratio)
-            )
-            self._v_hat_w[0] = float(self._flight_vel[0])
-            self._v_hat_w[1] = float(self._flight_vel[1])
-            self._v_hat_w[2] = float(self._v_hat_w[2]) + g_eff_fl * float(self.dt)
 
         # ---- Velocity KF: predict with IMU, update with leg kinematics in stance ----
         # x = [v_w (3); b_a (3, body-frame accel bias)]
@@ -2677,7 +2168,7 @@ class ModeECore:
         # Update (stance): z = v_base_from_foot_w, H = [I, 0]
         # IMU specific force naturally includes prop thrust and drag, so flight
         # needs no separate ballistic model; the stance updates keep b_a observable.
-        if use_kf and not bool(getattr(self, "_user_zero_vel_hold", False)):
+        if not bool(getattr(self, "_user_zero_vel_hold", False)):
             dt_kf = float(self.dt)
             g_w_kf = np.array([0.0, 0.0, float(self.gravity)], dtype=float)  # +Z DOWN
             if np.all(np.isfinite(imu_acc_b)):
@@ -2695,9 +2186,7 @@ class ModeECore:
             Q_kf[0:3, 0:3] = (sa * sa * dt_kf) * np.eye(3)
             Q_kf[3:6, 3:6] = (sb * sb * dt_kf) * np.eye(3)
             self._kf_P = F_kf @ self._kf_P @ F_kf.T + Q_kf
-            # Update only on TRUSTED samples ("foot planted" gate); gated ticks
-            # (TD impact, fast-extension skating) run predict-only on the IMU.
-            if (v_meas_w is not None) and meas_trusted:
+            if v_meas_w is not None:
                 r_std = float(getattr(self.cfg, "vel_kf_meas_std", 0.12))
                 if bool(in_push_now):
                     r_std = max(r_std, float(getattr(self.cfg, "vel_kf_meas_std_push", 0.30)))
@@ -2714,15 +2203,11 @@ class ModeECore:
             self._v_hat_w = self._kf_v_w.astype(float).reshape(3).copy()
 
         # integrate position + stance z correction
+        # (2026-07-10: the 50 ms stance-z LPF was DELETED per user -- in stance
+        # the height comes straight from leg kinematics every tick.)
         self._p_hat_w = self._p_hat_w + self._v_hat_w * float(self.dt)
         if bool(self._stance):
-            z_meas = -float((R_wb_hat @ foot_b.reshape(3))[2])
-            if self._z_hat_contact_filt is None:
-                self._z_hat_contact_filt = float(z_meas)
-            z_tau = 0.05
-            az = float(_clipf(float(self.dt) / (z_tau + float(self.dt)), 0.0, 1.0))
-            self._z_hat_contact_filt = (1.0 - az) * float(self._z_hat_contact_filt) + az * float(z_meas)
-            self._p_hat_w[2] = float(self._z_hat_contact_filt)
+            self._p_hat_w[2] = -float((R_wb_hat @ foot_b.reshape(3))[2])
 
         # ---- LiDAR XY position correction (slow pull; z stays leg-based) ----
         # lidar_fresh was evaluated at the attitude section this same tick.
@@ -2750,26 +2235,6 @@ class ModeECore:
             self._prev_vz = float(vz_hat)
         if (not bool(self._stance)) and (float(self._prev_vz) < 0.0) and (float(vz_hat) >= 0.0):
             apex_evt = True
-            self._apex_reached = True
-            # ---- Per-hop apex feedback: integrate the measured height error ----
-            # h_actual = z_lo - z_apex (world +Z DOWN: apex z is more negative).
-            # The energy pump is P-only, so without this integrator the actual
-            # apex sits far below hop_height_m (see apex_fb_* in ModeEConfig).
-            # p_hat-based apex update: SKIPPED when apex_meas_flight_time is on
-            # (the flight-time measurement at the next touchdown replaces it --
-            # p_hat integrates the latched vz_lo, which log 15:00 showed can be
-            # ~0.9 m/s wrong at identical push forces).
-            if bool(getattr(self.cfg, "apex_use_feedback", True)) and (self._z_lo is not None) \
-               and not bool(getattr(self.cfg, "apex_meas_flight_time", True)):
-                h_act = float(self._z_lo) - float(self._p_hat_w[2])
-                if np.isfinite(h_act):
-                    self._z_apex_actual = float(h_act)
-                    err = float(self.cfg.hop_height_m) - float(h_act)
-                    self._apex_err_last = float(err)
-                    ki = float(getattr(self.cfg, "apex_fb_ki", 0.0))
-                    i_max = float(getattr(self.cfg, "apex_fb_int_max", 0.6))
-                    self._apex_fb_int = float(_clipf(
-                        float(self._apex_fb_int) + ki * err, 0.0, i_max))
         self._prev_vz = float(vz_hat)
 
         # ===== stance: unified reference (no discrete COMP/PUSH switching) =====
@@ -3139,26 +2604,10 @@ class ModeECore:
                 
                 unitSpring_s = foot_b_now / max(1e-6, l_leg)
                 xdot_s = np.asarray(foot_vrel_b, dtype=float).reshape(3)
-                springVel_scalar = float(np.dot(xdot_s, unitSpring_s))
-                
-                # Anti-twitch: BOTH velocity consumers below (kd damping and the
-                # energy term, dF/dv = Kp*m*v) get a heavily-filtered extension
-                # velocity. Raw dq/dt velocity carries the 36 Hz stance vibration;
-                # feeding it to kd_z=10 alone injected +-5 N of fz noise (03:43
-                # log). The axial spring loop is only ~2.6 Hz, so 20 ms of lag
-                # costs ~18 deg there while cutting 36 Hz ~4.6x. Seeded at
-                # touchdown (init flag cleared in flight below).
-                e_tau = float(getattr(self.cfg, "energy_vel_lpf_tau", 0.0))
-                if e_tau > 0.0:
-                    if not self._energy_vel_lpf_init:
-                        self._energy_vel_lpf = float(springVel_scalar)
-                        self._energy_vel_lpf_init = True
-                    else:
-                        a_e = float(self.dt) / (e_tau + float(self.dt))
-                        self._energy_vel_lpf += a_e * (float(springVel_scalar) - self._energy_vel_lpf)
-                    springVel_energy = float(self._energy_vel_lpf)
-                else:
-                    springVel_energy = float(springVel_scalar)
+                # (2026-07-10: the 20 ms energy-velocity LPF was DELETED per
+                # user -- kd damping and the energy term consume the RAW axial
+                # extension velocity.)
+                springVel_energy = float(np.dot(xdot_s, unitSpring_s))
 
                 springForce_scalar = -k_spring * (l_leg - l0) - b_spring * springVel_energy
 
@@ -3174,12 +2623,9 @@ class ModeECore:
                     energy = (0.5 * m * springVel_energy * springVel_energy
                               + 0.5 * k_spring * (l0 - l_leg)**2
                               + m * g * groundHeight)
-                    # Effective target = commanded height + apex-feedback boost
-                    # (the P-only pump needs a persistent E_error to keep pushing;
-                    # the integrator supplies it so the ACTUAL apex converges to
-                    # hop_height_m instead of sitting ~4x low).
-                    h = float(self.cfg.hop_height_m) + float(self._apex_fb_int)
-                    target = m * g * (l0 + h)
+                    # (2026-07-10: apex-feedback boost DELETED per user; the
+                    # P-only pump tracks the raw hop_height_m energy target.)
+                    target = m * g * (l0 + float(self.cfg.hop_height_m))
                     E_error = target - energy
                     
                     Kp = float(self.cfg.energy_comp_kp)
@@ -3205,8 +2651,6 @@ class ModeECore:
         else:
             self._f_ref_z_prev = 0.0
             self._f_ref_xy_prev[:] = 0.0
-            # Re-seed the energy velocity LPF at the next touchdown.
-            self._energy_vel_lpf_init = False
 
         # Friction cone is enforced by QP constraints; no need to clip f_ref here.
 
@@ -3683,17 +3127,8 @@ class ModeECore:
             "rpy_hat": rpy_hat.copy(),
             "p_hat_w": np.asarray(self._p_hat_w, dtype=float).reshape(3).copy(),
             "v_hat_w": np.asarray(self._v_hat_w, dtype=float).reshape(3).copy(),
-            "flight_vel_b": np.asarray(self._flight_vel_b, dtype=float).reshape(3).copy(),
             # Debug: base velocity measured from leg kinematics (foot assumed stationary in WORLD).
             "v_meas_foot_w": np.asarray(v_base_from_foot_w, dtype=float).reshape(3).copy(),
-            # Debug: running PUSH-phase average (this is what the liftoff latch uses).
-            "v_push_avg_w": (
-                np.asarray(self._push_v_sum_w, dtype=float).reshape(3) / float(self._push_v_cnt)
-                if int(self._push_v_cnt) > 0 else np.zeros(3, dtype=float)
-            ),
-            "push_v_cnt": int(self._push_v_cnt),
-            # Liftoff latch source: 2=push linear fit, 1=push mean, 0=instantaneous.
-            "lo_latch_src": int(self._lo_latch_src),
             # Velocity-KF accel bias estimate (body frame) -- should settle to a
             # small near-constant value; a drifting/saturated bias means bad tuning.
             "kf_b_a": np.asarray(self._kf_b_a, dtype=float).reshape(3).copy(),
@@ -3773,15 +3208,10 @@ class ModeECore:
             "tau_b_stance_des": tau_b_stance_des.copy(),
             # Debug: gyro actually used by the stance attitude torque controller (BODY frame)
             "omega_b_used": omega_b_used_dbg.copy(),
-            # Apex height feedback (for debugging/convergence analysis)
-            "z_lo_m": float(self._z_lo) if self._z_lo is not None else float("nan"),
-            "vz_lo_m_s": float(self._vz_lo) if self._vz_lo is not None else float("nan"),
             "v_to_cmd_m_s": float(self._v_to_cmd),
             "hop_height_m": float(self.cfg.hop_height_m),
-            # Apex feedback loop state: last measured apex height above LO,
-            # and the current integrator boost added to the energy target.
+            # Flight-time apex measurement h = g*T^2/8 (log-only telemetry).
             "z_apex_actual_m": float(self._z_apex_actual),
-            "apex_err_int": float(self._apex_fb_int),
             # Mode 3 (HLIP S2S) measured model + applied gain (NaN in mode 2)
             "s2s_ts_s": float(self._s2s_ts_meas),
             "s2s_z0_m": float(self._s2s_z0_meas),

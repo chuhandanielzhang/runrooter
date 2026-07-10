@@ -880,10 +880,7 @@ class ModeELCMController:
                 "tau_total_w1",
                 "tau_total_w2",
                 # apex / takeoff debug
-                "z_lo_m",
-                "vz_lo_m_s",
                 "z_apex_actual_m",
-                "apex_err_int",
                 "v_to_cmd_m_s",
                 "desired_vz_from_apex_m_s",
                 "hop_height_m",
@@ -1175,10 +1172,7 @@ class ModeELCMController:
             rm_qd = np.asarray(self.robot_state["rm_qd"], dtype=float).reshape(3)
             rm_iq = np.asarray(self.robot_state["rm_iq"], dtype=float).reshape(3)
             rm_online = int(self.robot_state["rm_online"])
-            z_lo_m = float(info.get("z_lo_m", float("nan")))
-            vz_lo_m_s = float(info.get("vz_lo_m_s", float("nan")))
             z_apex_actual_m = float(info.get("z_apex_actual_m", float("nan")))
-            apex_err_int = float(info.get("apex_err_int", float("nan")))
             v_to_cmd_m_s = float(info.get("v_to_cmd_m_s", float("nan")))
             desired_vz_from_apex_m_s = float(info.get("desired_vz_from_apex_m_s", float("nan")))
             hop_height_m = float(info.get("hop_height_m", float("nan")))
@@ -1329,10 +1323,7 @@ class ModeELCMController:
                 float(tau_total_w[0]),
                 float(tau_total_w[1]),
                 float(tau_total_w[2]),
-                float(z_lo_m),
-                float(vz_lo_m_s),
                 float(z_apex_actual_m),
-                float(apex_err_int),
                 float(v_to_cmd_m_s),
                 float(desired_vz_from_apex_m_s),
                 float(hop_height_m),
