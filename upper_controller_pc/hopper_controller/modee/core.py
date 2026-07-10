@@ -454,17 +454,11 @@ class ModeEConfig:
     #
     # These simple filters make the controller much more tolerant to noisy qd/Jacobian.
     #
-    # Low-pass on joint velocity used in kinematics/Jacobian (seconds). Set <=0 to disable.
-    # 2026-07-06: replaced by the CASE-style qd chain below (EMA + moving average);
-    # keep at 0 to avoid triple-filtering.
-    joint_vel_lpf_tau: float = 0.0
-    # CASE/OMEGA-style joint velocity conditioning (their Simulink chain is
-    # q -> discrete derivative K(z-1)/(Ts*z) -> EMA(forgetting 0.4) -> moving avg).
-    # Our derivative step is qd_kin_from_q_diff below; these two complete the chain:
-    #   qd_ema = ff*prev + (1-ff)*new   (ff = qd_ema_forgetting, 0 disables)
-    #   then a qd_ma_window-sample moving average (<=1 disables).
-    qd_ema_forgetting: float = 0.4
-    qd_ma_window: int = 5
+    # 2026-07-10: the whole qd conditioning chain (first-order LPF, CASE-style
+    # EMA + moving average) was DELETED per user -- the kinematics/Jacobian
+    # consume the RAW CAN-reported joint velocity. The velocity KF is the one
+    # place measurement noise is handled (its meas_std is set to the real
+    # measured noise level).
     # Kinematics qd source. 2026-07-07 user decision (REVERSED from 07-06):
     # use the CAN-reported qd carried in hopper_data_lcmt.qd (the Jetson driver
     # now publishes the AK60 internal velocity estimate); the upper layer does
@@ -1218,15 +1212,6 @@ class ModeECore:
             except Exception:
                 pass
 
-        # Joint velocity LPF (used by kinematics to reduce Jacobian/qd jitter)
-        self._joint_vel_lpf = np.zeros(3, dtype=float)
-        self._joint_vel_lpf_init = False
-        # CASE-style qd conditioning state (EMA + moving average)
-        self._qd_ema = np.zeros(3, dtype=float)
-        self._qd_ema_init = False
-        _qd_ma_n = int(max(1, int(getattr(cfg, "qd_ma_window", 5))))
-        self._qd_ma_buf = np.zeros((_qd_ma_n, 3), dtype=float)
-        self._qd_ma_count = 0
         # Previous q sample for the dq/dt kinematics velocity (qd_kin_from_q_diff).
         self._q_diff_prev: np.ndarray | None = None
         # Heavily-filtered leg-extension velocity for the stance energy term
@@ -1479,12 +1464,6 @@ class ModeECore:
         """
         # Estimator/integrator states
         self._v_hat_w[:] = 0.0
-        self._joint_vel_lpf[:] = 0.0
-        self._joint_vel_lpf_init = False
-        self._qd_ema[:] = 0.0
-        self._qd_ema_init = False
-        self._qd_ma_buf[:] = 0.0
-        self._qd_ma_count = 0
         self._q_diff_prev = None
         self._energy_vel_lpf = 0.0
         self._energy_vel_lpf_init = False
@@ -2232,38 +2211,9 @@ class ModeECore:
         else:
             qd_src = joint_vel.copy()
 
+        # RAW qd into the kinematics (all qd filtering deleted 2026-07-10; the
+        # velocity KF absorbs measurement noise with its honest meas_std).
         joint_vel_kin = qd_src.copy()
-        # 2026-07-06: legacy first-order LPF REPLACED by the CASE-style chain below
-        # (EMA + moving average). joint_vel_lpf_tau=0; code kept for reference only.
-        # try:
-        #     tau = float(getattr(self.cfg, "joint_vel_lpf_tau", 0.0))
-        # except Exception:
-        #     tau = 0.0
-        # if float(tau) > 0.0:
-        #     if not bool(self._joint_vel_lpf_init):
-        #         self._joint_vel_lpf = qd_src.copy()
-        #         self._joint_vel_lpf_init = True
-        #     else:
-        #         a = float(_clipf(float(self.dt) / (float(tau) + float(self.dt)), 0.0, 1.0))
-        #         self._joint_vel_lpf = (1.0 - a) * self._joint_vel_lpf + a * qd_src
-        #     joint_vel_kin = np.asarray(self._joint_vel_lpf, dtype=float).reshape(3).copy()
-        # CASE/OMEGA-style qd conditioning: EMA (forgetting factor) + moving average.
-        # Their chain: q -> K(z-1)/(Ts*z) (that's qd_kin_from_q_diff) -> EMA(0.4) -> MA.
-        ff = float(getattr(self.cfg, "qd_ema_forgetting", 0.0))
-        if 0.0 < ff < 1.0:
-            if not bool(self._qd_ema_init):
-                self._qd_ema = joint_vel_kin.copy()
-                self._qd_ema_init = True
-            else:
-                self._qd_ema = ff * self._qd_ema + (1.0 - ff) * joint_vel_kin
-            joint_vel_kin = self._qd_ema.astype(float).reshape(3).copy()
-        ma_n = int(getattr(self.cfg, "qd_ma_window", 1))
-        if ma_n > 1 and self._qd_ma_buf.shape[0] == ma_n:
-            self._qd_ma_buf[:-1] = self._qd_ma_buf[1:]
-            self._qd_ma_buf[-1] = joint_vel_kin
-            self._qd_ma_count = min(self._qd_ma_count + 1, ma_n)
-            if self._qd_ma_count >= ma_n:
-                joint_vel_kin = np.mean(self._qd_ma_buf, axis=0).astype(float).reshape(3)
 
         # --- Foot kinematics (native delta FK, same FRD frame as IMU) ---
         # - foot_vicon / foot_vdot_vicon: used for leg PD & Jacobian
@@ -3783,9 +3733,8 @@ class ModeECore:
             "foot_b": foot_b.copy(),
             "foot_vdot_vicon": foot_vdot_vicon.copy(),
             "foot_vrel_b": foot_vrel_b.copy(),
-            # Filtered joint velocity actually used by kinematics/estimator
-            # (q-diff -> EMA(qd_ema_forgetting) -> MA(qd_ma_window)).
-            # Compare against raw qd0..qd2 in the CSV to see the filter effect.
+            # Joint velocity used by kinematics/estimator (RAW CAN qd since
+            # 2026-07-10; identical to qd0..qd2 unless qd_kin_from_q_diff).
             "qd_kin": np.asarray(joint_vel_kin, dtype=float).reshape(3).copy(),
             "J_inv_det": float(J_inv_det),
             "J_inv_cond": float(J_inv_cond),
