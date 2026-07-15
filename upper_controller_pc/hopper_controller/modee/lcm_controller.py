@@ -49,7 +49,10 @@ def _quat_wxyz_to_R_wb(q_wxyz: np.ndarray) -> np.ndarray:
 @dataclass
 class ModeELCMConfig:
     lcm_url: str = "udpm://239.255.76.67:7667?ttl=255"
-    max_cmd_vel: float = 0.8
+    # 2026-07-11 per user (MATLAB values): posvellim = 0.15 m/s. MATLAB's
+    # position loop clamps desiredVel to +-0.15; we have no position loop, so
+    # the equivalent is capping the stick/nav v_des at 0.15 (was 0.8).
+    max_cmd_vel: float = 0.15
     stick_deadzone: float = 0.10
     # ---- LiDAR patrol (hopper_nav_cmd_lcmt from lidar_perception/patrol.py) ----
     # SELECT toggles patrol; while engaged the nav velocity replaces the stick.
@@ -57,7 +60,7 @@ class ModeELCMConfig:
     # Nav command staleness gate: older than this -> treat as inactive (robot
     # falls back to zero-velocity stick behavior, patrol stays engaged).
     nav_cmd_stale_s: float = 0.3
-    nav_cmd_vel_max: float = 0.5  # hard cap on patrol velocity (below max_cmd_vel)
+    nav_cmd_vel_max: float = 0.15  # hard cap on patrol velocity (matches max_cmd_vel/posvellim)
     # Print rate (Hz). Default 5: status line only; control loop stays 500 Hz (dt=0.002).
     # Set <=0 to print every control step (500 lines/s — usually too fast).
     print_hz: float = 5.0
@@ -138,7 +141,7 @@ class ModeELCMConfig:
     #   the motor's own high-rate velocity estimate (not the Python/Lcm qd).
     # - Applied per-phase (FLIGHT vs STANCE) so you can add a small amount in stance too.
     ak60_flight_damp_kd: float = 0
-    ak60_stance_damp_kd: float = 0.1
+    ak60_stance_damp_kd: float = 0.2
 
     # ===== Command shaping / demo mode =====
     # To keep the hop process smooth, we rate-limit the commanded desired velocity.

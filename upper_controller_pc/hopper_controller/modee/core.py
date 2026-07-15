@@ -233,49 +233,94 @@ def _up_dir_w(gravity: float) -> np.ndarray:
 
 class SimpleIMUAttitudeEstimator:
     """
-    Minimal 'real robot style' attitude estimator:
-      - propagate by gyro integration
-      - correct tilt using accelerometer (no mag)
+    MATLAB com_filter-style attitude estimator (2026-07-11), COORDINATE FRAME
+    UNCHANGED (body FRD, world +Z DOWN):
+      - EVERY tick: pure gyro integration (q <- q (x) dq(omega,dt)).
+      - STANCE MID-WINDOW ONLY: nudge the tilt toward the specific-force
+        direction (the steady push points ~ up along the leg), by a fraction
+        `accel_weight` of the full correction -- NO |a|~g gate (direction only,
+        exactly like MATLAB, which normalizes imu_accel and uses its direction
+        even while |a| >> g during the push).
+      - FLIGHT: pure gyro (free-fall specific force is not "up", so no accel).
+      - reset(): next update re-initializes the tilt straight from the accel
+        (MATLAB orient_reset), yaw = 0.
+    Yaw is never corrected here (no mag / no accel yaw info); the caller fuses
+    yaw separately (lidar).
     """
 
     def __init__(self, kp_acc: float = 0.6, acc_g_min: float = 0.90, acc_g_max: float = 1.10):
-        self.kp_acc = float(kp_acc)
+        self.kp_acc = float(kp_acc)  # legacy (unused in MATLAB mode)
         self.acc_g_min = float(acc_g_min)
         self.acc_g_max = float(acc_g_max)
         self._q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)  # wxyz, body->world
+        self._need_init = True
 
     def reset(self) -> None:
         self._q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        self._need_init = True
 
-    def update(self, *, omega_b: np.ndarray, acc_b: np.ndarray, dt: float) -> np.ndarray:
-        # (2026-07-10: the 250 ms accel LPF was DELETED per user; the tilt
-        # correction consumes the RAW specific force, still gated by |a|~g.)
+    @staticmethod
+    def _tilt_from_accel(acc_b: np.ndarray) -> np.ndarray:
+        """Level tilt-only quaternion whose body UP aligns with the specific
+        force direction (yaw = 0). q=I gives up_b=[0,0,-1]; rotate it onto a_b."""
+        acc_b = np.asarray(acc_b, dtype=float).reshape(3)
+        a_n = float(np.linalg.norm(acc_b))
+        if a_n <= 1e-9:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        a_b = (acc_b / a_n).astype(float)
+        up0 = np.array([0.0, 0.0, -1.0], dtype=float)  # up_b at q = I
+        # We want body->world R with R @ a_b = up_w, i.e. R rotates the measured
+        # body-up onto world-up. axis = a_b x up0 (NOT up0 x a_b).
+        axis = _cross3(a_b, up0)
+        axis_n = float(np.linalg.norm(axis))
+        cos_a = float(_clipf(float(np.dot(a_b, up0)), -1.0, 1.0))
+        if axis_n < 1e-9:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        ang = float(math.acos(cos_a))
+        return _quat_from_omega_dt((axis / axis_n) * ang, 1.0)
+
+    def update(
+        self,
+        *,
+        omega_b: np.ndarray,
+        acc_b: np.ndarray,
+        dt: float,
+        correct: bool = False,
+        accel_weight: float = 0.0,
+    ) -> np.ndarray:
         dt = float(dt)
         omega_b = np.asarray(omega_b, dtype=float).reshape(3)
         acc_b = np.asarray(acc_b, dtype=float).reshape(3)
 
-        # gyro integration
+        # MATLAB orient_reset: seed the tilt straight from the accelerometer.
+        if bool(self._need_init):
+            self._q = _quat_normalize_wxyz(self._tilt_from_accel(acc_b))
+            self._need_init = False
+
+        # gyro integration (every tick)
         dq = _quat_from_omega_dt(omega_b, dt)
         self._q = _quat_mul(self._q, dq)
         self._q = _quat_normalize_wxyz(self._q)
 
-        # accel correction (tilt only)
-        a_norm = float(np.linalg.norm(acc_b))
-        if a_norm > 1e-9:
-            g = 9.81
-            g_ratio = float(a_norm / g)
-            if float(self.acc_g_min) <= g_ratio <= float(self.acc_g_max):
-                # Measured UP direction in body: normalized specific force
-                # (at rest in FRD: [0,0,-1] = -Z_frd = up).
+        # stance mid-window accel tilt correction (direction only, no |a| gate)
+        if bool(correct) and float(accel_weight) > 0.0:
+            a_norm = float(np.linalg.norm(acc_b))
+            if a_norm > 1e-9:
                 a_b = (acc_b / a_norm).astype(float)
                 R_wb = _quat_to_R_wb(self._q)
-                up_b = (R_wb.T @ _up_dir_w(g)).reshape(3)
-                e = _cross3(up_b, a_b)
-                # small-angle correction in body frame
-                omega_corr = float(self.kp_acc) * e
-                dq2 = _quat_from_omega_dt(omega_corr, dt)
-                self._q = _quat_mul(self._q, dq2)
-                self._q = _quat_normalize_wxyz(self._q)
+                up_b = (R_wb.T @ _up_dir_w(9.81)).reshape(3)
+                # Body-frame nudge q<-q*dq moves up_b by dR^T, so to rotate the
+                # ESTIMATED up_b toward the MEASURED a_b we rotate about
+                # e = a_b x up_b (NOT up_b x a_b -- that sign diverges).
+                e = _cross3(a_b, up_b)
+                e_n = float(np.linalg.norm(e))
+                if e_n > 1e-9:
+                    # MATLAB: correcting angle = accel_weight * asin(|cross|),
+                    # rotate about the (body-frame) correction axis. NO dt here.
+                    ang = float(accel_weight) * float(math.asin(min(1.0, e_n)))
+                    dq2 = _quat_from_omega_dt((e / e_n) * ang, 1.0)
+                    self._q = _quat_mul(self._q, dq2)
+                    self._q = _quat_normalize_wxyz(self._q)
 
         return self._q.copy()
 
@@ -283,7 +328,7 @@ class SimpleIMUAttitudeEstimator:
 @dataclass
 class ModeEConfig:
     # control rate
-    dt: float = 0.002  # 500 Hz
+    dt: float = 0.001  # 500 Hz
 
     # ===== 1D Mode (vertical hopping only) =====
     # When enabled:
@@ -304,14 +349,28 @@ class ModeEConfig:
     # This helps achieve target hop height even with model errors.
     use_energy_compensation: bool = True
     # Hopper4-style energy loop (scaled conservative for real-robot bring-up).
-    energy_comp_kp: float = 6
+    energy_comp_kp: float = 9
+    # ---- Energy-pump chatter guards (2026-07-11 log: the pump, NOT the leg PD,
+    # was the dominant axial-force chatter: ~5.5 N hf from the 1/2 m v^2 kinetic
+    # term + the on/off gate stepping tens of N in/out; leg P was 0.9 N, leg D
+    # 0.6 N). These ONLY affect the velocity the ENERGY term + gate consume --
+    # the phase machine and qd_shift stay on the RAW signal, and the b*springVel
+    # damping stays on the raw axial velocity. ----
+    # First-order LPF cutoff (Hz) on the axial extension velocity fed to the
+    # energy kinetic term + gate. <=0 disables (raw, pre-2026-07-11 behavior).
+    energy_vel_lpf_hz: float = 15.0
+    # Schmitt gate on the (filtered) extension velocity: turn the Kp*error term
+    # ON above _on, OFF below _off. Replaces the single 0.1 threshold that could
+    # flicker the whole energy term in/out. Set _on==_off for a plain threshold.
+    energy_gate_on_mps: float = 0.15
+    energy_gate_off_mps: float = 0.05
     # Height fed to the P-only energy pump: E_tgt = m*g*(l0 + hop_height_m).
     # 2026-07-10: the per-hop apex-feedback INTEGRATOR (apex_fb_ki / seed 0.25 /
     # clamp 0.6) was DELETED per user -- it was a patch hiding the energy-model
     # error. With a P-only pump the ACTUAL apex sits well below this value, so
     # set hop_height_m to the ENERGY target, not the apex you expect to see
     # (previously integrator-boosted h_eff ran at ~0.3 for a ~10 cm apex).
-    hop_height_m: float = 0.30
+    hop_height_m: float = 0.07
     # (2026-07-10: energy_vel_lpf_tau 20 ms LPF DELETED per user; the energy
     # term consumes the raw axial extension velocity.)
     # physical params
@@ -329,7 +388,14 @@ class ModeEConfig:
     # Nominal "extended" leg length (m).
     # - delta: this is ||foot_vicon|| when the delta leg is at its nominal length.
     # - serial (MuJoCo roll/pitch/shift model): we will auto-override this to match the model geometry.
-    leg_l0_m: float = 0.45
+    # 2026-07-11 per user (MATLAB values): MATLAB uses l0 = 0.4610 + 0.03 with the
+    # foot CONTACT point offset zoffset = -0.03 folded into foot_pos. Our
+    # foot_vicon is the LINK origin (no 3 cm contact offset), so the exactly
+    # equivalent value here is 0.461: the two 0.03 shifts cancel in the spring
+    # force k(l0-l), the TD/LO thresholds and the energy error. Do NOT set
+    # 0.491 -- the delta workspace tops out at ||foot|| ~ 0.49 and liftoff
+    # (l >= l0) would never trigger.
+    leg_l0_m: float = 0.461
 
     # hop target (relative height above liftoff/contact estimate)
     hop_z0: float = 0.9
@@ -350,43 +416,49 @@ class ModeEConfig:
     # -1.84 cm (swing PD pulls the leg in), so 1 cm sits BELOW the swing
     # excursion -- if mid-air false touchdowns show up, revert to 0.020 or
     # add a compression-speed condition (qd_shift < -0.3 m/s).
-    hopper4_td_threshold_m: float = 0.01
+    hopper4_td_threshold_m: float = 0.02
     hopper4_lo_threshold_m: float = 0.0
-    hopper4_phase_min_steps: int = 50  # ~100ms at 500Hz
+    # 2026-07-11 per user (MATLAB virtual_spring alignment): NO debounce --
+    # MATLAB enters stance at l < l0-0.02 and leaves at l > l0 with no minimum
+    # phase time. 1 step (= 2 ms at 500 Hz) is the code minimum, effectively
+    # none. CAUTION: flight-phase swing-PD q_shift dips were measured to
+    # -1.84 cm; the 2 cm TD threshold is the only thing rejecting them now.
+    hopper4_phase_min_steps: int = 1
     # Kinematics qd source. 2026-07-07 user decision (REVERSED from 07-06):
     # use the CAN-reported qd carried in hopper_data_lcmt.qd (the Jetson driver
     # now publishes the AK60 internal velocity estimate); the upper layer does
     # NOT differentiate q itself. Set True to go back to PC-side dq/dt.
     qd_kin_from_q_diff: bool = False
-    # CASE/Simulink forgetting-factor filter, applied ONLY to the BODY
-    # VELOCITY measurement channel (2026-07-11 per user: 单独一个通道判定机体
-    # 速度, 其他保持裸值). The leg-kinematics base velocity fed to the
-    # velocity KF is smoothed as v = a*v_prev + (1-a)*v_raw with a = this
-    # value (0.95 at 500 Hz ~ 38 ms, the old SimulinkVelocityFilter number).
-    # Seeded fresh at every touchdown. Control-side consumers (Jacobian foot
-    # velocity, qd_shift phase detection, stance energy velocity, swing PD)
-    # keep the RAW CAN qd. <=0 disables.
-    vel_meas_forgetting: float = 0.95
-    # ---- Velocity Kalman filter (Cheetah-style: velocity + accel bias) ----
-    # State x = [v_w (3, world); b_a (3, accel bias, body frame)].
-    # Predict every tick with the IMU: v_w += (R_wb @ (f_b - b_a) + g_w) * dt.
-    # Update with the leg-kinematics base velocity on every finite stance tick.
-    # The stance updates make the accel bias observable, so IMU integration is
-    # safe in flight. This is the ONLY velocity estimator (2026-07-10: the
-    # legacy leg-only estimator, the whole liftoff XY latch chain -- push-phase
-    # linear fit, push mean, IMU dv add-back, 0.5 m/s clamp -- and the
-    # "foot planted" trust gate were all DELETED per user; foot placement
-    # consumes the KF velocity directly).
-    vel_kf_sigma_acc: float = 0.6       # accel white noise -> velocity Q [m/s^2]
-    vel_kf_sigma_bias: float = 0.03     # accel bias random walk [m/s^2/sqrt(s)]
-    # 2026-07-10 20:33 log: measured leg-kinematics noise inside stance is
-    # 0.5-0.9 m/s rms (CAN qd through the Jacobian + the omega x r term while
-    # the body rocks). The old 0.12 made the KF chase those bursts; whatever
-    # value the burst had at liftoff was carried into flight as a phantom
-    # drift and the swing leg "caught" it. Match the filter to the REAL noise:
-    vel_kf_meas_std: float = 0.30       # leg-kinematics velocity noise [m/s]
-    vel_kf_meas_std_push: float = 0.50  # inflated during push (fast leg, worst SNR)
-    vel_kf_bias_max: float = 1.5        # |b_a| clamp per axis [m/s^2]
+    # Body velocity (2026-07-11 per user):
+    # STANCE COMP: XY held (no leg update).
+    # STANCE PUSH: XY = mean of the LAST vel_push_tail_n leg-kinematics samples.
+    # LIFTOFF:     latch flight XY from that tail mean; Z = 0.
+    # FLIGHT:      XY latched; Z = IMU integration.
+    vel_push_tail_n: int = 20
+
+    # ===== Liftoff XY latch: MID-STANCE QUASI-STATIC window (2026-07-11) =====
+    # On this hardware (serial leg, no cross-arm, no Vicon) the MATLAB "last N
+    # samples at liftoff" latch eats the push-off contamination: while the leg
+    # extends fast (~2 m/s axial) a few deg of body tilt projects that
+    # extension into XY, and near liftoff the foot slips / loses contact so the
+    # "planted foot" odometry assumption breaks. Log (modee_latest, in-place
+    # hops, true vx~=0): last-10 latched vx up to +0.49, push-mean up to +0.26,
+    # but the MID-STANCE mean (after the touchdown impact, before push-off)
+    # stayed within +/-0.05. So we latch the mean of v_meas over the clean
+    # mid-stance window instead.
+    #   - accumulate only after t_in_stance >= vel_clean_td_skip_s (impact gone)
+    #   - stop when the leg starts extending (qd_shift >= vel_clean_push_qd),
+    #     i.e. before push-off.
+    # Falls back to the last-N tail mean if too few clean samples were seen.
+    # 2026-07-11 per user: OFF -- back to the plain MATLAB com_filter latch
+    # (mean of the last vel_push_tail_n stance samples at liftoff). No extra
+    # parameters needed: MATLAB's velocity path only has the 10-sample window
+    # (= vel_push_tail_n) and time_step (= dt); vel_lambda/vicon_* are Vicon
+    # fusion knobs we have no sensor for.
+    use_mid_stance_vel: bool = False
+    vel_clean_td_skip_s: float = 0.03
+    vel_clean_push_qd: float = 0.15
+    vel_clean_min_samples: int = 5
 
     # DLS / ridge regularization for delta Jacobian inversions.
     # When enabled, we compute a damped pseudo-inverse:
@@ -400,7 +472,8 @@ class ModeEConfig:
     # When enabled, stance is controlled by a single smooth COM-z reference trajectory:
     #   (z_td, vz_td) -> (z_min, 0) -> (z_end, v_to)
     # where z_min (compression depth) is chosen adaptively from touchdown vertical speed to "soft land".
-    use_unified_stance: bool = True
+    # Disabled for leg-axis SLIP spring (compress/push gated by q_shift, not COM-z profile).
+    use_unified_stance: bool = False
     # Approximate max upward deceleration (m/s^2) during landing. Smaller => deeper compression, softer landing.
     # Reduced from 25.0 to 15.0 to increase compression depth (squat deeper before jump).
     soft_land_a_max: float = 16.0   # Softer landing → deeper but gentler compression
@@ -434,13 +507,13 @@ class ModeEConfig:
     # NOTE: these are the exact knobs you want to tune to prevent flight over-extension.
     # Hopper4-like baseline for this controller:
     #   Khp ~= 50, Khd ~= 1, with axial spring/damping kept conservative for hardware bring-up.
-    swing_kp_xy: float = 50.0
+    swing_kp_xy: float = 55.0
     swing_kd_xy: float = 1
     # Axial (virtual spring) stiffness and damping for flight leg control.
-    swing_kp_z: float = 1300.0
-    stance_kp_z: float = 1450.0   # RESTORED to Cao original (was drifted to 1100)
-    stance_kd_z: float = 10.0    # RESTORED to Cao original (was drifted to 20)
-    swing_kd_z: float = 10.0
+    swing_kp_z: float = 1000.0
+    stance_kp_z: float = 900.0
+    stance_kd_z: float = 20.0
+    swing_kd_z: float = 20.0
     # (2026-07-10: the swing deadband/clip params -- l0 deadband, axial/xdot/
     # omega clips, overextend kp scale -- were DEAD config (never read by any
     # runtime code) and were DELETED per user.)
@@ -493,7 +566,7 @@ class ModeEConfig:
     #           small disturbances never cross the stop, big ones get the
     #           full bidir authority automatically.
     #   "bidir" reverse always available (old behavior before 07-10).
-    prop_flight_reverse: str = "auto"
+    prop_flight_reverse: str = "fwd"
     # NOTE (2026-07-09): the old pure_leg_mode flag / control_mode 1 are DELETED.
     # "Pure leg" is now simply mode 2 with the props not armed (A not pressed):
     # the LCM layer feeds the A-switch state into set_props_armed() every cycle,
@@ -603,13 +676,16 @@ class ModeEConfig:
     # Keep min >= mg to avoid collapse during early compression.
     stance_fz_min: float = 0.0
     stance_fz_max: float = 260.0   # raised 240->260 for more vertical headroom in stance
-    # Stance horizontal (attitude) force limit, applied by PROPORTIONAL scaling
-    # (direction preserved) in the closed-form allocation.
-    # 2026-07-09: friction cone disabled (stance_mu=0); hard cap only:
-    #   |fxy| <= stance_fxy_max
-    # Set stance_fxy_max <= 0 to disable.
+    # Stance horizontal (attitude) force limits.
+    # Friction cone ||f_xy||_2 <= mu * fz (paper Eq. 11 form) available via
+    # stance_mu > 0 (proportional projection); currently DISABLED (mu=0) per
+    # 2026-07-09 user decision. stance_fxy_max is a per-axis hard clip to
+    # ±stance_fxy_max (2026-07-11 user: "cut, don't scale"); <= 0 disables.
     stance_mu: float = 0.0
-    stance_fxy_max: float = 20.0
+    # 2026-07-11 per user: DISABLED (0). The side force is now bounded ONLY by
+    # the hiptorque cap (stance_tau_rp_max) upstream -- f_side = (r x tau)/|r|^2
+    # is back-solved from the already-capped torque, so no separate f_side clip.
+    stance_fxy_max: float = 0.0
     # ===== SLIP-style stance allocation (2026-07-09) =====
     # True  -> decompose the stance contact force into
     #            f = f_ax * u + f_side,   u = (foot - COM)/|foot - COM|
@@ -621,7 +697,17 @@ class ModeEConfig:
     #          and stance_fxy_max above now clips ONLY the attitude channel.
     #          f_ax is chosen so the WORLD-vertical push still equals fz_cmd.
     # False -> legacy body-frame z/xy split with the rx*fz lever feedforward.
-    stance_leg_frame_alloc: bool = True
+    # 2026-07-11 (log analysis, hop2 modee_latest): with the legacy split the
+    # push-phase lever term rx*fz/rz reached -30..-50 N while the pitch
+    # correction only asked +6..+28 N -- the sum pinned fx at the -20 N clip
+    # for the WHOLE stance and the attitude channel never got authority.
+    # PURE-LEG ONLY workaround: set True (axial push has no moment arm, the
+    # +/-20 N budget goes entirely to attitude). With PROPS ARMED keep False:
+    # the paper HFA structure (fz fixed, fxy exact torque solve) is correct
+    # because the stance props compensate the clip residual (Eq. 12).
+    # 2026-07-11 user: leg spring-SLIP (axial spring + side attitude), not body
+    # xyz split (fx/fy/fz + rx*fz lever feedforward).
+    stance_leg_frame_alloc: bool = False
 
     # PWM limits
     pwm_min_us: float = 1000.0
@@ -639,7 +725,7 @@ class ModeEConfig:
     # forward pulse widths pass, reverse-side widths do not; do NOT use AUX2/5/6).
     # NOTE: in 3D mode the forward throttle resolution is halved -> k_thrust must be
     # re-calibrated before trusting absolute thrust numbers.
-    prop_bidir: bool = True
+    prop_bidir: bool = False
     # Per-arm REVERSE thrust budget (N) = allocator lower bound (only when prop_bidir).
     # USER REQUIREMENT (2026-07-06): total Z thrust must stay ~constant during attitude
     # correction. The differential solution is zero-sum by geometry (symmetric tri-rotor
@@ -698,8 +784,31 @@ class ModeEConfig:
     # 25% base lift but actual thrust was only ~0.1 kg total.
     prop_k_thrust: float = 1.24e-5
 
-    # Use FC quaternion directly (recommended for real robot) vs. re-estimate from gyro+acc
-    use_fc_quat: bool = True
+    # Use FC quaternion directly vs. re-estimate from gyro+acc.
+    # 2026-07-11 per user: FALSE -- run the MATLAB com_filter-style upper-layer
+    # AHRS (gyro integration + stance mid-window accel tilt correction) instead
+    # of trusting the FC quaternion carried in hopper_imu_lcmt.
+    use_fc_quat: bool = False
+    # ===== MATLAB com_filter AHRS params (only used when use_fc_quat=False) =====
+    # Per-tick fraction of the full accel tilt correction applied INSIDE the
+    # stance mid-window. MATLAB value 0.01. 2026-07-11 log (21:01 run): the
+    # earlier 0.5 DESTROYED the estimate -- in the [90,130) window the
+    # accelerometer reads the LEG PUSH (|acc| 17-31 m/s^2, along the leg),
+    # not gravity, and 0.5/tick yanked roll by up to 5 deg/tick (gyro-implied
+    # motion was 0.07 deg/tick): rpy_hat swung -1 -> -15 -> -1 deg inside the
+    # window, e_R chased the phantom, hip torque pinned at the cap, and the
+    # injected disturbance tipped the real pitch over (+10 deg at LO, +23 at
+    # next TD). At 0.01 the 40-tick window bleeds in only ~33% of the accel
+    # tilt -- slow drift trim, no yank (this is why MATLAB gets away with
+    # correcting during the push).
+    att_accel_weight: float = -0.01
+    # Stance-tick window [lo, hi) in which the accel correction is active
+    # (MATLAB bound = [90 130]). Counted from the tick AFTER touchdown. At
+    # 500 Hz this is 180-260 ms into stance. CAUTION: if a hop's stance is
+    # shorter than lo*dt the window never opens (pure gyro that hop) -- lower
+    # att_stance_bound_lo if stance runs short.
+    att_stance_bound_lo: int = 90
+    att_stance_bound_hi: int = 130
 
     # ===== Flight phase attitude control gains (SO(3) roll/pitch) =====
     # Separate gains for roll and pitch axes to allow independent tuning.
@@ -763,28 +872,19 @@ class ModeEConfig:
     # gimbal: counterweight the rig until it hangs level with props off,
     # then re-tune (12-18 should become usable once the constant moment is
     # gone). NEVER push kW past ~5 while tau_m ~ 100 ms.
-    flight_kR_roll: float = 15.0
-    flight_kW_roll: float = 1
-    flight_kR_pitch: float = 15.0
-    flight_kW_pitch: float = 1
+    flight_kR_roll: float = 20.0
+    flight_kW_roll: float = 6
+    flight_kR_pitch: float = 20.0
+    flight_kW_pitch: float = 6
     # Cap = deliverable torque with the "auto" reverse policy. Verified
     # numerically (2026-07-10): forward-only realizes up to ~2 Nm (with a
     # collective-lift sum spike); the reverse path extends the ceiling to
     # ~3 Nm at base 0.08. 2.5 leaves margin below the hard ceiling so the
-    # allocator's s-scaling (not the PWM clip) stays in charge. NOTE: at
-    # 1.5 the auto policy would never engage reverse -- the cap must sit
-    # above the forward-only ceiling for the bidir authority to be usable.
+    # allocator's s-scaling (not the PWM clip) stays in charge.
     flight_tau_rp_max: float = 2.5
-    # ===== Stance propeller attitude SO(3) PD (separate from flight) =====
-    # Stance leg fxy uses stance_kpp/kpd above; props get their own weak overlay
-    # so they assist attitude without fighting the leg. Flight keeps flight_kR/kW.
-    # 2026-07-10 rescaled with the calibrated k (see flight gains above):
-    # the user-tuned 10/10 physically delivered ~1.1/1.1 Nm-per-rad through
-    # the wrong mapping; keep that DELIVERED behavior with honest numbers.
-    stance_prop_kR_roll: float = 15
-    stance_prop_kW_roll: float = 1
-    stance_prop_kR_pitch: float = 15
-    stance_prop_kW_pitch: float = 1
+    # (2026-07-11: the independent stance prop PD [stance_prop_kR/kW_*] was
+    # DELETED. Per the CASE2026 paper HFA, stance props compensate only the
+    # RESIDUAL moment tau_des - r x f left after the feasible leg allocation.)
 
     # ===== Flight velocity -> attitude tilt (Raibert-style pull-back) =====
     # 2026-07-05 user request: props should NOT hold level; they should TILT
@@ -800,6 +900,8 @@ class ModeEConfig:
     # there is ~no restoring torque, hard push only beyond it). User wants the
     # opposite: restore level from the FIRST degree. Keep level target; pull-
     # back toward desired velocity is handled by Raibert foot placement only.
+    # 2026-07-11: INERT -- the attitude error is now the MATLAB tilt vector
+    # (always-level target); the R_des tilt-target machinery was deleted.
     prop_vel_tilt: bool = False
     prop_vel_tilt_kv: float = 3.5
     prop_vel_tilt_max_deg: float = 1.0
@@ -811,11 +913,10 @@ class ModeEConfig:
     #     (The OLD meaning "pure_leg" is gone: pure leg = any mode with props
     #     not armed / A not pressed.)
     # 2 = decouple_leg_prop: closed-form leg + lstsq prop overlay (stance & flight).
-    # 3 = MODE 3 (2026-07-07): same leg/prop pipeline as 2, but the flight
-    #     foot placement is replaced by the HLIP step-to-step (S2S) law (see
-    #     the "Mode 3" config block below). Raibert kv/kr are NOT used in
-    #     mode 3 -- the placement gain is DERIVED each hop from the measured
-    #     stance duration and pivot height.
+    # 3 = MODE 3: HLIP step-to-step (S2S) flight placement plus the
+    #     phase-aware, rate-constrained cooperative stance allocator below.
+    #     Raibert kv/kr are NOT used after the first measured hop; placement
+    #     gain is derived online from measured stance duration/pivot height.
     control_mode: int = 3
 
     # ===== Mode 3: HLIP S2S foot placement (2026-07-07) =====
@@ -842,9 +943,32 @@ class ModeEConfig:
     # - Ts and z0 are MEASURED online (EMA over hops, seeded on the first
     #   completed stance). Until the first stance completes, mode 3 falls back
     #   to the mode-2 Raibert law.
-    s2s_pole_beta: float = 0.6
+    s2s_pole_beta: float = 0.7
     # Print the derived S2S quantities (Ts, z0, gain) once per hop at liftoff.
     s2s_print_debug: bool = True
+
+    # ===== Mode 3: phase-aware rate-constrained cooperative allocation =====
+    # Improvement over CASE HFA's leg-first/residual-only prop policy:
+    #   1) props proactively carry a scheduled share of the stance attitude
+    #      moment, rather than waiting for the leg to saturate;
+    #   2) commanded leg GRF is slew-limited, so a noisy attitude/energy demand
+    #      cannot create a one-tick force jump;
+    #   3) the prop share is temporarily boosted after touchdown and for large
+    #      attitude demands. This is the allowed transient "over-share": it may
+    #      exceed the nominal share, but never the calibrated prop limits.
+    # The final prop command still tracks Tau_des - tau_leg_actual, so leg and
+    # props do not double-command the same moment.
+    mode3_coop_alloc: bool = True
+    mode3_prop_share_nominal: float = 0.35
+    mode3_prop_share_max: float = 0.80
+    mode3_prop_share_demand_gain: float = 0.25
+    mode3_prop_td_boost: float = 0.20
+    mode3_prop_td_boost_tau_s: float = 0.06
+    # Leg-force slew limits. At dt=1 ms these defaults allow 0.30 N/tick in
+    # horizontal norm, +2.0 N/tick axial rise, and -3.5 N/tick axial release.
+    mode3_leg_fxy_slew_nps: float = 300.0
+    mode3_leg_fz_rise_nps: float = 2000.0
+    mode3_leg_fz_fall_nps: float = 3500.0
 
     # ===== Stance phase attitude control (SRB SO(3) PD) =====
     # SRB approach: compute Tau_des = -kR*e_R - kW*omega in body frame, then let QP
@@ -874,31 +998,34 @@ class ModeEConfig:
     # old 40/1 -> zeta 0.46 underdamped, body leaves ground still rotating.
     # 20/1.5 -> zeta ~1.0 (critical), wn ~26 rad/s (plenty for a 180 ms
     # stance). If retuning, keep zeta ~= 1: kW = 2*sqrt(kR*0.0297).
-    stance_kpp_x: float = 40.0    # leg stance kR roll
-    stance_kpp_y: float = 40.0    # leg stance kR pitch
-    stance_kpd_x: float = 2    # leg stance kW roll
-    stance_kpd_y: float = 2    # leg stance kW pitch
-    stance_tau_rp_max: float = 20.0
+    stance_kpp_x: float = 40    # leg stance kR roll
+    stance_kpp_y: float = 40     # leg stance kR pitch
+    stance_kpd_x: float = 1       # leg stance kW roll
+    stance_kpd_y: float = 1      # leg stance kW pitch
+    # 2026-07-11 per user (MATLAB values): hipTorqueLim = 2 Nm (was 20). With
+    # kR=37 this saturates at ~3.1 deg tilt -- the MATLAB controller relies on
+    # a SMALL torque cap (gentle side force, never fights the push hard)
+    # rather than a small gain.
+    stance_tau_rp_max: float = 7
     # ===== Stance D-term rate OBSERVER (inverted-pendulum-paper style) =====
-    # 2026-07-11 per user: allow a HIGH stance kW without gyro-noise chatter.
+    # 2026-07-11 per user: ON for stance kW ONLY (e_R P-term + prop D stay raw).
     # NOT a low-pass (an LPF adds phase lag, and lag is exactly what limits
-    # kW). This is the standard balancing/inverted-pendulum structure: a
-    # steady-state Kalman (Luenberger) RATE OBSERVER driven by the KNOWN
+    # kW). Steady-state Kalman (Luenberger) RATE OBSERVER driven by the KNOWN
     # commanded body torque through the inertia model:
     #   predict:  w_hat += (tau_cmd_prev / J_xy) * dt
     #             (flight, props off: tau=0 -> torque-free body, exact)
     #   correct:  w_hat += k_obs * (w_gyro_raw - w_hat)
     # The D-term sees the controller's OWN action instantly through the model
     # (zero lag on commanded dynamics); sensor noise only enters via the
-    # correction at gain k_obs (noise bandwidth ~ k_obs/(2*pi*dt): 0.15 at
-    # 500 Hz ~ 12 Hz). Runs EVERY tick so it is warm at touchdown.
+    # correction at gain k_obs (noise bandwidth ~ k_obs/(2*pi*dt): 0.05 at
+    # 500 Hz ~ 4 Hz -- strengthened again for kW=2).
+    # Runs EVERY tick so it is warm at touchdown.
     # k_obs = 1.0 -> passthrough (raw gyro, observer transparent).
     # Applies ONLY to the leg stance kW. e_R (P) and the prop D stay raw.
-    # With the observer on, kW can go well past the old chatter limit
-    # (~1.3-1.4 raw): start 2.5-3.5, keep zeta = kW/(2*sqrt(kR*J)) ~ 1
-    # (J~0.0716: kR=33 -> critical kW ~ 3.1).
-    stance_kw_obs_en: bool = True
-    stance_kw_obs_k: float = 0.15
+    # 2026-07-11 per user (MATLAB virtual_spring alignment): OFF -- the MATLAB
+    # PD damps on the RAW gyro (Kpd*rAngVel), so stance kW consumes omega_raw.
+    stance_kw_obs_en: bool = False
+    stance_kw_obs_k: float = 0.05
 
     # ===== WBC-QP slack weights (stance vs flight) =====
     # These weights decide whether the QP would rather:
@@ -966,8 +1093,9 @@ class ModeEConfig:
     # Lower value = earlier vertical impulse build-up (more liftoff speed for short contacts).
     mpc_push_start_ratio: float = 0.55
     # MPC state-input gyro conditioning (for x0[omega]):
+    # DISABLED 2026-07-11 per user: gyro 不要滤波.
     # Use a dedicated LPF/clip so optimizer is not driven by raw IMU high-frequency noise.
-    mpc_omega_lpf_tau: float = 0.020
+    mpc_omega_lpf_tau: float = 0.0
     mpc_omega_xy_clip_radps: float = 2.2
     # If MPC is enabled, keep stance in pure MPC->SRB-QP path:
     # - on solve failure, hold cached MPC force if available
@@ -1055,10 +1183,20 @@ class ModeECore:
 
         # Previous q sample for the dq/dt kinematics velocity (qd_kin_from_q_diff).
         self._q_diff_prev: np.ndarray | None = None
-        # Forgetting-factor filter state for the body-velocity measurement
-        # channel (see vel_meas_forgetting). Re-seeded at every touchdown.
-        self._vmeas_forget = np.zeros(3, dtype=float)
-        self._vmeas_forget_init: bool = False
+        # Flight-phase XY velocity latched at liftoff (push tail mean).
+        self._flight_vel = np.zeros(3, dtype=float)
+        # Per-stance push-phase ring buffer (last N samples for XY velocity).
+        _tail_n = int(max(1, int(getattr(self.cfg, "vel_push_tail_n", 10))))
+        self._vel_push_tail_n = _tail_n
+        self._push_vel_ring = np.zeros((_tail_n, 3), dtype=float)
+        self._push_vel_ring_i: int = 0
+        self._push_vel_ring_cnt: int = 0
+        # Mid-stance quasi-static clean-window accumulator (see use_mid_stance_vel).
+        self._vclean_sum = np.zeros(3, dtype=float)
+        self._vclean_cnt: int = 0
+        # Mode-3 cooperative allocator state: previously delivered stance leg
+        # force, used by the GRF slew constraint.
+        self._mode3_leg_force_prev_w = np.zeros(3, dtype=float)
         # "auto" reverse-policy hysteresis latch (see _allocate_prop_thrust).
         self._prop_rev_on: bool = False
         # Stance kW rate observer state (see stance_kw_obs_* config):
@@ -1121,22 +1259,22 @@ class ModeECore:
 
         # attitude estimator
         self.att = SimpleIMUAttitudeEstimator(kp_acc=0.6, acc_g_min=0.90, acc_g_max=1.10)
+        # MATLAB com_filter stance-tick counter (accel-correction window gate).
+        self._att_stance_tick: int = 0
 
         # estimator state
-        # (2026-07-10: the whole liftoff XY latch chain -- push-fit buffers,
-        # push/clean-window accumulators, IMU dv integral, _flight_vel -- and
-        # the legacy non-KF estimator were DELETED per user. The velocity KF
-        # is the only estimator.)
+        # Leg-kinematics velocity in stance; latched at liftoff for flight XY.
+        # Flight Z from raw IMU integration only (no KF / no filter).
         self._v_hat_w = np.zeros(3, dtype=float)
         self._p_hat_w = np.array([0.0, 0.0, float(cfg.hop_z0)], dtype=float)
         self._v_hat_inited = False
-        # Velocity KF state: x = [v_w(3); b_a(3, body-frame accel bias)].
-        # Generous initial bias covariance so b_a converges within the first ~10 hops.
-        self._kf_v_w = np.zeros(3, dtype=float)
-        self._kf_b_a = np.zeros(3, dtype=float)
-        self._kf_P = np.diag([0.5, 0.5, 0.5, 0.25, 0.25, 0.25]).astype(float)
         # User override: freeze internal velocity estimate to zero (used to stop drift on demand).
         self._user_zero_vel_hold: bool = False
+        # Energy-pump chatter guards: LPF state on the axial extension velocity
+        # fed to the energy term + Schmitt gate latch (see energy_vel_lpf_hz).
+        self._energy_vel_f: float = 0.0
+        self._energy_vel_f_init: bool = False
+        self._energy_gate_on: bool = False
 
         # ---- LiDAR odometry fusion state (see lidar_* in ModeEConfig) ----
         # Written by update_lidar_odom() (LCM thread, under the runner's lock);
@@ -1158,10 +1296,12 @@ class ModeECore:
         self._td_t: float | None = None
         self._lo_t: float | None = None
         self._q_shift_td: float | None = None
-        self._prev_vz: float | None = None
+        self._prev_vz: float | None = None  # up-positive vz for apex crossing
 
-        # (2026-07-10: per-hop apex feedback INTEGRATOR deleted per user.
-        # Only the flight-time apex MEASUREMENT h = g*T^2/8 remains, for logs.)
+        # apex + swing gating (legacy up-positive vz crossing)
+        self._apex_reached = False
+        self._z_lo: float | None = None
+        self._vz_lo: float | None = None
         self._z_apex_actual: float = float("nan")  # last measured apex h (m, for log)
 
         # Mode 3 (HLIP S2S) measured hybrid-model quantities, updated every hop:
@@ -1275,17 +1415,22 @@ class ModeECore:
         # Estimator/integrator states
         self._v_hat_w[:] = 0.0
         self._q_diff_prev = None
-        self._vmeas_forget[:] = 0.0
-        self._vmeas_forget_init = False
+        self._flight_vel[:] = 0.0
+        self._push_vel_ring[:] = 0.0
+        self._push_vel_ring_i = 0
+        self._push_vel_ring_cnt = 0
+        self._vclean_sum[:] = 0.0
+        self._vclean_cnt = 0
+        self._mode3_leg_force_prev_w[:] = 0.0
         self._prop_rev_on = False
         self._kw_obs_w[:] = 0.0
         self._kw_obs_tau_prev[:] = 0.0
         self._kw_obs_init = False
         self._v_hat_inited = False
-        self._kf_v_w[:] = 0.0
-        self._kf_b_a[:] = 0.0
-        self._kf_P = np.diag([0.5, 0.5, 0.5, 0.25, 0.25, 0.25]).astype(float)
         self._prev_vz = None
+        self._apex_reached = False
+        self._z_lo = None
+        self._vz_lo = None
         self._z_apex_actual = float("nan")
         self._s2s_ts_meas = float("nan")
         self._s2s_z0_meas = float("nan")
@@ -1319,6 +1464,10 @@ class ModeECore:
             self.att.reset()
         except Exception:
             pass
+        self._att_stance_tick = 0
+        self._energy_vel_f = 0.0
+        self._energy_vel_f_init = False
+        self._energy_gate_on = False
 
     def user_zero_velocity_hold(self, enable: bool) -> None:
         """
@@ -1759,6 +1908,17 @@ class ModeECore:
         x = float(_clipf(float(x), 0.0, 1.0))
         return float(x * x * (3.0 - 2.0 * x))
 
+    def _push_vel_tail_mean(self) -> np.ndarray | None:
+        """Mean of the last vel_push_tail_n stance leg-kinematics samples
+        (MATLAB avg_foot_vel/pos rolling window; used only for flight_vel)."""
+        n = int(self._push_vel_ring_cnt)
+        if n <= 0:
+            return None
+        cap = int(self._vel_push_tail_n)
+        if n < cap:
+            return np.mean(self._push_vel_ring[:n, :], axis=0)
+        return np.mean(self._push_vel_ring, axis=0)
+
     def _init_unified_stance_profile(
         self,
         *,
@@ -1937,9 +2097,7 @@ class ModeECore:
         else:
             qd_src = joint_vel.copy()
 
-        # RAW qd into the kinematics (control side stays unfiltered; the
-        # forgetting-factor filter lives ONLY in the body-velocity measurement
-        # channel, see vel_meas_forgetting).
+        # RAW qd into the kinematics (velocity estimate also uses this path).
         joint_vel_kin = qd_src.copy()
 
         # --- Foot kinematics (native delta FK, same FRD frame as IMU) ---
@@ -2014,7 +2172,24 @@ class ModeECore:
         if bool(self.cfg.use_fc_quat) and (imu_quat_wxyz is not None):
             q_hat = _quat_normalize_wxyz(np.asarray(imu_quat_wxyz, dtype=float).reshape(4))
         else:
-            q_hat = self.att.update(omega_b=imu_gyro_b, acc_b=imu_acc_b, dt=float(self.dt))
+            # MATLAB com_filter AHRS: gyro integrate every tick; inject the
+            # accel tilt correction ONLY inside the stance mid-window. self._stance
+            # here still holds the PREVIOUS tick's phase (the phase machine runs
+            # below), so the counter tracks stance ticks with a 1-tick lag.
+            if bool(self._stance):
+                self._att_stance_tick += 1
+            else:
+                self._att_stance_tick = 0
+            b_lo = int(getattr(self.cfg, "att_stance_bound_lo", 90))
+            b_hi = int(getattr(self.cfg, "att_stance_bound_hi", 130))
+            att_correct = bool(self._stance) and (b_lo <= int(self._att_stance_tick) < b_hi)
+            q_hat = self.att.update(
+                omega_b=imu_gyro_b,
+                acc_b=imu_acc_b,
+                dt=float(self.dt),
+                correct=att_correct,
+                accel_weight=float(getattr(self.cfg, "att_accel_weight", 0.5)),
+            )
         R_wb_hat = _quat_to_R_wb(q_hat)
 
         # ---- LiDAR yaw fusion (slow complementary pull, see lidar_* config) ----
@@ -2093,6 +2268,7 @@ class ModeECore:
                         )
                         g_eff_fl_m = float(max(1e-3, g_eff_fl_m))
                         self._z_apex_actual = float(g_eff_fl_m * T_fl * T_fl / 8.0)
+                self._apex_reached = False
                 # Trigger MPC solve on the very first stance step.
                 self._mpc_counter = max(1, int(self.cfg.mpc_decimation)) - 1
                 self._mpc_f_ref_cache[:] = 0.0
@@ -2104,9 +2280,15 @@ class ModeECore:
 
                 # latch TD shift for compression measurement
                 self._q_shift_td = float(q_shift)
-                # Re-seed the body-velocity measurement forgetting filter
-                # (stale flight-phase state must not lag the new stance).
-                self._vmeas_forget_init = False
+                # Re-seed push-phase velocity ring (COMP samples excluded).
+                self._push_vel_ring[:] = 0.0
+                self._push_vel_ring_i = 0
+                self._push_vel_ring_cnt = 0
+                # Re-seed mid-stance clean-window accumulator (per-stance).
+                self._vclean_sum[:] = 0.0
+                self._vclean_cnt = 0
+                # Start the mode-3 leg GRF ramp from zero at every contact.
+                self._mode3_leg_force_prev_w[:] = 0.0
 
                 # touchdown z estimate from kinematics (assume foot at ground z=0).
                 # World +Z DOWN: the body above the ground has NEGATIVE z (p_z = -height).
@@ -2176,89 +2358,92 @@ class ModeECore:
                     print("[s2s] LO: Ts=%.3fs z0=%.3fm lam=%.2f -> gain=%.3f (beta=%.2f)"
                           % (float(self._s2s_ts_meas), float(self._s2s_z0_meas), lam_dbg,
                              float(self._s2s_gain_dbg), float(getattr(self.cfg, "s2s_pole_beta", 0.2))))
-                # (2026-07-10: the liftoff XY velocity latch -- push-phase
-                # linear fit, push mean, instantaneous fallback, 0.5 m/s clamp,
-                # z_lo/vz_lo record -- was DELETED per user. Flight foot
-                # placement consumes the KF velocity directly.)
+                # Latch flight XY. PREFERRED: mean of v_meas over the clean
+                # mid-stance window (foot firmly planted, leg quasi-static) --
+                # avoids the push-off contamination that biases the last-N tail
+                # mean on this hardware. FALLBACK (too few clean samples, e.g.
+                # very short stance): the MATLAB-style last-N tail mean, then
+                # the instantaneous liftoff sample.
+                v_latch = None
+                if bool(getattr(self.cfg, "use_mid_stance_vel", True)) and \
+                   int(self._vclean_cnt) >= int(self.cfg.vel_clean_min_samples):
+                    v_latch = (self._vclean_sum / float(self._vclean_cnt)).reshape(3)
+                    if not np.all(np.isfinite(v_latch)):
+                        v_latch = None
+                if v_latch is None:
+                    v_push_tail = self._push_vel_tail_mean()
+                    if v_push_tail is not None:
+                        v_latch = np.asarray(v_push_tail, dtype=float).reshape(3)
+                    elif np.all(np.isfinite(v_base_from_foot_w)):
+                        v_latch = v_base_from_foot_w.reshape(3).astype(float)
+                    else:
+                        v_latch = self._v_hat_w.reshape(3)
+                self._flight_vel = np.asarray(v_latch, dtype=float).reshape(3).copy()
+                self._flight_vel[2] = 0.0
+                # Liftoff state for apex detection / logs (up-positive vz).
+                self._z_lo = float(self._p_hat_w[2])
+                self._vz_lo = float(-self._v_hat_w[2])
+                self._prev_vz = None
+                self._apex_reached = False
 
-        # ===== Velocity estimator (Cheetah-style KF, the only estimator) =====
-        # IMU prediction every tick (accel bias estimated online),
-        # leg-kinematics velocity update on every finite stance sample.
-        v_meas_w = None
-        in_push_now = False
+        # ===== Body velocity: MATLAB com_filter scheme (2026-07-11) =====
+        # STANCE: instantaneous raw leg odometry EVERY tick (no COMP hold, no
+        #         push-tail mean). A rolling N-sample buffer is kept ONLY to
+        #         seed the flight latch (MATLAB avg_foot_vel/pos at the 2->1
+        #         transition).
+        # FLIGHT: XY held at flight_vel, latched at liftoff (MATLAB flight_vel;
+        #         a latch is unavoidable -- the swing leg gives no ground vel).
+        # Z:      STANCE = leg odometry (plays the role of MATLAB's vicon z);
+        #         FLIGHT = IMU integration seeded by the last stance tick.
+        #         2026-07-11 log: IMU-only vz carried a ~0.9 m/s touchdown
+        #         offset (zero-vel hold released while already falling) all the
+        #         way to liftoff -> apex read 22 cm when the real hop was ~6 cm.
+        #         Leg odometry in stance clears that offset every touchdown.
+        g_w = np.array([0.0, 0.0, float(self.gravity)], dtype=float)  # +Z DOWN
+        if np.all(np.isfinite(imu_acc_b)):
+            a_w = (R_wb_hat @ imu_acc_b.reshape(3) + g_w.reshape(3)).reshape(3)
+        else:
+            a_w = np.zeros(3, dtype=float)
+        vz_pred = float(self._v_hat_w[2]) + float(a_w[2]) * float(self.dt)
+
         if bool(getattr(self, "_user_zero_vel_hold", False)):
-            # User "hard stop": freeze the estimate at exactly zero.
             self._v_hat_w[:] = 0.0
-            self._kf_v_w[:] = 0.0
         elif bool(self._stance):
-            # (2026-07-10: the "foot planted" trust gate (TD skip 30 ms +
-            # extension-speed gate), the rolling foot windows, and every
-            # liftoff-latch accumulator were DELETED per user. Every finite
-            # leg-kinematics sample updates the KF; its meas_std carries the
-            # real measurement noise.)
-            v_meas_w = v_base_from_foot_w.reshape(3).copy()
-            # Forgetting-factor smoothing on THIS channel only (see
-            # vel_meas_forgetting): v = a*v_prev + (1-a)*v_raw, seeded at TD.
-            a_vm = float(_clipf(float(getattr(self.cfg, "vel_meas_forgetting", 0.0)), 0.0, 0.999))
-            if a_vm > 0.0 and np.all(np.isfinite(v_meas_w)):
-                if not bool(self._vmeas_forget_init):
-                    self._vmeas_forget = v_meas_w.copy()
-                    self._vmeas_forget_init = True
-                else:
-                    self._vmeas_forget = a_vm * self._vmeas_forget + (1.0 - a_vm) * v_meas_w
-                v_meas_w = self._vmeas_forget.copy()
-            if np.all(np.isfinite(v_meas_w)):
-                # Push detection (KF inflates meas noise during push).
-                td_t_acc = float(self._td_t) if self._td_t is not None else float(self.sim_time)
-                t_in_st_acc = float(self.sim_time) - td_t_acc
-                if bool(self._stance_prof_inited) and (self._stance_t_comp is not None):
-                    in_push_now = t_in_st_acc >= float(self._stance_t_comp)
-                else:
-                    # Profile not initialized: fall back to "leg extending".
-                    in_push_now = np.isfinite(float(qd_shift)) and (float(qd_shift) > 0.0)
+            if np.all(np.isfinite(v_base_from_foot_w)):
+                # instantaneous stance velocity (MATLAB stance branch),
+                # z included: leg odometry stands in for MATLAB's vicon z.
+                self._v_hat_w[0] = float(v_base_from_foot_w[0])
+                self._v_hat_w[1] = float(v_base_from_foot_w[1])
+                self._v_hat_w[2] = float(v_base_from_foot_w[2])
+                # roll the N-sample buffer (MATLAB last_foot_vel/pos shift) so
+                # the liftoff latch below sees the last N stance samples.
+                i = int(self._push_vel_ring_i)
+                self._push_vel_ring[i, :] = v_base_from_foot_w.reshape(3).astype(float)
+                self._push_vel_ring_i = (i + 1) % int(self._vel_push_tail_n)
+                self._push_vel_ring_cnt = min(
+                    int(self._push_vel_ring_cnt) + 1, int(self._vel_push_tail_n)
+                )
+                # Mid-stance quasi-static clean window (see use_mid_stance_vel):
+                # accumulate v_meas ONLY after the touchdown impact has decayed
+                # (t_in_stance >= td_skip) and BEFORE push-off starts (leg not
+                # yet extending, q_shift < push_qd). This is the window where
+                # the planted-foot odometry assumption holds best.
+                if bool(getattr(self.cfg, "use_mid_stance_vel", True)):
+                    _td_t = float(self._td_t) if self._td_t is not None else float(self.sim_time)
+                    _t_in_st = float(self.sim_time) - _td_t
+                    if (_t_in_st >= float(self.cfg.vel_clean_td_skip_s)) and \
+                       (float(q_shift) < float(self.cfg.vel_clean_push_qd)):
+                        self._vclean_sum[0] += float(v_base_from_foot_w[0])
+                        self._vclean_sum[1] += float(v_base_from_foot_w[1])
+                        self._vclean_sum[2] += float(v_base_from_foot_w[2])
+                        self._vclean_cnt += 1
             else:
-                # Invalid kinematics this tick: predict-only.
-                v_meas_w = None
-
-        # ---- Velocity KF: predict with IMU, update with leg kinematics in stance ----
-        # x = [v_w (3); b_a (3, body-frame accel bias)]
-        # Predict: v_w += (R_wb @ (f_b - b_a) + g_w) * dt, F = [[I, -R*dt], [0, I]]
-        # Update (stance): z = v_base_from_foot_w, H = [I, 0]
-        # IMU specific force naturally includes prop thrust and drag, so flight
-        # needs no separate ballistic model; the stance updates keep b_a observable.
-        if not bool(getattr(self, "_user_zero_vel_hold", False)):
-            dt_kf = float(self.dt)
-            g_w_kf = np.array([0.0, 0.0, float(self.gravity)], dtype=float)  # +Z DOWN
-            if np.all(np.isfinite(imu_acc_b)):
-                f_b_kf = imu_acc_b.reshape(3).astype(float)
-            else:
-                # Missing accel this tick: coast (a_w = 0 <=> pure gravity cancel).
-                f_b_kf = (R_wb_hat.T @ (-g_w_kf)).reshape(3) + self._kf_b_a
-            a_w_kf = (R_wb_hat @ (f_b_kf - self._kf_b_a)).reshape(3) + g_w_kf
-            self._kf_v_w = self._kf_v_w + a_w_kf * dt_kf
-            F_kf = np.eye(6, dtype=float)
-            F_kf[0:3, 3:6] = -R_wb_hat * dt_kf
-            sa = float(getattr(self.cfg, "vel_kf_sigma_acc", 0.6))
-            sb = float(getattr(self.cfg, "vel_kf_sigma_bias", 0.03))
-            Q_kf = np.zeros((6, 6), dtype=float)
-            Q_kf[0:3, 0:3] = (sa * sa * dt_kf) * np.eye(3)
-            Q_kf[3:6, 3:6] = (sb * sb * dt_kf) * np.eye(3)
-            self._kf_P = F_kf @ self._kf_P @ F_kf.T + Q_kf
-            if v_meas_w is not None:
-                r_std = float(getattr(self.cfg, "vel_kf_meas_std", 0.12))
-                if bool(in_push_now):
-                    r_std = max(r_std, float(getattr(self.cfg, "vel_kf_meas_std_push", 0.30)))
-                S_kf = self._kf_P[0:3, 0:3] + (r_std * r_std) * np.eye(3)
-                K_kf = self._kf_P[:, 0:3] @ np.linalg.inv(S_kf)  # 6x3
-                dx = (K_kf @ (v_meas_w.reshape(3) - self._kf_v_w)).reshape(6)
-                self._kf_v_w = self._kf_v_w + dx[0:3]
-                b_max = float(getattr(self.cfg, "vel_kf_bias_max", 1.5))
-                self._kf_b_a = np.clip(self._kf_b_a + dx[3:6], -b_max, b_max)
-                IKH = np.eye(6, dtype=float)
-                IKH[:, 0:3] -= K_kf
-                self._kf_P = IKH @ self._kf_P
-                self._kf_P = 0.5 * (self._kf_P + self._kf_P.T)
-            self._v_hat_w = self._kf_v_w.astype(float).reshape(3).copy()
+                self._v_hat_w[2] = float(vz_pred)
+        else:
+            self._v_hat_w[0] = float(self._flight_vel[0])
+            self._v_hat_w[1] = float(self._flight_vel[1])
+            self._v_hat_w[2] = float(vz_pred)
+        self._v_hat_inited = True
 
         # integrate position + stance z correction
         # (2026-07-10: the 50 ms stance-z LPF was DELETED per user -- in stance
@@ -2285,15 +2470,20 @@ class ModeECore:
                 self._p_hat_w[1] = float(self._p_hat_w[1]) + a_p * ey
             self._lidar_fused_n += 1
 
-        # apex detection (flight): vz_hat sign change
-        # World +Z is DOWN: ascending => vz < 0, descending => vz > 0.
-        # Apex is the crossing from negative (up) to non-negative (down).
-        vz_hat = float(self._v_hat_w[2])
+        # apex detection (flight): up-positive vz sign change (legacy).
+        # World +Z is DOWN internally, but apex uses vz_up = -v_hat_w[2] so
+        # ascending => vz_up > 0 and apex is the crossing to <= 0.
+        vz_up = float(-self._v_hat_w[2])
         if self._prev_vz is None:
-            self._prev_vz = float(vz_hat)
-        if (not bool(self._stance)) and (float(self._prev_vz) < 0.0) and (float(vz_hat) >= 0.0):
+            self._prev_vz = float(vz_up)
+        if (not bool(self._stance)) and (float(self._prev_vz) > 0.0) and (float(vz_up) <= 0.0):
             apex_evt = True
-        self._prev_vz = float(vz_hat)
+            self._apex_reached = True
+            if self._z_lo is not None:
+                h_act = float(self._z_lo) - float(self._p_hat_w[2])
+                if np.isfinite(h_act) and h_act > 0.0:
+                    self._z_apex_actual = float(h_act)
+        self._prev_vz = float(vz_up)
 
         # ===== stance: unified reference (no discrete COMP/PUSH switching) =====
         # We keep "compress_active" as a debug label only (pre/post max-compression time),
@@ -2404,47 +2594,25 @@ class ModeECore:
         )
         if not bool(props_enabled_ctrl):
             thrust_sum_ref = 0.0
-        # ===== Compute SO(3) attitude error EARLY =====
-        # Use the quaternion published in hopper_imu_lcmt (q_hat -> R_wb_hat), and
-        # the yaw published in the same LCM message to build a yaw-free level target.
-        # This matches the paper form:
-        #   e_R = 1/2 * vee(R_des^T R - R^T R_des)
-        # while keeping yaw uncontrolled and avoiding the rpy_hat Euler branch.
-        yaw_des = float(imu_rpy[2])
-        R_des = _Rz(yaw_des)
-        # ---- Flight velocity->tilt target (Raibert-style pull-back, props) ----
-        # Replace the LEVEL flight target with a tilt that accelerates the body
-        # toward the desired velocity (see prop_vel_tilt in ModeEConfig).
-        # Stance keeps the level target: horizontal control there is leg fxy.
-        if (not bool(self._stance)) and bool(props_enabled_ctrl) and \
-           bool(getattr(self.cfg, "prop_vel_tilt", False)):
-            kv_t = float(getattr(self.cfg, "prop_vel_tilt_kv", 0.0))
-            # 2026-07-10: KF velocity, same source as the Raibert placement
-            # (the stance latch/extrapolation is legacy-estimator only now).
-            a_des_x = kv_t * (float(desired_v_xy_w[0]) - float(self._v_hat_w[0]))
-            a_des_y = kv_t * (float(desired_v_xy_w[1]) - float(self._v_hat_w[1]))
-            g_t = float(self.gravity)
-            a_cap = g_t * math.tan(math.radians(float(getattr(self.cfg, "prop_vel_tilt_max_deg", 10.0))))
-            a_n = float(math.hypot(a_des_x, a_des_y))
-            if a_n > a_cap and a_n > 1e-9:
-                s_a = a_cap / a_n
-                a_des_x *= s_a
-                a_des_y *= s_a
-            # World +Z is DOWN. Thrust must point "up + toward a_des":
-            # t_dir ~ (a_des_x, a_des_y, -g), and body +Z axis = -t_dir.
-            t_dir = np.array([a_des_x, a_des_y, -g_t], dtype=float)
-            t_dir /= float(np.linalg.norm(t_dir))
-            z_des = (-t_dir).reshape(3)
-            # Keep the current yaw: x_c is the yaw heading projected to horizontal.
-            x_c = np.array([math.cos(yaw_des), math.sin(yaw_des), 0.0], dtype=float)
-            y_des = _cross3(z_des, x_c)
-            y_n = float(np.linalg.norm(y_des))
-            if y_n > 1e-6:
-                y_des = y_des / y_n
-                x_des = _cross3(y_des, z_des)
-                R_des = np.column_stack([x_des, y_des, z_des]).astype(float)
-        E = (R_des.T @ R_wb_hat) - (R_wb_hat.T @ R_des)
-        e_R = 0.5 * _vee_so3(E)
+        # ===== Attitude error: MATLAB virtual_spring tilt vector (2026-07-11) =====
+        # Replaced the SO(3) e_R (yaw-free R_des, prop_vel_tilt override) per user
+        # with the MATLAB robotTilt axis-angle vector -- COORDINATE FRAMES UNCHANGED
+        # (body FRD, world +Z DOWN):
+        #   up_b      = R_wb^T @ [0,0,-1]        (world "up" seen in body frame)
+        #   robotTilt = up_b x [0,0,-1]          (corrective rotation axis, z comp = 0)
+        #   |robotTilt| normalized to the tilt ANGLE via acos(dot) when > 0.01 rad,
+        #   below that the raw cross product (axis*sin ~= axis*angle) is used, as in
+        #   MATLAB. Small angles: identical to the old e_R (same sign), so the
+        #   downstream law tau = -kR*e_R - kW*omega and all logging stay unchanged.
+        # Yaw is uncontrolled by construction (cross(.,[0,0,-1]) has zero z).
+        up_b = (R_wb_hat.T @ np.array([0.0, 0.0, -1.0], dtype=float)).reshape(3)
+        tilt_axis = _cross3(up_b, np.array([0.0, 0.0, -1.0], dtype=float))
+        tilt_n = float(np.linalg.norm(tilt_axis))
+        cos_tilt = float(_clipf(-float(up_b[2]), -1.0, 1.0))  # dot(up_b,[0,0,-1])
+        if tilt_n > 0.01:
+            e_R = (tilt_axis / tilt_n) * float(math.acos(cos_tilt))
+        else:
+            e_R = tilt_axis.astype(float)
         e_R[2] = 0.0
 
         f_ref = np.zeros(3, dtype=float)
@@ -2485,18 +2653,19 @@ class ModeECore:
                     # Feed MPC with conditioned angular rates and keep frame consistency.
                     # Dynamics/cost are expressed in world coordinates; use omega_w = R_wb * omega_b.
                     omega_mpc_b = np.asarray(imu_gyro_b, dtype=float).reshape(3).copy()
-                    try:
-                        tau_om = float(max(0.0, float(getattr(self.cfg, "mpc_omega_lpf_tau", 0.0))))
-                    except Exception:
-                        tau_om = 0.0
-                    if tau_om > 1e-9:
-                        if not bool(self._mpc_omega_lpf_init):
-                            self._mpc_omega_lpf = omega_mpc_b.copy()
-                            self._mpc_omega_lpf_init = True
-                        else:
-                            a_om = float(_clipf(float(self.dt) / (float(tau_om) + float(self.dt)), 0.0, 1.0))
-                            self._mpc_omega_lpf = (1.0 - a_om) * self._mpc_omega_lpf + a_om * omega_mpc_b
-                        omega_mpc_b = np.asarray(self._mpc_omega_lpf, dtype=float).reshape(3).copy()
+                    # MPC gyro LPF (DISABLED per user 2026-07-11: gyro 不要滤波).
+                    # try:
+                    #     tau_om = float(max(0.0, float(getattr(self.cfg, "mpc_omega_lpf_tau", 0.0))))
+                    # except Exception:
+                    #     tau_om = 0.0
+                    # if tau_om > 1e-9:
+                    #     if not bool(self._mpc_omega_lpf_init):
+                    #         self._mpc_omega_lpf = omega_mpc_b.copy()
+                    #         self._mpc_omega_lpf_init = True
+                    #     else:
+                    #         a_om = float(_clipf(float(self.dt) / (float(tau_om) + float(self.dt)), 0.0, 1.0))
+                    #         self._mpc_omega_lpf = (1.0 - a_om) * self._mpc_omega_lpf + a_om * omega_mpc_b
+                    #     omega_mpc_b = np.asarray(self._mpc_omega_lpf, dtype=float).reshape(3).copy()
                     # Convert to world-frame angular velocity for MPC state consistency.
                     omega_mpc = (R_wb_hat @ omega_mpc_b.reshape(3)).reshape(3)
                     try:
@@ -2639,17 +2808,20 @@ class ModeECore:
                 mpc_status = "cached"
 
             if not mpc_used:
-                # SRB stance: f_ref carries only vertical force (virtual spring, below).
-                # Horizontal forces are solved by QP to satisfy Tau_des (attitude SO(3) PD).
+                # SLIP stance: f_ref[2] = leg-axis spring magnitude; horizontal
+                # attitude force comes from the SLIP side channel (below).
                 f_ref[:] = 0.0
 
-            # f_ref[2] will be filled by virtual spring below; f_ref[0:2] = 0 (QP handles horizontal).
+            # f_ref[2] filled by leg-axis virtual spring below; f_ref[0:2] stay 0.
         else:
             f_ref[:] = 0.0
 
-        # ===== Hopper4-style Virtual Spring (replaces unified stance & energy comp) =====
-        # Instead of artificial COMP floors and complex energy tracking, we use a simple
-        # robust virtual spring directly on the leg length error, matching Hopper4.py.
+        # ===== CASE2026 SRB vertical force: CoM-height impedance + energy =====
+        # 2026-07-11 per user "全改成 srb 像论文 case": the MATLAB leg-length
+        # virtual spring is replaced by the paper's WORLD-vertical CoM-height
+        # impedance (eq. push_impedance_energy). f_cz is applied along the WORLD
+        # vertical by the SRB allocation branch below:
+        #   f_cz = max(0, kz*(h_des - h) - bz*vz_up + kE*(E_des - E_sys))
         energy_comp_fz = 0.0
         try:
             if bool(self._stance) and (not mpc_used):
@@ -2657,42 +2829,42 @@ class ModeECore:
                 foot_b_now = np.asarray(foot_b, dtype=float).reshape(3)
                 l_leg = float(np.linalg.norm(foot_b_now))
                 
-                k_spring = float(getattr(self.cfg, "stance_kp_z", 1000.0))
-                b_spring = float(getattr(self.cfg, "stance_kd_z", 20.0))
-                
-                unitSpring_s = foot_b_now / max(1e-6, l_leg)
-                xdot_s = np.asarray(foot_vrel_b, dtype=float).reshape(3)
-                # (2026-07-10: the 20 ms energy-velocity LPF was DELETED per
-                # user -- kd damping and the energy term consume the RAW axial
-                # extension velocity.)
-                springVel_energy = float(np.dot(xdot_s, unitSpring_s))
+                m = float(self.mass)
+                g = float(self.gravity)
+                # CASE CoM-height impedance gains (reused stance_kp_z/kd_z; note
+                # the semantics changed from leg-length to CoM height, so these
+                # very likely need RETUNING -- probably lower than the old 900).
+                kz = float(getattr(self.cfg, "stance_kp_z", 900.0))
+                bz = float(getattr(self.cfg, "stance_kd_z", 20.0))
+                # h = world CoM height above ground (foot on ground, +Z DOWN so
+                # foot_w[2] > 0 = body height). vz_up = up-positive vertical
+                # velocity from the estimator. h_des = rest length + hop height.
+                foot_w_now = (R_wb_hat @ foot_b_now.reshape(3)).reshape(3)
+                h_com = float(foot_w_now[2])
+                vz_up = -float(self._v_hat_w[2])
+                h_des = l0 + float(self.cfg.hop_height_m)
+                springForce_scalar = kz * (h_des - h_com) - bz * vz_up
 
-                springForce_scalar = -k_spring * (l_leg - l0) - b_spring * springVel_energy
-
-                leg_velocity = float(qd_shift)
-                if leg_velocity > 0.0 and bool(getattr(self.cfg, "use_energy_compensation", True)):
-                    m = float(self.mass)
-                    g = float(self.gravity)
-                    # World +Z DOWN: foot below the body has foot_w[2] > 0, and the body
-                    # height above the (assumed flat) ground is +foot_w[2].
-                    foot_w_now = (R_wb_hat @ foot_b_now.reshape(3)).reshape(3)
-                    groundHeight = float(foot_w_now[2])
-                    
-                    energy = (0.5 * m * springVel_energy * springVel_energy
-                              + 0.5 * k_spring * (l0 - l_leg)**2
-                              + m * g * groundHeight)
-                    # (2026-07-10: apex-feedback boost DELETED per user; the
-                    # P-only pump tracks the raw hop_height_m energy target.)
-                    target = m * g * (l0 + float(self.cfg.hop_height_m))
-                    E_error = target - energy
-                    
-                    Kp = float(self.cfg.energy_comp_kp)
-                    energy_comp_fz = float(max(0.0, Kp * E_error))
+                # ===== Energy compensation on the VERTICAL channel (CASE) =====
+                # 2026-07-11 per user: exact CASE E_sys = 1/2 m vz^2 + m g h
+                # (NO spring PE term), applied EVERY stance tick (no springVel
+                # gate -- the max(0,.) below is the paper's one-sided clamp).
+                # E_des keeps the +1/2 m|v_des|^2 term so directed hops still
+                # get their launch kinetic energy (0 for in-place hopping).
+                if bool(getattr(self.cfg, "use_energy_compensation", True)):
+                    E_sys = 0.5 * m * vz_up * vz_up + m * g * h_com
+                    v_des_xy2 = float(desired_v_xy_w[0]) ** 2 + float(desired_v_xy_w[1]) ** 2
+                    E_des = m * g * h_des + 0.5 * m * v_des_xy2
+                    E_error = E_des - E_sys
+                    kE = float(self.cfg.energy_comp_kp)
+                    energy_comp_fz = float(kE * E_error)
                     springForce_scalar += energy_comp_fz
-                
+
                 if springForce_scalar < 0.0:
                     springForce_scalar = 0.0
-                
+
+                # World-vertical support magnitude fz (SRB); applied along the
+                # WORLD vertical by the stance allocation branch below.
                 f_ref[2] = float(springForce_scalar)
                 f_ref[2] = float(_clipf(float(f_ref[2]), float(self.cfg.stance_fz_min), float(self.cfg.stance_fz_max)))
         except Exception:
@@ -2720,7 +2892,7 @@ class ModeECore:
         tau_b_stance_des = np.zeros(3, dtype=float)
         tau_b_att_des = np.zeros(3, dtype=float)
 
-        # Raw gyro for P-error frames and the prop D-term.
+        # Raw gyro for P-error (e_R) and prop D-term; stance leg kW uses observer.
         omega_raw = np.asarray(imu_gyro_b, dtype=float).reshape(3)
 
         # ---- Stance kW rate OBSERVER (see stance_kw_obs_* in ModeEConfig) ----
@@ -2731,7 +2903,7 @@ class ModeECore:
         omega_obs_xy = np.array([float(omega_raw[0]), float(omega_raw[1])], dtype=float)
         kw_obs_on = bool(getattr(self.cfg, "stance_kw_obs_en", False))
         if kw_obs_on and np.isfinite(omega_obs_xy).all():
-            k_obs = float(_clipf(float(getattr(self.cfg, "stance_kw_obs_k", 0.15)), 0.0, 1.0))
+            k_obs = float(_clipf(float(getattr(self.cfg, "stance_kw_obs_k", 0.09)), 0.0, 1.0))
             J_diag = np.asarray(self.cfg.I_body_diag, dtype=float).reshape(3)
             if not bool(self._kw_obs_init):
                 self._kw_obs_w[0] = float(omega_raw[0])
@@ -2757,9 +2929,22 @@ class ModeECore:
             kW_x = float(self.cfg.stance_kpd_x)
             kW_y = float(self.cfg.stance_kpd_y)
             tau_b_stance = np.zeros(3, dtype=float)
-            # kW acts on the OBSERVER rate (zero-lag on own dynamics); kR on raw e_R.
+            # kW rate source: RAW gyro when stance_kw_obs_en=False (MATLAB
+            # virtual_spring uses rAngVel directly); observer only if re-enabled.
             tau_b_stance[0] = -kR_x * float(e_R[0]) - kW_x * float(omega_obs_xy[0])
             tau_b_stance[1] = -kR_y * float(e_R[1]) - kW_y * float(omega_obs_xy[1])
+            # MATLAB virtual_spring: project the hip torque OFF the leg axis
+            # before the norm limit. The axial component is undeliverable by a
+            # point-foot force anyway (r x (a*u_leg) = 0), so this does NOT
+            # change the delivered side force -- it only stops the limiter from
+            # wasting budget on an unrealizable component.
+            u_leg_att = np.asarray(foot_b, dtype=float).reshape(3)
+            u_leg_n = float(np.linalg.norm(u_leg_att))
+            if u_leg_n > 1e-6:
+                u_leg_att = u_leg_att / u_leg_n
+                tau_b_stance = (
+                    tau_b_stance - float(np.dot(tau_b_stance, u_leg_att)) * u_leg_att
+                )
             tau_b_stance_des = tau_b_stance.copy()
             tau_b_att_des = tau_b_stance.copy()
             # DEBUG: kill stance attitude torque so QP produces NO horizontal contact force (fxfy=0).
@@ -2787,55 +2972,35 @@ class ModeECore:
                 tau_b_att_des = tau_b.copy()
         
         # Norm-based torque limiting before projection to the world-frame wrench.
-        tau_rp_norm = float(np.sqrt(tau_b_att_des[0] ** 2 + tau_b_att_des[1] ** 2))
+        # MATLAB virtual_spring limits the FULL norm of the leg-axis-projected
+        # hip torque (stance gains a small z comp from the projection; flight
+        # z stays 0 so this is unchanged there).
+        tau_rp_norm = float(np.linalg.norm(tau_b_att_des))
         if tau_rp_norm > tau_rp_max and tau_rp_max > 0.0 and tau_rp_norm > 1e-9:
             scale = float(tau_rp_max) / tau_rp_norm
-            tau_b_att_des[0] = float(tau_b_att_des[0] * scale)
-            tau_b_att_des[1] = float(tau_b_att_des[1] * scale)
+            tau_b_att_des = (tau_b_att_des * scale).astype(float)
         if bool(self._stance):
             tau_b_stance_des = tau_b_att_des.copy()
         tau_w = (R_wb_hat @ tau_b_att_des.reshape(3)).reshape(3)
         Tau_des = np.array([float(tau_w[0]), float(tau_w[1]), 0.0], dtype=float)
-        # Propeller attitude demand: stance and flight use separate gains.
-        # Stance leg fxy uses stance_kpp/kpd above.
-        tau_b_prop_des = np.zeros(3, dtype=float)
-        if bool(props_enabled_ctrl):
-            # RAW gyro for the prop D-term (user request); filtered gyro is
-            # reserved for the leg stance D-term.
-            if bool(self._stance):
-                kR_roll = float(self.cfg.stance_prop_kR_roll)
-                kW_roll = float(self.cfg.stance_prop_kW_roll)
-                kR_pitch = float(self.cfg.stance_prop_kR_pitch)
-                kW_pitch = float(self.cfg.stance_prop_kW_pitch)
-            else:
-                kR_roll = float(self.cfg.flight_kR_roll)
-                kW_roll = float(self.cfg.flight_kW_roll)
-                kR_pitch = float(self.cfg.flight_kR_pitch)
-                kW_pitch = float(self.cfg.flight_kW_pitch)
-            tau_b_prop_des[0] = (
-                -kR_roll * float(e_R[0])
-                - kW_roll * float(omega_b[0])
-            )
-            tau_b_prop_des[1] = (
-                -kR_pitch * float(e_R[1])
-                - kW_pitch * float(omega_b[1])
-            )
-            prop_tau_max = float(self.cfg.flight_tau_rp_max)
-            prop_norm = float(np.sqrt(tau_b_prop_des[0] ** 2 + tau_b_prop_des[1] ** 2))
-            if prop_norm > prop_tau_max and prop_tau_max > 0.0 and prop_norm > 1e-9:
-                prop_scale = prop_tau_max / prop_norm
-                tau_b_prop_des[0] = float(tau_b_prop_des[0] * prop_scale)
-                tau_b_prop_des[1] = float(tau_b_prop_des[1] * prop_scale)
-        tau_prop_w = (R_wb_hat @ tau_b_prop_des.reshape(3)).reshape(3)
-        Tau_prop_des = np.array([float(tau_prop_w[0]), float(tau_prop_w[1]), 0.0], dtype=float)
+        # ===== HFA propeller demand (CASE2026 paper) =====
+        # Flight: props are the primary attitude actuator and track Tau_des
+        # directly (Eq. 15 in the paper; no separate prop PD/gains).
+        # Stance: props compensate ONLY the residual moment left after the
+        # feasible leg allocation (tau_res = tau_des - r x f, Eq. 12); that is
+        # computed below in the stance allocation branch once f_contact_w is
+        # known. (2026-07-11: the independent stance_prop_* PD was DELETED.)
+        Tau_prop_des = Tau_des.copy()
         Tau_des_dbg = Tau_des.copy()
-        # Observer prediction input for NEXT tick: total commanded body
-        # attitude torque this tick (leg contact demand in stance + props when
-        # armed; flight with props off leaves it 0 = torque-free prediction).
-        self._kw_obs_tau_prev[0] = float(tau_b_att_des[0]) + float(tau_b_prop_des[0])
-        self._kw_obs_tau_prev[1] = float(tau_b_att_des[1]) + float(tau_b_prop_des[1])
-        # Log the rate the stance D-term actually consumed (observer output
-        # when enabled, raw gyro otherwise).
+        # Observer prediction input for NEXT tick: the total commanded body
+        # attitude moment is Tau_des in both phases under HFA (leg + residual
+        # props sum to the demand); props off in flight leaves it 0.
+        if bool(self._stance) or bool(props_enabled_ctrl):
+            self._kw_obs_tau_prev[0] = float(tau_b_att_des[0])
+            self._kw_obs_tau_prev[1] = float(tau_b_att_des[1])
+        else:
+            self._kw_obs_tau_prev[:] = 0.0
+        # Log the rate the stance D-term actually consumed (observer when on).
         omega_b_used_dbg = omega_b.copy()
         if kw_obs_on:
             omega_b_used_dbg[0] = float(omega_obs_xy[0])
@@ -2930,7 +3095,11 @@ class ModeECore:
             omega_b_native = np.asarray(imu_gyro_b, dtype=float).reshape(3)
             Khp = float(self.cfg.swing_kp_xy)
             Khd = float(self.cfg.swing_kd_xy)
-            sideForce = (Khp * (targetFootPos - x) - Khd * (xdot - _cross3(omega_b_native, x))).astype(float)
+            # Ground-relative foot velocity: xdot is the JOINT-only foot
+            # velocity (J*qdot); subtract the body-rotation part ω×x to remove
+            # the foot velocity induced by body spin. 2026-07-11: reverted back
+            # to '-' per user.
+            sideForce = (Khp * (targetFootPos - x) - Khd * (xdot + 0* _cross3(omega_b_native, x))).astype(float)
             sideForce = (sideForce - float(np.dot(sideForce, unitSpring)) * unitSpring).astype(float)
 
             k = float(self.cfg.swing_kp_z)
@@ -2982,6 +3151,10 @@ class ModeECore:
         # control_mode 2/3 = decouple (lstsq prop overlay); pure leg = A not armed
         thrust_sum_max = float(self.mass * self.gravity * float(self.cfg.thrust_total_ratio_max))
         props_on = bool(props_enabled_ctrl)
+        mode3_prop_share_dbg = 0.0
+        mode3_leg_rate_limited_dbg = False
+        mode3_leg_force_raw_w_dbg = np.zeros(3, dtype=float)
+        mode3_coop = False
         if not props_on:
             thrust_sum_max = 0.0
 
@@ -3011,6 +3184,45 @@ class ModeECore:
             if f_dn > 0.0:
                 thrust_sum_ref = -f_dn
             fz_cmd = float(max(0.0, float(f_ref[2]))) + f_dn
+
+            # Mode 3 cooperative authority schedule. CASE HFA assigns the
+            # entire attitude moment to the leg first and uses props only for
+            # the infeasible residual. Here the leg is deliberately assigned
+            # only (1-share) of the demand; props receive the measured residual
+            # after the rate-limited leg command is known.
+            mode3_coop = bool(
+                int(self.cfg.control_mode) == 3
+                and bool(getattr(self.cfg, "mode3_coop_alloc", True))
+                and props_on
+            )
+            tau_leg_share = 1.0
+            if mode3_coop:
+                share_nom = float(_clipf(
+                    float(getattr(self.cfg, "mode3_prop_share_nominal", 0.35)),
+                    0.0, 1.0,
+                ))
+                share_max = float(_clipf(
+                    float(getattr(self.cfg, "mode3_prop_share_max", 0.80)),
+                    share_nom, 1.0,
+                ))
+                tau_cap = max(1e-6, float(getattr(self.cfg, "stance_tau_rp_max", 1.0)))
+                demand01 = float(_clipf(
+                    float(np.linalg.norm(np.asarray(Tau_des, dtype=float).reshape(3)[:2])) / tau_cap,
+                    0.0, 1.0,
+                ))
+                demand_boost = float(getattr(self.cfg, "mode3_prop_share_demand_gain", 0.25)) * demand01
+                td_t_alloc = float(self._td_t) if self._td_t is not None else float(self.sim_time)
+                t_st_alloc = max(0.0, float(self.sim_time) - td_t_alloc)
+                td_tau = max(1e-4, float(getattr(self.cfg, "mode3_prop_td_boost_tau_s", 0.06)))
+                td_boost = float(getattr(self.cfg, "mode3_prop_td_boost", 0.20)) * math.exp(
+                    -t_st_alloc / td_tau
+                )
+                mode3_prop_share_dbg = float(_clipf(
+                    share_nom + demand_boost + td_boost,
+                    share_nom, share_max,
+                ))
+                tau_leg_share = 1.0 - mode3_prop_share_dbg
+
             try:
                 r_foot_b = (foot_b - self.com_b).reshape(3)
                 rx = float(r_foot_b[0])
@@ -3033,56 +3245,105 @@ class ModeECore:
                     # Reduces exactly to the legacy solution when rx=ry=0.
                     r_n2 = float(rx * rx + ry * ry + rz * rz)
                     u_b = (r_foot_b / max(1e-6, math.sqrt(r_n2))).reshape(3)
-                    tau_v = np.array([float(tau_att_xy[0]), float(tau_att_xy[1]), 0.0], dtype=float)
+                    # MATLAB: full 3-vector hip torque into the min-norm map
+                    # (the leg-axis component was already projected out above;
+                    # any residual component along r drops out of the cross).
+                    tau_v = (
+                        tau_leg_share * np.asarray(tau_b_att_des, dtype=float).reshape(3)
+                    ).copy()
                     f_side_b = (np.cross(r_foot_b, tau_v) / max(1e-9, r_n2)).reshape(3)
                     # The fxy limit acts on the PURE attitude channel only --
                     # the axial push carries no torque, so clipping f_side no
                     # longer corrupts the height/energy channel (and vice versa).
-                    s_n = float(np.linalg.norm(f_side_b))
-                    if np.isfinite(lim) and s_n > lim and s_n > 1e-9:
-                        f_side_b *= lim / s_n
-                    # Axial magnitude: keep the WORLD-vertical push equal to
-                    # fz_cmd (world +Z down; pushing the ground = +z force).
-                    u_w = (R_wb_hat @ u_b.reshape(3)).reshape(3)
-                    s_w = (R_wb_hat @ f_side_b.reshape(3)).reshape(3)
-                    # Guard: if the COM->foot line tilts >60 deg from vertical
-                    # the 1/uz boost would explode; cap it (accept less lift).
-                    uz = float(max(0.5, float(u_w[2])))
-                    f_ax = (float(fz_cmd) - float(s_w[2])) / uz
-                    f_ax = float(max(0.0, f_ax))  # never pull on the ground
+                    if np.isfinite(lim) and lim > 0.0:
+                        f_side_b[0] = float(_clipf(float(f_side_b[0]), -lim, lim))
+                        f_side_b[1] = float(_clipf(float(f_side_b[1]), -lim, lim))
+                    # Axial spring: f_ref[2] is the leg-axis SLIP spring magnitude;
+                    # apply directly along u_b (no body-z / world-z projection).
+                    f_ax = float(max(0.0, float(fz_cmd)))
                     f_contact_b_cmd = (f_ax * u_b + f_side_b).astype(float).reshape(3)
                 else:
-                    # --- Legacy body z/xy split + rx*fz lever feedforward ---
-                    # Delivered body torque from the commanded contact force
-                    # (robot pushes the ground with f_cmd, body feels the
-                    # reaction):
-                    #   tau_x = rz*fy - ry*fz
-                    #   tau_y = rx*fz - rz*fx
-                    # Solving with the full lever arm turns the known rx*fz
-                    # tipping moment into a feedforward:
+                    # --- SRB (HFA): WORLD-vertical support + WORLD torque solve ---
+                    # 2026-07-11 fix: the fz support is now held along the WORLD
+                    # vertical, NOT body-z. The old legacy split placed fz_cmd in
+                    # f_contact_b_cmd[2] (body z) and rotated the whole vector to
+                    # world, so a body tilt theta leaked a WORLD-horizontal force
+                    # fz*sin(theta) that was NOT part of the attitude solve --
+                    # a destabilizing side push that fed the tip-over divergence
+                    # seen while hopping. Solving in the WORLD frame with the
+                    # WORLD lever arm r_foot_w and WORLD demand Tau_des keeps the
+                    # weight-support push vertical at any attitude.
+                    #
+                    # Leg reaction torque:  tau_leg = -(r_w x f_w)
+                    #   tau_leg_x = rz*fy - ry*fz
+                    #   tau_leg_y = rx*fz - rz*fx
+                    # Fix fz = fz_cmd (world vertical, +Z DOWN = push into ground)
+                    # and back-solve the world horizontal for the demanded torque:
                     #   fy = (tau_x + ry*fz)/rz ,  fx = (rx*fz - tau_y)/rz
-                    # Lever feedforward uses fz WITHOUT the downforce pulse:
-                    # feeding f_dn through here converts the pulse into extra
-                    # TANGENTIAL force (fx ~ rx*fz/rz) -- measured in sim as
-                    # more TD slip, the opposite of the pulse's purpose.
-                    fz_lever = float(max(0.0, fz_cmd - f_dn))
-                    if abs(rz) > 1e-6:
-                        fxy_b = (
-                            (rx * fz_lever - float(tau_att_xy[1])) / rz,
-                            (float(tau_att_xy[0]) + ry * fz_lever) / rz,
-                        )
+                    r_w = np.asarray(r_foot_w, dtype=float).reshape(3)
+                    rxw, ryw, rzw = float(r_w[0]), float(r_w[1]), float(r_w[2])
+                    fz_w = float(fz_cmd)
+                    tau_des_xy = (
+                        tau_leg_share * np.asarray(Tau_des, dtype=float).reshape(3)[:2]
+                    )
+                    if abs(rzw) > 1e-6:
+                        fx_w = (rxw * fz_w - float(tau_des_xy[1])) / rzw
+                        fy_w = (float(tau_des_xy[0]) + ryw * fz_w) / rzw
                     else:
-                        fxy_b = (0.0, 0.0)
-                    # Cap on stance fxy; proportional scaling keeps direction.
-                    fxy_norm = float(np.hypot(float(fxy_b[0]), float(fxy_b[1])))
-                    if np.isfinite(lim) and fxy_norm > lim and fxy_norm > 1e-9:
-                        s_fxy = lim / fxy_norm
-                        fxy_b = (float(fxy_b[0]) * s_fxy, float(fxy_b[1]) * s_fxy)
-                    f_contact_b_cmd = np.array([float(fxy_b[0]), float(fxy_b[1]), fz_cmd], dtype=float)
+                        fx_w, fy_w = 0.0, 0.0
+                    # Paper HFA friction cone (Eq. 11): ||f_xy||_2 <= mu * fz,
+                    # projected by proportional scaling (direction preserved).
+                    if mu_s > 0.0:
+                        cone = float(mu_s * max(0.0, fz_w))
+                        fxy_norm = float(np.hypot(fx_w, fy_w))
+                        if fxy_norm > cone and fxy_norm > 1e-9:
+                            s_fxy = cone / fxy_norm
+                            fx_w *= s_fxy
+                            fy_w *= s_fxy
+                    # Optional extra per-axis hard cut (stance_fxy_max; 0 = off).
+                    if fxy_cap > 0.0:
+                        fx_w = float(_clipf(fx_w, -fxy_cap, fxy_cap))
+                        fy_w = float(_clipf(fy_w, -fxy_cap, fxy_cap))
+                    f_contact_w = np.array([fx_w, fy_w, fz_w], dtype=float)
+                    # Keep the body-frame command consistent (logs + the shared
+                    # rotate-back below reproduce exactly this world force).
+                    f_contact_b_cmd = (R_wb_hat.T @ f_contact_w.reshape(3)).reshape(3)
                 # Downstream variables named *_w expect world frame; convert once here.
                 f_contact_w = (R_wb_hat @ f_contact_b_cmd.reshape(3)).reshape(3)
             except Exception:
                 f_contact_w = np.array([0.0, 0.0, fz_cmd], dtype=float)
+
+            mode3_leg_force_raw_w_dbg = np.asarray(f_contact_w, dtype=float).reshape(3).copy()
+            if mode3_coop:
+                # Incremental/rate-constrained allocation: limit the change in
+                # the LEG command, not the desired total wrench. Whatever
+                # moment the smoothed leg cannot deliver this tick is measured
+                # below and handed to the props.
+                f_prev = np.asarray(self._mode3_leg_force_prev_w, dtype=float).reshape(3)
+                f_rate = np.asarray(f_contact_w, dtype=float).reshape(3).copy()
+
+                dxy = (f_rate[:2] - f_prev[:2]).reshape(2)
+                dxy_n = float(np.linalg.norm(dxy))
+                dxy_max = max(
+                    0.0,
+                    float(getattr(self.cfg, "mode3_leg_fxy_slew_nps", 300.0)) * float(self.dt),
+                )
+                if dxy_max > 0.0 and dxy_n > dxy_max and dxy_n > 1e-12:
+                    f_rate[:2] = f_prev[:2] + (dxy_max / dxy_n) * dxy
+                    mode3_leg_rate_limited_dbg = True
+
+                dz = float(f_rate[2] - f_prev[2])
+                z_rate = (
+                    float(getattr(self.cfg, "mode3_leg_fz_rise_nps", 2000.0))
+                    if dz >= 0.0
+                    else float(getattr(self.cfg, "mode3_leg_fz_fall_nps", 3500.0))
+                )
+                dz_max = max(0.0, z_rate * float(self.dt))
+                if dz_max > 0.0 and abs(dz) > dz_max:
+                    f_rate[2] = float(f_prev[2] + math.copysign(dz_max, dz))
+                    mode3_leg_rate_limited_dbg = True
+
+                f_contact_w = f_rate.astype(float).reshape(3)
 
             if A_tau_f_3rsr is not None:
                 tau_qp = (np.asarray(A_tau_f_3rsr, dtype=float).reshape(3, 3) @ f_contact_w.reshape(3)).reshape(3)
@@ -3092,9 +3353,22 @@ class ModeECore:
             slack = np.zeros(6, dtype=float)
 
             if props_on:
+                # --- HFA residual compensation (CASE2026 paper Eq. 12) ---
+                # The moment actually assigned to the leg by the feasible
+                # contact-force allocation is tau_leg = -r x f (body feels the
+                # reaction of the commanded push force f). Props compensate
+                # ONLY the residual: tau_res = Tau_des - tau_leg.
                 try:
+                    tau_leg_w = (-_cross3(r_foot_w.reshape(3), f_contact_w.reshape(3))).reshape(3)
+                    tau_res_w = np.array([
+                        float(Tau_des[0]) - float(tau_leg_w[0]),
+                        float(Tau_des[1]) - float(tau_leg_w[1]),
+                        0.0,
+                    ], dtype=float)
+                    if not np.all(np.isfinite(tau_res_w)):
+                        tau_res_w = np.zeros(3, dtype=float)
                     thrusts = self._allocate_prop_thrust(
-                        tau_des_w=Tau_prop_des,
+                        tau_des_w=tau_res_w,
                         prop_r_w=prop_r_w,
                         z_thrust_w=z_thrust_w,
                         thrust_sum_ref=float(thrust_sum_ref),
@@ -3106,7 +3380,7 @@ class ModeECore:
                 thrusts = np.zeros(3, dtype=float)
 
         else:
-            # --- Flight: swing-leg tau_ref + optional prop overlay (same lstsq as stance) ---
+            # --- Flight: swing-leg tau_ref + props track Tau_des directly ---
             F_des = (np.asarray(f_ref, dtype=float).reshape(3) + z_thrust_w.reshape(3) * float(thrust_sum_ref)).astype(float)
             f_contact_w = np.zeros(3, dtype=float)
             if tau_ref is not None:
@@ -3200,6 +3474,62 @@ class ModeECore:
         if bool(self._stance) and float(scale) < 1.0:
             f_contact_w = (np.asarray(f_contact_w, dtype=float).reshape(3) * float(scale)).astype(float)
 
+        if bool(self._stance) and int(self.cfg.control_mode) == 3:
+            # Store the ACTUALLY deliverable leg force (after joint-torque
+            # scaling) for next tick's rate constraint.
+            self._mode3_leg_force_prev_w = (
+                np.asarray(f_contact_w, dtype=float).reshape(3).copy()
+            )
+
+            if mode3_coop and props_on:
+                # A joint-torque cap may have reduced the leg after the first
+                # residual allocation. Reallocate once from the final leg
+                # force so props compensate the true, not the requested,
+                # residual. This bounded second pass is the lexicographic
+                # correction step of the incremental allocator.
+                try:
+                    tau_leg_final_w = (
+                        -_cross3(r_foot_w.reshape(3), f_contact_w.reshape(3))
+                    ).reshape(3)
+                    tau_res_final_w = np.array([
+                        float(Tau_des[0]) - float(tau_leg_final_w[0]),
+                        float(Tau_des[1]) - float(tau_leg_final_w[1]),
+                        0.0,
+                    ], dtype=float)
+                    thrusts = self._allocate_prop_thrust(
+                        tau_des_w=tau_res_final_w,
+                        prop_r_w=prop_r_w,
+                        z_thrust_w=z_thrust_w,
+                        thrust_sum_ref=float(thrust_sum_ref),
+                        thrust_sum_max=float(thrust_sum_max),
+                    )
+                    self._wbc_last_t = thrusts.copy()
+                except Exception:
+                    pass
+
+                # Refresh wrench telemetry after the final prop allocation.
+                thrust_sum = float(np.sum(thrusts)) if np.all(np.isfinite(thrusts)) else float("nan")
+                F_total_w = (
+                    f_contact_w + z_thrust_w.reshape(3) * thrust_sum
+                ).astype(float).reshape(3)
+                tau_contact_w = _cross3(
+                    r_foot_w.reshape(3), f_contact_w.reshape(3)
+                ).astype(float).reshape(3)
+                try:
+                    tau_props_w = np.sum(
+                        [
+                            _cross3(
+                                prop_r_w[i].reshape(3),
+                                z_thrust_w.reshape(3) * float(thrusts[i]),
+                            )
+                            for i in range(3)
+                        ],
+                        axis=0,
+                    ).astype(float).reshape(3)
+                except Exception:
+                    tau_props_w = np.full(3, np.nan, dtype=float)
+                tau_total_w = (tau_contact_w + tau_props_w).astype(float).reshape(3)
+
         # Stance GRF in BODY FRD (same frame as foot_b): single SO(3) R_wb^T, after torque scaling.
         if bool(self._stance):
             f_tau_b = (R_wb_hat.T @ f_contact_w.reshape(3)).reshape(3)
@@ -3223,9 +3553,7 @@ class ModeECore:
             "v_hat_w": np.asarray(self._v_hat_w, dtype=float).reshape(3).copy(),
             # Debug: base velocity measured from leg kinematics (foot assumed stationary in WORLD).
             "v_meas_foot_w": np.asarray(v_base_from_foot_w, dtype=float).reshape(3).copy(),
-            # Velocity-KF accel bias estimate (body frame) -- should settle to a
-            # small near-constant value; a drifting/saturated bias means bad tuning.
-            "kf_b_a": np.asarray(self._kf_b_a, dtype=float).reshape(3).copy(),
+            "flight_vel_w": np.asarray(self._flight_vel, dtype=float).reshape(3).copy(),
             # LiDAR odometry fusion debug (hopper_odom_lcmt):
             "lidar_fresh": int(bool(lidar_fresh)),
             "lidar_pos_map": np.asarray(self._lidar_pos_map, dtype=float).reshape(3).copy(),
@@ -3275,6 +3603,12 @@ class ModeECore:
             "tau_props_w": np.asarray(tau_props_w, dtype=float).reshape(3).copy(),
             "tau_total_w": np.asarray(tau_total_w, dtype=float).reshape(3).copy(),
             "f_contact_w": f_contact_w.copy(),
+            # Mode-3 cooperative allocator telemetry.
+            "mode3_prop_share": float(mode3_prop_share_dbg),
+            "mode3_leg_rate_limited": int(bool(mode3_leg_rate_limited_dbg)),
+            "mode3_leg_force_raw_w": np.asarray(
+                mode3_leg_force_raw_w_dbg, dtype=float
+            ).reshape(3).copy(),
             # Contact force (GRF) expressed in BODY frame, same frame as foot_b.
             "f_contact_b": (np.asarray(R_wb_hat, dtype=float).reshape(3, 3).T @ np.asarray(f_contact_w, dtype=float).reshape(3)).reshape(3).copy(),
             # Unified footforce, SAME coordinate system as footpos (foot_b) for ALL phases:
@@ -3302,6 +3636,8 @@ class ModeECore:
             "tau_b_stance_des": tau_b_stance_des.copy(),
             # Debug: gyro actually used by the stance attitude torque controller (BODY frame)
             "omega_b_used": omega_b_used_dbg.copy(),
+            "z_lo_m": float(self._z_lo) if self._z_lo is not None else float("nan"),
+            "vz_lo_m_s": float(self._vz_lo) if self._vz_lo is not None else float("nan"),
             "v_to_cmd_m_s": float(self._v_to_cmd),
             "hop_height_m": float(self.cfg.hop_height_m),
             # Flight-time apex measurement h = g*T^2/8 (log-only telemetry).

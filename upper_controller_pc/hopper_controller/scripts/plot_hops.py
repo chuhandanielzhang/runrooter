@@ -3,9 +3,13 @@
 (x = log time t_s), all hops together, stance windows shaded + numbered.
 
 Rows:
-  1. BODY-frame fx/fy with the +/-20 N cap lines
-  2. fz_b, the friction cone 0.3*fz, and |fxy_b| (shows which limit binds)
+  1. hiptorque tau_b_stance_des x/y (roll/pitch body torque) with +/- cap lines
+  2. |hiptorque_xy| magnitude vs the cap (shows attitude-torque saturation)
   3. roll / pitch
+  4. base height (+ apex markers)
+  5. body velocity v_hat_w (vx, vy, vz) and raw leg meas v_meas_foot_w (dashed)
+  6. swing-leg foot target vs actual in BODY frame (NO quaternion):
+     foot_des_b (dashed) vs foot_b (solid), x/y/z -- flight only
 Contact force is logged in world frame; it is rotated back to body with
 rpy_hat so tilt does not leak fz into fx/fy (a -38 deg roll makes world fx
 look like -100 N while body |fxy| is really capped at 20 N).
@@ -38,9 +42,11 @@ try:
     _cfg = ModeEConfig()
     FXY_CAP_N = float(_cfg.stance_fxy_max)
     STANCE_MU = float(_cfg.stance_mu)
+    TAU_CAP_NM = float(_cfg.stance_tau_rp_max)
 except Exception:
     FXY_CAP_N = 15.0
     STANCE_MU = 0.0
+    TAU_CAP_NM = 2.0
 
 
 def rot_wb(r, p, y):
@@ -74,6 +80,30 @@ def main():
     pitch = col("rpy_hat_pitch")
     # Base height above ground: estimator position, world +Z DOWN -> negate.
     height = -col("p_hat_w2")
+
+    def _vel3(prefix):
+        if f"{prefix}0" in rows[0]:
+            return np.stack([col(f"{prefix}0"), col(f"{prefix}1"), col(f"{prefix}2")], axis=1)
+        return None
+
+    v_hat = _vel3("v_hat_w")
+    v_meas = _vel3("v_meas_foot_w")
+
+    # Swing-leg tracking in BODY frame (no quaternion mapping):
+    #   foot_des_b = commanded foot target, foot_b = measured foot position.
+    foot_des_b = _vel3("foot_des_b")
+    foot_b = _vel3("foot_b")
+
+    # Stance hiptorque (body-frame attitude torque, already capped at TAU_CAP_NM).
+    tau_hip = None
+    if "tau_b_stance_des0" in rows[0]:
+        tau_hip = np.stack(
+            [col("tau_b_stance_des0"), col("tau_b_stance_des1"), col("tau_b_stance_des2")],
+            axis=1,
+        )
+    v_des = None
+    if "desired_vx_w" in rows[0] and "desired_vy_w" in rows[0]:
+        v_des = np.stack([col("desired_vx_w"), col("desired_vy_w"), np.zeros(len(rows))], axis=1)
 
     if "f_contact_b0" in rows[0]:
         # New logs carry the controller's own BODY-frame GRF directly.
@@ -112,7 +142,7 @@ def main():
     sl = slice(m0, m1)
     ts = t[sl]
 
-    fig, axs = plt.subplots(4, 1, figsize=(max(12, 3 * len(segs)), 11), sharex=True)
+    fig, axs = plt.subplots(6, 1, figsize=(max(12, 3 * len(segs)), 15.5), sharex=True)
 
     def shade(ax, label_hops=False):
         for k, a, b in segs:
@@ -121,36 +151,34 @@ def main():
                 ax.text((t[a] + t[b]) / 2, ax.get_ylim()[1] * 0.92, f"hop {k}",
                         ha="center", va="top", fontsize=9, color="tab:blue")
 
-    # The enforced limit is fz-dependent: lim(t) = min(mu*fz(t), cap).
-    # Only meaningful in stance; NaN elsewhere so nothing is drawn in flight.
-    lim = np.full(len(t), np.inf)
-    if STANCE_MU > 0.0:
-        lim = np.minimum(lim, STANCE_MU * np.clip(fb[:, 2], 0.0, None))
-    if FXY_CAP_N > 0.0:
-        lim = np.minimum(lim, FXY_CAP_N)
-    lim[~np.isfinite(lim)] = np.nan
-    lim[st == 0] = np.nan
-    lim_lbl = (f"limit min({STANCE_MU}*fz, {FXY_CAP_N:.0f}N)" if STANCE_MU > 0.0
-               else f"limit {FXY_CAP_N:.0f}N")
+    # Hiptorque cap trace: only meaningful in stance (NaN in flight so nothing drawn).
+    tau_cap = np.full(len(t), TAU_CAP_NM if TAU_CAP_NM > 0.0 else np.nan)
+    tau_cap[st == 0] = np.nan
+    tau_lbl = f"hiptorque cap {TAU_CAP_NM:.1f} Nm"
 
     ax = axs[0]
-    ax.plot(ts, fb[sl, 0], label="fx_b", color="tab:blue")
-    ax.plot(ts, fb[sl, 1], label="fy_b", color="tab:orange")
-    ax.plot(ts, lim[sl], ls="--", c="r", lw=1.0, label=lim_lbl)
-    ax.plot(ts, -lim[sl], ls="--", c="r", lw=1.0)
+    if tau_hip is not None:
+        ax.plot(ts, tau_hip[sl, 0], label="hiptorque_x (roll)", color="tab:blue")
+        ax.plot(ts, tau_hip[sl, 1], label="hiptorque_y (pitch)", color="tab:orange")
+        ax.plot(ts, tau_cap[sl], ls="--", c="r", lw=1.0, label=tau_lbl)
+        ax.plot(ts, -tau_cap[sl], ls="--", c="r", lw=1.0)
+    else:
+        ax.text(0.5, 0.5, "tau_b_stance_des not in log", transform=ax.transAxes, ha="center")
     ax.axhline(0, color="k", lw=0.5)
     shade(ax, label_hops=True)
-    ax.set_ylabel("body force [N]")
+    ax.set_ylabel("hiptorque [Nm]")
     ax.legend(loc="lower right", fontsize=8)
     ax.grid(alpha=0.3)
     ax.set_title(f"hops {hops[0]}..{hops[-1]} (shaded = stance, white = flight)")
 
     ax = axs[1]
-    ax.plot(ts, fb[sl, 2], label="fz_b", color="tab:green")
-    ax.plot(ts, lim[sl], ls="--", c="r", lw=1.0, label=lim_lbl)
-    ax.plot(ts, np.hypot(fb[sl, 0], fb[sl, 1]), color="tab:red", label="|fxy_b|")
+    if tau_hip is not None:
+        ax.plot(ts, np.hypot(tau_hip[sl, 0], tau_hip[sl, 1]), color="tab:red", label="|hiptorque_xy|")
+        ax.plot(ts, tau_cap[sl], ls="--", c="r", lw=1.0, label=tau_lbl)
+    else:
+        ax.text(0.5, 0.5, "tau_b_stance_des not in log", transform=ax.transAxes, ha="center")
     shade(ax)
-    ax.set_ylabel("N")
+    ax.set_ylabel("|hiptorque| [Nm]")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(alpha=0.3)
 
@@ -182,19 +210,63 @@ def main():
                     textcoords="offset points", xytext=(0, 8),
                     ha="center", fontsize=8, color="tab:red")
     ax.set_ylabel("height [m]")
-    ax.set_xlabel("log time t_s [s]")
     ax.legend(loc="lower right", fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # Row 5: body velocity (world frame, +Z down).
+    ax = axs[4]
+    if v_hat is not None:
+        ax.plot(ts, v_hat[sl, 0], label="v_hat_x", color="tab:blue")
+        ax.plot(ts, v_hat[sl, 1], label="v_hat_y", color="tab:orange")
+        ax.plot(ts, v_hat[sl, 2], label="v_hat_z", color="tab:green", alpha=0.85)
+    else:
+        ax.text(0.5, 0.5, "v_hat_w not in log", transform=ax.transAxes, ha="center")
+    if v_meas is not None:
+        ax.plot(ts, v_meas[sl, 0], ls="--", lw=0.9, color="tab:blue", alpha=0.45, label="v_meas_x")
+        ax.plot(ts, v_meas[sl, 1], ls="--", lw=0.9, color="tab:orange", alpha=0.45, label="v_meas_y")
+    if v_des is not None:
+        ax.plot(ts, v_des[sl, 0], ls=":", lw=1.0, color="k", alpha=0.6, label="v_des_x")
+        ax.plot(ts, v_des[sl, 1], ls=":", lw=1.0, color="k", alpha=0.6, label="v_des_y")
+    ax.axhline(0, color="k", lw=0.5)
+    shade(ax)
+    ax.set_ylim(-2, 2)
+    ax.set_ylabel("velocity [m/s]")
+    ax.legend(loc="lower right", fontsize=8, ncol=2)
+    ax.grid(alpha=0.3)
+
+    # Row 6: swing-leg foot tracking in BODY frame (NO quaternion). Target
+    # foot_des_b is only computed in FLIGHT (NaN/held in stance), so the swing
+    # tracking is read in the white (flight) bands. Solid = actual foot_b,
+    # dashed = commanded foot_des_b, per axis.
+    ax = axs[5]
+    if foot_des_b is not None and foot_b is not None:
+        cols3 = ("tab:blue", "tab:orange", "tab:green")
+        names = ("x", "y", "z")
+        for i in range(3):
+            ax.plot(ts, foot_b[sl, i], color=cols3[i], lw=1.3, label=f"foot_{names[i]} (real)")
+            ax.plot(ts, foot_des_b[sl, i], color=cols3[i], ls="--", lw=1.1,
+                    alpha=0.8, label=f"foot_{names[i]} (target)")
+    else:
+        ax.text(0.5, 0.5, "foot_des_b / foot_b not in log", transform=ax.transAxes, ha="center")
+    ax.axhline(0, color="k", lw=0.5)
+    shade(ax)
+    ax.set_ylabel("foot pos body [m]")
+    ax.set_xlabel("log time t_s [s]")
+    ax.legend(loc="lower right", fontsize=7, ncol=3)
     ax.grid(alpha=0.3)
 
     for k, a, b in segs:
         seg = slice(a, b)
         ap = next((x for x in apexes if x[0] == k), None)
         ap_s = f"apex +{100*ap[3]:.1f}cm (abs {ap[2]:.3f}m)" if ap else "apex n/a"
+        v_lo = ""
+        if v_hat is not None:
+            v_lo = (f"  v_hat@LO [{v_hat[b,0]:+.2f},{v_hat[b,1]:+.2f},{v_hat[b,2]:+.2f}]")
         print(f"hop {k}: TD@{t[a]:7.3f}s Ts={(t[b]-t[a])*1000:4.0f}ms  "
               f"fx_b[{fb[seg,0].min():+6.1f}..{fb[seg,0].max():+6.1f} mean {fb[seg,0].mean():+6.1f}]  "
               f"fy_b[{fb[seg,1].min():+6.1f}..{fb[seg,1].max():+6.1f} mean {fb[seg,1].mean():+6.1f}]  "
               f"roll {np.degrees(roll[a]):+.1f}->{np.degrees(roll[b]):+.1f}deg  "
-              f"pitch {np.degrees(pitch[a]):+.1f}->{np.degrees(pitch[b]):+.1f}deg  {ap_s}")
+              f"pitch {np.degrees(pitch[a]):+.1f}->{np.degrees(pitch[b]):+.1f}deg  {ap_s}{v_lo}")
 
     plt.tight_layout()
     out = os.path.join(os.path.dirname(log_path), "hops_combined.png")
