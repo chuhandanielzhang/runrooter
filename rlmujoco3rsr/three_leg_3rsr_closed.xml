@@ -25,8 +25,9 @@
 
     <body name="base" pos="0 0 0.6">
       <freejoint name="root"/>
-      <!-- paper total 3.75 kg = base 2.95 + 3 props 0.45 + leg 0.35. inertia from STL; TODO(SolidWorks) measured -->
-      <geom name="upperbody_visual" type="mesh" mesh="upperbody_mesh" mass="2.95" rgba="0.55 0.6 0.7 1" contype="0" conaffinity="0"/>
+      <!-- SIGMA Simulation.m total m=2.73 kg (was paper 3.75). Scaled in place:
+           base 2.148 + 3 props 0.327 + legs 0.219 + foot 0.036. -->
+      <geom name="upperbody_visual" type="mesh" mesh="upperbody_mesh" mass="2.148" rgba="0.55 0.6 0.7 1" contype="0" conaffinity="0"/>
 
       <site name="imu" pos="0 0 0" size="0.012" rgba="1 1 0 0"/>
 
@@ -35,14 +36,14 @@
         <body name="hip1" pos="0.02424 0 0">
           <body name="upper1" quat="0 0 0 1">
             <joint name="ctrl_joint_1" type="hinge" axis="0 1 0" range="-1.5708 1.0472" damping="0.05"/>
-            <geom name="upper1_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.05" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="1 0 0 1"/>
+            <geom name="upper1_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.0365" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="1 0 0 1"/>
             <body name="cross1" pos="-0.158 0 0">
               <joint name="cross_pin_1" type="hinge" axis="0 1 0" damping="0.01"/>
-              <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+              <inertial pos="0 0 0" mass="0.0073" diaginertia="7.28e-7 7.28e-7 7.28e-7"/>
               <geom class="legmesh" type="mesh" mesh="joint_mesh" pos="0 0 0" rgba="0.25 0.25 0.25 1"/>
               <body name="lower1" pos="0 0 0">
               <joint name="lower_pin_1" type="hinge" axis="0 0 1" range="-0.7854 0.7854" damping="0.01"/>
-              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.04" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
+              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.0292" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
               <site name="foot_site_1" pos="-0.0735 0.0086 -0.396" size="0.012" rgba="1 0 0 0"/>
               </body>
             </body>
@@ -55,14 +56,14 @@
         <body name="hip2" pos="0.02424 0 0">
           <body name="upper2" quat="0 0 0 1">
             <joint name="ctrl_joint_2" type="hinge" axis="0 1 0" range="-1.5708 1.0472" damping="0.05"/>
-            <geom name="upper2_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.05" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="0 0 1 1"/>
+            <geom name="upper2_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.0365" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="0 0 1 1"/>
             <body name="cross2" pos="-0.158 0 0">
               <joint name="cross_pin_2" type="hinge" axis="0 1 0" damping="0.01"/>
-              <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+              <inertial pos="0 0 0" mass="0.0073" diaginertia="7.28e-7 7.28e-7 7.28e-7"/>
               <geom class="legmesh" type="mesh" mesh="joint_mesh" pos="0 0 0" rgba="0.25 0.25 0.25 1"/>
               <body name="lower2" pos="0 0 0">
               <joint name="lower_pin_2" type="hinge" axis="0 0 1" range="-0.7854 0.7854" damping="0.01"/>
-              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.04" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
+              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.0292" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
               <site name="foot_site_2" pos="-0.0735 0.0086 -0.396" size="0.012" rgba="0 1 0 0"/>
               </body>
             </body>
@@ -75,14 +76,14 @@
         <body name="hip3" pos="0.02424 0 0">
           <body name="upper3" quat="0 0 0 1">
             <joint name="ctrl_joint_3" type="hinge" axis="0 1 0" range="-1.5708 1.0472" damping="0.05"/>
-            <geom name="upper3_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.05" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="0 1 0 1"/>
+            <geom name="upper3_visual" class="legmesh" type="mesh" mesh="upperleg_mesh" mass="0.0365" pos="-0.158 0 0" quat="0.7071068 0.7071068 0 0" rgba="0 1 0 1"/>
             <body name="cross3" pos="-0.158 0 0">
               <joint name="cross_pin_3" type="hinge" axis="0 1 0" damping="0.01"/>
-              <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+              <inertial pos="0 0 0" mass="0.0073" diaginertia="7.28e-7 7.28e-7 7.28e-7"/>
               <geom class="legmesh" type="mesh" mesh="joint_mesh" pos="0 0 0" rgba="0.25 0.25 0.25 1"/>
               <body name="lower3" pos="0 0 0">
               <joint name="lower_pin_3" type="hinge" axis="0 0 1" range="-0.7854 0.7854" damping="0.01"/>
-              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.04" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
+              <geom class="legmesh" type="mesh" mesh="lowerleg_mesh" mass="0.0292" quat="0 0 1 0" rgba="0.1 0.6 0.2 1"/>
               <site name="foot_site_3" pos="-0.0735 0.0086 -0.396" size="0.012" rgba="0 0 1 0"/>
               </body>
             </body>
@@ -95,7 +96,7 @@
         <body name="prop1" pos="0.56705 0 0.0866" quat="0 0.7071068 0 0.7071068">
           <joint name="servo_1" type="hinge" axis="0 0 1" range="-1.5708 1.5708" damping="0.2"/>
           <site name="thrust_site_1" pos="0 0 0" size="0.012" rgba="1 0.5 0 0"/>
-          <inertial pos="0 0 0" mass="0.15" diaginertia="2e-4 2e-4 2e-4"/>
+          <inertial pos="0 0 0" mass="0.109" diaginertia="1.456e-4 1.456e-4 1.456e-4"/>
           <geom type="mesh" mesh="propeller_mesh" rgba="0.3 0.3 0.35 1" contype="0" conaffinity="0"/>
           <!-- prop frame: X red(up), Y green, Z blue(outward) -->
         </body>
@@ -104,7 +105,7 @@
         <body name="prop2" pos="0.56705 0 0.0866" quat="0 0.7071068 0 0.7071068">
           <joint name="servo_2" type="hinge" axis="0 0 1" range="-1.5708 1.5708" damping="0.2"/>
           <site name="thrust_site_2" pos="0 0 0" size="0.012" rgba="1 0.5 0 0"/>
-          <inertial pos="0 0 0" mass="0.15" diaginertia="2e-4 2e-4 2e-4"/>
+          <inertial pos="0 0 0" mass="0.109" diaginertia="1.456e-4 1.456e-4 1.456e-4"/>
           <geom type="mesh" mesh="propeller_mesh" rgba="0.3 0.3 0.35 1" contype="0" conaffinity="0"/>
         </body>
       </body>
@@ -112,7 +113,7 @@
         <body name="prop3" pos="0.56705 0 0.0866" quat="0 0.7071068 0 0.7071068">
           <joint name="servo_3" type="hinge" axis="0 0 1" range="-1.5708 1.5708" damping="0.2"/>
           <site name="thrust_site_3" pos="0 0 0" size="0.012" rgba="1 0.5 0 0"/>
-          <inertial pos="0 0 0" mass="0.15" diaginertia="2e-4 2e-4 2e-4"/>
+          <inertial pos="0 0 0" mass="0.109" diaginertia="1.456e-4 1.456e-4 1.456e-4"/>
           <geom type="mesh" mesh="propeller_mesh" rgba="0.3 0.3 0.35 1" contype="0" conaffinity="0"/>
         </body>
       </body>
@@ -121,7 +122,7 @@
     <!-- shared foot point: free body pulled to the three leg ends -->
     <body name="foot" pos="0 0 0.231055">
       <freejoint name="foot_free"/>
-      <inertial pos="0 0 0" mass="0.05" diaginertia="1e-5 1e-5 1e-5"/>
+      <inertial pos="0 0 0" mass="0.036" diaginertia="7.28e-6 7.28e-6 7.28e-6"/>
       <geom name="foot_visual" type="mesh" mesh="foot_mesh" rgba="0.8 0.5 0.2 1" contype="0" conaffinity="0"/>
       <geom name="foot_collision" type="sphere" size="0.025" pos="0 0 -0.012" rgba="0.8 0.5 0.2 0"/>
       <site name="foot_touch" pos="0 0 -0.012" size="0.03" rgba="1 1 1 0"/>

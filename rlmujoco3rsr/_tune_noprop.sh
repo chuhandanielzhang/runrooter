@@ -20,7 +20,7 @@ run_one () {
     ${GIF:+--record-gif $GIF} > /tmp/tn_mj_$tag.log 2>&1 &
   local MJ=$!
   sleep 2
-  env CAO_MODE=1 CAO_TAU=20 $ctl_extra "$@" \
+  env CAO_TAU=20 $ctl_extra "$@" \
     timeout 150 python3 -u run_cao_on_our_model.py > /tmp/tn_ct_$tag.log 2>&1 &
   local CT=$!
   wait $MJ

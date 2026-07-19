@@ -238,8 +238,7 @@ def main() -> None:
         _print_stats("v_hat - v_meas (z)", dvz, unit="m/s")
         _print_stats("||v_hat - v_meas||", dvn, unit="m/s")
 
-    # Flight S2S target stats
-    s2s_active = _to_int_array(rows, "s2s_active")
+    # Flight Raibert target stats
     tgt_bx = _to_float_array(rows, "foot_des_b0")
     tgt_by = _to_float_array(rows, "foot_des_b1")
     tgt_bz = _to_float_array(rows, "foot_des_b2")
@@ -247,8 +246,7 @@ def main() -> None:
 
     m_flight = _phase_mask(phases, "FLIGHT")
     if np.any(m_flight):
-        print("\n### Flight target (S2S)")
-        print(f"- s2s_active rows (in flight): {int(np.sum((s2s_active != 0) & m_flight))} / {int(np.sum(m_flight))}")
+        print("\n### Flight target (Raibert)")
         _print_stats("tgt_bx", tgt_bx[m_flight], unit="m")
         _print_stats("tgt_by", tgt_by[m_flight], unit="m")
         _print_stats("tgt_bz", tgt_bz[m_flight], unit="m")

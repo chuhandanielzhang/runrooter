@@ -12,7 +12,7 @@ for k in $(seq 1 $N); do
     > /tmp/rep1d_mj_$k.log 2>&1 &
   MJ=$!
   sleep 2
-  env CAO_MODE=1 CAO_TAU=20 CAO_1D=1 CAO_L0=0.455 CAO_HOP_H=0.10 CAO_KZ=1100 CAO_KDZ=20 \
+  env CAO_TAU=20 CAO_1D=1 CAO_L0=0.455 CAO_HOP_H=0.10 CAO_KZ=1100 CAO_KDZ=20 \
       CAO_SW_KP=150 CAO_SW_KD=4 \
     timeout 120 python3 -u run_cao_on_our_model.py > /tmp/rep1d_ct_$k.log 2>&1 &
   CT=$!

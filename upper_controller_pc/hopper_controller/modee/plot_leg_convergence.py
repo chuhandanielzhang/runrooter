@@ -4,7 +4,7 @@ Plot ModeE CSV logs (produced by hopper_controller/modee/lcm_controller.py).
 
 What it plots (time-domain):
 1) Leg/foot convergence: foot_des_b (target) vs foot_b (measured) + error norm
-2) Flight (S2S active): velocity convergence + S2S foot target (XY) vs time
+2) Flight: velocity convergence + Raibert foot target (XY) vs time
 3) Stance: velocity convergence (v_hat vs desired_v) vs time
 
 Default behavior:
@@ -136,7 +136,6 @@ def main() -> None:
     t = (t - float(t[0])) if np.isfinite(t[0]) else t
 
     stance = _to_int(rows, "stance")
-    s2s_active = _to_int(rows, "s2s_active")
     s_stance = _to_float(rows, "s_stance")
     phases = [str(r.get("phase", "")) for r in rows]
 
@@ -160,7 +159,6 @@ def main() -> None:
         # Trim all arrays from first_stance_idx onwards
         t = t[first_stance_idx:]
         stance = stance[first_stance_idx:]
-        s2s_active = s2s_active[first_stance_idx:]
         s_stance = s_stance[first_stance_idx:]
         phases = phases[first_stance_idx:]
         foot_b = foot_b[first_stance_idx:]
@@ -214,8 +212,7 @@ def main() -> None:
     _shade_by_phase(axs[3])
     fig1.suptitle("Leg/foot convergence (BODY frame): target vs measured")
 
-    # ===== Figure 2: Flight (S2S) velocity convergence + foot target (XY) =====
-    m_flight_s2s = (stance == 0) & (s2s_active != 0)
+    # ===== Figure 2: Flight velocity convergence + Raibert target (XY) =====
     fig2, axs2 = plt.subplots(2, 1, sharex=True, figsize=(12, 7))
     for ax_i, (vel_i, pos_i, lab_v, lab_p) in enumerate(
         [
@@ -239,7 +236,7 @@ def main() -> None:
         ax.legend(lines + lines2, labels + labels2, loc="best")
 
     axs2[-1].set_xlabel("time (s)")
-    fig2.suptitle("Flight (S2S active): velocity vs desired + S2S foot target (XY)")
+    fig2.suptitle("Flight: velocity vs desired + Raibert foot target (XY)")
 
     # ===== Figure 3: Stance velocity convergence =====
     m_stance = stance != 0
@@ -431,7 +428,7 @@ def main() -> None:
     # Save
     base = os.path.splitext(os.path.basename(log_path))[0]
     p1 = os.path.join(out_dir, f"{base}_leg_pos_convergence.png")
-    p2 = os.path.join(out_dir, f"{base}_flight_s2s_vel_target.png")
+    p2 = os.path.join(out_dir, f"{base}_flight_raibert_vel_target.png")
     p3 = os.path.join(out_dir, f"{base}_stance_vel_convergence.png")
     p4 = os.path.join(out_dir, f"{base}_takeoff_apex_convergence.png")
     p5 = os.path.join(out_dir, f"{base}_leg_robot_vel_pos_body.png")

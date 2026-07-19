@@ -10,7 +10,7 @@ FAKE_TAU=${FAKE_TAU:-25} python3 -u modee_fake_robot.py --duration-s ${DUR:-20} 
   --record-gif "${GIF:-/tmp/modee_2d.gif}" > /tmp/mfr2d.log 2>&1 &
 MJ=$!
 sleep 2
-CAO_L0=${CAO_L0:-0.42} CAO_HOP_H=${CAO_HOP_H:-0.20} CAO_MODE=${CAO_MODE:-3} CAO_TAU=${CAO_TAU:-25} \
+CAO_L0=${CAO_L0:-0.42} CAO_HOP_H=${CAO_HOP_H:-0.20} CAO_TAU=${CAO_TAU:-25} \
   timeout 150 python3 -u run_cao_on_our_model.py > /tmp/mfr2d_ctl.log 2>&1 &
 CT=$!
 wait $MJ

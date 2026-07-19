@@ -38,7 +38,7 @@ Examples:
         default=None,
         help="Torque limit (Nm) for BOTH internal solver clip and final motor output "
         "(sets tau_cmd_max_nm and tau_out_max_nm unless --tau-out-max is also given). "
-        "Default internal: 20 Nm, default output: 30 Nm.",
+        "Default internal: 40 Nm, default output: 30 Nm.",
     )
     ap.add_argument(
         "--tau-sign",
@@ -50,31 +50,50 @@ Examples:
         "--pwm-max",
         type=float,
         default=None,
-        help="Max PWM pulse width (us). Default: 1300. For first bring-up, use 1100-1200.",
+        help="Max PWM pulse width (us). Default: 2000 (bidir full-forward).",
     )
     ap.add_argument(
         "--pwm-min",
         type=float,
         default=None,
-        help="Min PWM pulse width (us). Default: 1000 (disarmed/idle).",
+        help="Min PWM pulse width (us). Default: 1000 (stop / bidir center).",
     )
     ap.add_argument(
         "--thrust-ratio",
         type=float,
         default=None,
-        help="Baseline prop thrust ratio (0.0-1.0). Default: 0.10. For first bring-up, use 0.0-0.05.",
+        help="Flight baseline prop thrust ratio (0.0-1.0). Default: 0.01.",
+    )
+    ap.add_argument(
+        "--stance-thrust-ratio",
+        type=float,
+        default=None,
+        help="Stance-phase prop idle / collective ratio (0.0-1.0). Default: 0.12.",
     )
     ap.add_argument(
         "--thrust-max-each",
         type=float,
         default=None,
-        help="Per-arm max thrust cap passed to WBC (N). Default: 10.0. For first bring-up, use ~2-6.",
+        help="Calibrated per-arm maximum thrust (N). Default: 10.0.",
+    )
+    ap.add_argument(
+        "--prop-bidir",
+        dest="prop_bidir",
+        action="store_true",
+        default=None,
+        help="Enable bidirectional (3D) prop thrust (pwm<1000 = reverse). Default: off.",
+    )
+    ap.add_argument(
+        "--no-prop-bidir",
+        dest="prop_bidir",
+        action="store_false",
+        help="Disable bidirectional prop thrust (forward-only).",
     )
     ap.add_argument(
         "--thrust-min-each",
         type=float,
         default=None,
-        help="Per-arm MIN thrust lower bound in WBC-QP (N). Helps avoid props hitting pwm_min (stop/start) which causes wobble. Default: 0.0",
+        help="Per-arm minimum forward thrust (N). Default: 0.1.",
     )
     # LCM settings
     ap.add_argument(
@@ -89,7 +108,7 @@ Examples:
         "--max-cmd-vel",
         type=float,
         default=None,
-        help="Max commanded velocity from gamepad stick (m/s). Default: 0.8",
+        help="Max commanded velocity from gamepad stick (m/s). Default: 0.15.",
     )
     ap.add_argument(
         "--tau-out-max",
@@ -107,31 +126,31 @@ Examples:
         "--swing-kp-xy",
         type=float,
         default=None,
-        help="Flight swing PERPENDICULAR (⊥ leg axis) position gain kp (N/m). Default: 300.0.",
+        help="Flight swing perpendicular position gain kp (N/m). Default: 60.0.",
     )
     ap.add_argument(
         "--swing-kd-xy",
         type=float,
         default=None,
-        help="Flight swing PERPENDICULAR (⊥ leg axis) damping gain kd (N/(m/s)). Default: 0.0.",
+        help="Flight swing perpendicular damping gain kd (N/(m/s)). Default: 1.0.",
     )
     ap.add_argument(
         "--swing-kp-z",
         type=float,
         default=None,
-        help="Flight swing AXIAL (along leg axis) position gain kp (N/m). Default: 300.0.",
+        help="Flight swing axial position gain kp (N/m). Default: 1000.0.",
     )
     ap.add_argument(
         "--swing-kd-z",
         type=float,
         default=None,
-        help="Flight swing AXIAL (along leg axis) damping gain kd (N/(m/s)). Default: 0.0.",
+        help="Flight swing axial damping gain kd (N/(m/s)). Default: 20.0.",
     )
     ap.add_argument(
         "--print-hz",
         type=float,
         default=None,
-        help="Print frequency (Hz). <=0 means print every loop. Default: 0 (every loop).",
+        help="Print frequency (Hz). <=0 means every loop. Default: 5.",
     )
     ap.add_argument(
         "--demo-negx",
@@ -154,29 +173,12 @@ Examples:
         "--cmd-dv-max",
         type=float,
         default=None,
-        help="Rate limit on commanded desired velocity (m/s^2). Helps keep hopping smooth. Default: 0.6",
+        help="Rate limit on commanded desired velocity (m/s^2). Default: 0 (disabled).",
     )
     ap.add_argument(
         "--force-arm",
         action="store_true",
         help="Force ARM on startup (for testing without gamepad). WARNING: Robot will start sending torques immediately!",
-    )
-    ap.add_argument(
-        "--control-mode",
-        type=int,
-        default=None,
-        choices=[1, 2, 3],
-        help="Control mode: 1=LEGACY stance PD (pre-2026-07-09, for A/B), "
-        "2=decouple + stance attitude upgrades (rate KF + TD reference shaping + "
-        "error-scheduled damping), "
-        "3=mode2 + HLIP S2S foot placement (gain derived from measured Ts/z0 each hop, "
-        "deadbeat-family; falls back to Raibert until the first stance is measured). "
-        "Pure leg = any mode without pressing A (props never armed). Default: 2",
-    )
-    ap.add_argument(
-        "--stance-use-props",
-        action="store_true",
-        help="Enable propellers in STANCE (helpful for balance in simulation). Default: disabled (leg-only stance).",
     )
     ap.add_argument(
         "--leg-model",
@@ -193,39 +195,27 @@ Examples:
         "--prop-k-thrust",
         type=float,
         default=None,
-        help="Hopper4 thrust coefficient k_thrust (N per (pwm_delta)^2). Default: 1.47e-4. Only used when --use-hopper4-pwm is set.",
+        help="Calibrated thrust coefficient in N/(PWM delta)^2. Default: 1.24e-5.",
     )
 
-    # Flight phase attitude control gains (separate roll/pitch)
+    # Flight phase attitude control gains (shared roll/pitch)
     ap.add_argument(
-        "--flight-kR-roll",
+        "--flight-kR",
         type=float,
         default=None,
-        help="Flight phase roll axis attitude error gain (proportional). Default: 20.0",
+        help="Flight phase attitude error gain (roll and pitch). Default: 40.0.",
     )
     ap.add_argument(
-        "--flight-kW-roll",
+        "--flight-kW",
         type=float,
         default=None,
-        help="Flight phase roll axis angular velocity damping gain (derivative). Default: 10.0",
-    )
-    ap.add_argument(
-        "--flight-kR-pitch",
-        type=float,
-        default=None,
-        help="Flight phase pitch axis attitude error gain (proportional). Default: 20.0",
-    )
-    ap.add_argument(
-        "--flight-kW-pitch",
-        type=float,
-        default=None,
-        help="Flight phase pitch axis angular velocity damping gain (derivative). Default: 10.0",
+        help="Flight phase angular-rate damping gain (roll and pitch). Default: 6.0.",
     )
     ap.add_argument(
         "--flight-tau-rp-max",
         type=float,
         default=None,
-        help="Flight phase maximum roll/pitch torque limit (Nm). Default: 30.0",
+        help="Flight phase maximum roll/pitch torque limit (Nm). Default: 100.0.",
     )
 
     mode_dim_group = ap.add_mutually_exclusive_group()
@@ -248,16 +238,10 @@ Examples:
         help="Disable Hopper4-style energy compensation in PUSH phase (default: enabled).",
     )
     ap.add_argument(
-        "--energy-kp",
-        type=float,
-        default=None,
-        help="Energy compensation gain (Hopper4 Kp). Default: 7.0",
-    )
-    ap.add_argument(
         "--hop-height",
         type=float,
         default=None,
-        help="Target hop height above l0 for energy calculation (m). Default: 0.15",
+        help="Target hop height above l0 for energy calculation (m). Default: 0.07.",
     )
 
     args = ap.parse_args()
@@ -274,10 +258,16 @@ Examples:
         modee_cfg.pwm_min_us = float(args.pwm_min)
     if args.thrust_ratio is not None:
         modee_cfg.prop_base_thrust_ratio = float(args.thrust_ratio)
+    if getattr(args, "stance_thrust_ratio", None) is not None:
+        modee_cfg.prop_stance_base_thrust_ratio = float(args.stance_thrust_ratio)
     if args.thrust_max_each is not None:
         modee_cfg.thrust_max_each_n = float(args.thrust_max_each)
     if args.thrust_min_each is not None:
         modee_cfg.wbc_thrust_min_each_n = float(args.thrust_min_each)
+    if getattr(args, "prop_bidir", None) is not None:
+        modee_cfg.prop_bidir = bool(args.prop_bidir)
+        if bool(args.prop_bidir) and str(modee_cfg.prop_flight_reverse) == "fwd":
+            modee_cfg.prop_flight_reverse = "auto"
     if args.swing_kp_xy is not None:
         modee_cfg.swing_kp_xy = float(args.swing_kp_xy)
     if args.swing_kd_xy is not None:
@@ -286,12 +276,6 @@ Examples:
         modee_cfg.swing_kp_z = float(args.swing_kp_z)
     if args.swing_kd_z is not None:
         modee_cfg.swing_kd_z = float(args.swing_kd_z)
-
-    if args.control_mode is not None:
-        modee_cfg.control_mode = int(args.control_mode)
-
-    if bool(getattr(args, "stance_use_props", False)):
-        modee_cfg.stance_use_props = True
 
     if args.leg_model is not None:
         modee_cfg.leg_model = str(args.leg_model).strip().lower()
@@ -302,8 +286,6 @@ Examples:
         modee_cfg.mode_1d = True
     if bool(getattr(args, "no_energy_comp", False)):
         modee_cfg.use_energy_compensation = False
-    if args.energy_kp is not None:
-        modee_cfg.energy_comp_kp = float(args.energy_kp)
     if args.hop_height is not None:
         modee_cfg.hop_height_m = float(args.hop_height)
 
@@ -311,15 +293,11 @@ Examples:
     # - ModeE core defaults to Hopper4-like XY behavior (stance: leg kinematics; flight: hold XY).
     # If you later want runtime switches again, re-introduce CLI flags here.
     
-    # Flight phase attitude control gains (separate roll/pitch)
-    if args.flight_kR_roll is not None:
-        modee_cfg.flight_kR_roll = float(args.flight_kR_roll)
-    if args.flight_kW_roll is not None:
-        modee_cfg.flight_kW_roll = float(args.flight_kW_roll)
-    if args.flight_kR_pitch is not None:
-        modee_cfg.flight_kR_pitch = float(args.flight_kR_pitch)
-    if args.flight_kW_pitch is not None:
-        modee_cfg.flight_kW_pitch = float(args.flight_kW_pitch)
+    # Flight phase attitude control gains (shared roll/pitch)
+    if args.flight_kR is not None:
+        modee_cfg.flight_kR = float(args.flight_kR)
+    if args.flight_kW is not None:
+        modee_cfg.flight_kW = float(args.flight_kW)
     if args.flight_tau_rp_max is not None:
         modee_cfg.flight_tau_rp_max = float(args.flight_tau_rp_max)
     
@@ -354,16 +332,6 @@ Examples:
             lcm_cfg.demo_vx_mps = float(args.demo_vx)
         if args.demo_vy is not None:
             lcm_cfg.demo_vy_mps = float(args.demo_vy)
-
-    _mode_names = {1: "LEGACY stance PD (pre-upgrade A/B baseline)",
-                   2: "DECOUPLE + stance att upgrades (rate KF / TD ref shaping / scheduled kW)",
-                   3: "MODE 3: mode2 upgrades + HLIP S2S foot placement (measured Ts/z0, pole beta)"}
-    print("=" * 58)
-    print("HOPPER-AERO  |  Right stick → v_des  |  Y → log")
-    print(f"  mode={modee_cfg.control_mode}: {_mode_names.get(modee_cfg.control_mode, '???')}")
-    print(f"  max_cmd_vel={lcm_cfg.max_cmd_vel} m/s  kv={modee_cfg.flight_kv}  kr={modee_cfg.flight_kr}")
-    print(f"  tau_cmd_max={modee_cfg.tau_cmd_max_nm} Nm  tau_out_max={lcm_cfg.tau_out_max_nm} Nm")
-    print("=" * 58)
 
     ctl = ModeELCMController(modee_cfg=modee_cfg, lcm_cfg=lcm_cfg)
     

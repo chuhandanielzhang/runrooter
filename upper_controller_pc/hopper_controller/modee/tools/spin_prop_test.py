@@ -31,11 +31,14 @@ for p in (CTRL, _LCM_TYPES_DIR):
 from python.motor_pwm_lcmt import motor_pwm_lcmt  # noqa: E402
 
 # pwm_values index -> 120° Y arm (body FRD: +X fwd, +Y right).
-# 2026-07-06 physical mapping (per user): M3 on -Y, M1 on (+x,+y), M2 on (-x,+y).
+# 2026-07-18 confirmed physical mapping (M1 moved MAIN1 -> MAIN8):
+# M1->MAIN8 at +30deg, M2->MAIN2 at -90deg, M3->MAIN3 at +150deg.
+# Bridge map: pwm[1]->set1, pwm[2]->set2, pwm[3]->set3 (sets, not pins).
+# --motors here still takes the PWM INDICES 1,2,3 (unchanged).
 MOTOR_LABELS = {
-    1: "M1 pwm[1] @ +30deg (+x,+y)",
-    2: "M2 pwm[2] @ +150deg (-x,+y)",
-    3: "M3 pwm[3] @ -90deg (0,-L)",
+    1: "M1 pwm[1]->MAIN8 @ +30deg (+x,+y), bridge direction inverted",
+    2: "M2 pwm[2]->MAIN2 @ -90deg (0,-L), bridge direction inverted",
+    3: "M3 pwm[3]->MAIN3 @ +150deg (-x,+y)",
 }
 
 
@@ -75,21 +78,48 @@ def main() -> None:
                     help="Idle pause between motors (s)")
     ap.add_argument("--together", action="store_true",
                     help="spin ALL listed motors at the same time (default: one by one)")
+    ap.add_argument("--wire", action="store_true",
+                    help="interpret --pwm in WIRE scale (1500=stop, 1000=full rev, "
+                         "2000=full fwd) instead of the internal LCM scale (1000=stop)")
     args = ap.parse_args()
+
+    if args.wire:
+        # wire 1500=stop, +/-500 span  ->  LCM 1000=stop, +/-1000 span
+        args.pwm = 1000.0 + (float(args.pwm) - 1500.0) * 2.0
 
     motor_idxs = [int(x.strip()) for x in str(args.motors).split(",") if x.strip()]
     for idx in motor_idxs:
         if not (0 <= idx <= 5):
             raise SystemExit(f"invalid motor index {idx}; pwm_values is length 6 (0..5)")
 
+    # A spin shorter than a few bridge periods (bridge re-streams at ~250 Hz and
+    # the ESC ramps over ~100 ms) does nothing visible; catch typos like 0.001.
+    if float(args.duration) < 0.2:
+        raise SystemExit(
+            f"--duration {args.duration} s is too short to observe (ESC ramp ~0.1 s); "
+            f"use >= 0.2, e.g. --duration 1")
+
     lc = lcm.LCM(str(args.lcm_url))
     idle = [float(args.pwm_min)] * 6
     spin_pwm = float(args.pwm)
     cm = int(args.control_mode)
 
+    def wire_us(pwm_lcm: float) -> float:
+        """LCM scale (1000=stop) -> actual AUX wire PWM (1500=stop, 3D ESC)."""
+        act = max(-1.0, min(1.0, (pwm_lcm - 1000.0) / 1000.0))
+        return 1500.0 + act * 500.0
+
+    def pct(pwm_lcm: float) -> str:
+        act = max(-1.0, min(1.0, (pwm_lcm - 1000.0) / 1000.0))
+        if act == 0.0:
+            return "stop"
+        return f"{abs(act) * 100.0:.0f}% {'FWD' if act > 0 else 'REV'}"
+
     print(f"LCM {args.lcm_url}")
-    print(f"Motors {motor_idxs}: {spin_pwm:.0f} us for {args.duration:.1f} s each, "
-          f"control_mode={cm}, idle={args.pwm_min:.0f} us")
+    print(f"Motors {motor_idxs}: cmd {spin_pwm:.0f} (LCM scale, 1000=stop) "
+          f"= wire {wire_us(spin_pwm):.0f} us (1500=stop) = {pct(spin_pwm)}")
+    print(f"Duration {args.duration:.1f} s each, control_mode={cm}, "
+          f"idle cmd {args.pwm_min:.0f} = wire {wire_us(args.pwm_min):.0f} us")
     print("Ctrl+C to abort.\n")
 
     # Hold idle briefly so bridge sees a live stream before arming.
@@ -101,7 +131,8 @@ def main() -> None:
             pwm = list(idle)
             for idx in motor_idxs:
                 pwm[idx] = spin_pwm
-            print(f"[ALL {motor_idxs}] {spin_pwm:.0f} us for {args.duration:.1f} s (together)")
+            print(f"[ALL {motor_idxs}] cmd {spin_pwm:.0f} (wire {wire_us(spin_pwm):.0f} us, "
+                  f"{pct(spin_pwm)}) for {args.duration:.1f} s (together)")
             _stream(lc, pwm, cm, float(args.duration), args.hz)
             print(f"[ALL {motor_idxs}] done -> idle")
             _stream(lc, idle, cm, float(args.pause), args.hz)
@@ -110,7 +141,8 @@ def main() -> None:
                 pwm = list(idle)
                 pwm[idx] = spin_pwm
                 label = MOTOR_LABELS.get(idx, f"pwm[{idx}]")
-                print(f"[{label}] pwm_values[{idx}]={spin_pwm:.0f} us for {args.duration:.1f} s")
+                print(f"[{label}] cmd {spin_pwm:.0f} (wire {wire_us(spin_pwm):.0f} us, "
+                      f"{pct(spin_pwm)}) for {args.duration:.1f} s")
                 _stream(lc, pwm, cm, float(args.duration), args.hz)
                 print(f"[{label}] done -> idle")
                 _stream(lc, idle, cm, float(args.pause), args.hz)

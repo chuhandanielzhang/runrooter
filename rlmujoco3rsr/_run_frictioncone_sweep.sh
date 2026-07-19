@@ -29,7 +29,7 @@ for MU in $MUS; do for DF in $DFS; do
     --floor-mu "$MU" $EXTRA_FLAGS > "/tmp/fc_${TAG}.log" 2>&1 &
   MJ=$!
   sleep 2
-  CAO_MODE=${CAO_MODE:-3} CAO_TAU=${CAO_TAU:-25} CAO_MU="$MU" CAO_DOWNFORCE="$DF" \
+  CAO_TAU=${CAO_TAU:-25} CAO_MU="$MU" CAO_DOWNFORCE="$DF" \
     CAO_DOWNFORCE_TD=${CAO_DOWNFORCE_TD:-} \
     timeout $((DUR + 30)) python3 -u run_cao_on_our_model.py > "/tmp/fc_${TAG}_ctl.log" 2>&1 &
   CT=$!

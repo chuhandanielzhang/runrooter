@@ -9,7 +9,7 @@ sleep 2
 
 echo "=== Cao stance_kp_z = $KZ N/m  ->  $GIF ==="
 # 1) start Cao HFA QP controller (high level) in background, fully detached
-CAO_L0=0.42 CAO_HOP_H=0.20 CAO_MODE=3 CAO_TAU=25 CAO_KZ=$KZ \
+CAO_L0=0.42 CAO_HOP_H=0.20 CAO_TAU=25 CAO_KZ=$KZ \
   setsid python -u run_cao_on_our_model.py > run_cao.log 2>&1 < /dev/null &
 CTRL_PID=$!
 sleep 5

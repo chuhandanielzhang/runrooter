@@ -59,11 +59,11 @@ _c, _s = np.cos(YAW_FRD), np.sin(YAW_FRD)
 # v_frd = M @ v_sim  (sim base/world Z-up -> FRD/NED-like Z-down); M is proper (det=+1)
 M_FRD = np.diag([1.0, -1.0, -1.0]) @ np.array([[_c, -_s, 0], [_s, _c, 0], [0, 0, 1.0]])
 
-# current core.py prop convention (FRD), remapped 2026-07-06 (core.py:643):
-#   arm 0 (-90deg, (0,-L))   -> PWM[3]
-#   arm 1 (+150deg, (-x,+y)) -> PWM[2]
+# current core.py prop convention (FRD), confirmed 2026-07-18:
+#   arm 0 (-90deg, (0,-L))   -> PWM[2] / M2
+#   arm 1 (+150deg, (-x,+y)) -> PWM[3] / M3
 #   arm 2 (+30deg, (+x,+y))  -> PWM[1]
-PROP_PWM_ARM_ANGLE_FRD = {3: -90.0, 2: +150.0, 1: +30.0}
+PROP_PWM_ARM_ANGLE_FRD = {2: -90.0, 3: +150.0, 1: +30.0}
 TAU_LIM = float(os.environ.get("FAKE_TAU", "25.0"))
 
 

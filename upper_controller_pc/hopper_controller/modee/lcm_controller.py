@@ -141,7 +141,9 @@ class ModeELCMConfig:
     #   the motor's own high-rate velocity estimate (not the Python/Lcm qd).
     # - Applied per-phase (FLIGHT vs STANCE) so you can add a small amount in stance too.
     ak60_flight_damp_kd: float = 0
-    ak60_stance_damp_kd: float = 0.2
+    # 2026-07-19 stance anti-jitter: small motor-side damping using the
+    # driver's own high-rate velocity (much cleaner than the ~230 Hz LCM qd).
+    ak60_stance_damp_kd: float = 0.1
 
     # ===== Command shaping / demo mode =====
     # To keep the hop process smooth, we rate-limit the commanded desired velocity.
@@ -153,10 +155,8 @@ class ModeELCMConfig:
     demo_vx_mps: float = 0.0
     demo_vy_mps: float = 0.0  # Zero velocity - stationary hopping with Raibert stabilization
 
-    # Motor velocity (2026-07-07, reversed from 07-06): hopper_data_lcmt.qd now
-    # carries the AK60 CAN-reported velocity and ALL upper layers consume it
-    # directly -- ModeECore no longer differentiates q (qd_kin_from_q_diff=False
-    # in core.py; the EMA+MA conditioning chain still applies on top).
+    # Motor velocity: Mode1 uses hopper_data_lcmt.qd (AK60 CAN estimate) as
+    # the input to the controller-side EMA.
 
     # ===== RM M2006 (3x, output-shaft rad; the JETSON DRIVER owns the zero) =====
     # One sequence, two triggers (parameters tuned 2026-07-07 with run_rm_test.py:
@@ -729,7 +729,6 @@ class ModeELCMController:
                 "touchdown",
                 "liftoff",
                 "apex",
-                "s2s_active",
                 "status",
                 # joints
                 "q0",
@@ -868,6 +867,10 @@ class ModeELCMController:
                 "f_ref_w0",
                 "f_ref_w1",
                 "f_ref_w2",
+                # Mode1 vertical push energy
+                "energy_comp_fz",
+                "vz_up",
+                "energy_gate",
                 "thrust_sum_ref",
                 "thrust_sum",
                 "F_total_w0",
@@ -1111,7 +1114,6 @@ class ModeELCMController:
             touchdown = int(info.get("touchdown", 0))
             liftoff = int(info.get("liftoff", 0))
             apex = int(info.get("apex", 0))
-            s2s_active = int(info.get("s2s_active", 0))
             status = str(info.get("status", ""))
 
             if stance:
@@ -1163,6 +1165,15 @@ class ModeELCMController:
             omega_b_used = np.asarray(info.get("omega_b_used", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
             F_des_w = np.asarray(info.get("F_des_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
             f_ref_w = np.asarray(info.get("f_ref_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
+            energy_comp_fz = float(info.get("energy_comp_fz", float("nan")))
+            # Log the exact core signals; do not reconstruct the gate from vz.
+            # CASE PUSH is physical leg extension (qd_shift > 0), while vz_up
+            # remains useful for the SRB vertical-energy calculation.
+            vz_up = float(info.get(
+                "vz_up",
+                -v_hat_w[2] if np.isfinite(float(v_hat_w[2])) else float("nan"),
+            ))
+            energy_gate = int(info.get("energy_gate", 0))
             thrust_sum_ref = float(info.get("thrust_sum_ref", float("nan")))
             thrust_sum = float(info.get("thrust_sum", float("nan")))
             F_total_w = np.asarray(info.get("F_total_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
@@ -1191,7 +1202,6 @@ class ModeELCMController:
                 touchdown,
                 liftoff,
                 apex,
-                s2s_active,
                 status,
                 float(q[0]),
                 float(q[1]),
@@ -1312,6 +1322,9 @@ class ModeELCMController:
                 float(f_ref_w[0]),
                 float(f_ref_w[1]),
                 float(f_ref_w[2]),
+                float(energy_comp_fz),
+                float(vz_up),
+                int(energy_gate),
                 float(thrust_sum_ref),
                 float(thrust_sum),
                 float(F_total_w[0]),

@@ -13,7 +13,7 @@ FAKE_TAU=25 python3 -u modee_fake_robot.py --duration-s ${DUR:-12} \
   --init-roll-deg ${ROLL0:-10} --drop-start-s 999 > /tmp/att.log 2>&1 &
 MJ=$!
 sleep 2
-CAO_L0=${L0:-0.42} CAO_HOP_H=0.15 CAO_MODE=3 CAO_TAU=25 \
+CAO_L0=${L0:-0.42} CAO_HOP_H=0.15 CAO_TAU=25 \
   timeout 100 python3 -u run_cao_on_our_model.py > /tmp/att_ctl.log 2>&1 &
 CT=$!
 wait $MJ

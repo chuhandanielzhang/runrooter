@@ -1,5 +1,4 @@
-"""Launch Cao's ModeE controller configured for OUR 3RSR_package_2 plant geometry.
-Pair with cao_fake_robot.py (which simulates our model over LCM)."""
+"""Launch the current Mode1 controller on the 3RSR MuJoCo plant."""
 import os
 import sys
 import time
@@ -10,42 +9,34 @@ sys.path.insert(0, CONTROLLER_DIR)
 from modee.lcm_controller import ModeELCMController, ModeELCMConfig
 from modee.core import ModeEConfig
 
-import os
 cfg = ModeEConfig()
-# nominal leg length: our home is 0.369, but the mechanism reaches ~0.54;
-# give the controller push-off stroke like the real robot (l0 0.464)
+# MuJoCo plant mass differs from the measured hardware mass.
+cfg.mass_kg = float(os.environ.get("CAO_MASS", "2.73"))
 cfg.leg_l0_m = float(os.environ.get("CAO_L0", "0.42"))
 cfg.hop_height_m = float(os.environ.get("CAO_HOP_H", "0.20"))
-cfg.control_mode = int(os.environ.get("CAO_MODE", "3"))   # 1=legacy PD, 2=decouple+att upgrades, 3=+HLIP S2S
 cfg.tau_cmd_max_nm = (float(os.environ.get("CAO_TAU", "9.0")),) * 3
 cfg.mode_1d = os.environ.get("CAO_1D", "0") == "1"        # real robot runs 3D (mode_1d=False)
 cfg.prop_base_thrust_ratio = 0.10
 cfg.stance_use_props = True
-# CAO_PURE=1: leg-only operation (props never armed at runtime, enables
-# core.py no-prop liftoff omega gate). Works with any CAO_MODE.
-# NOTE 2026-07-09: CAO_MODE=1 now means "legacy stance PD" (the pre-upgrade
-# attitude law) -- it is NO LONGER remapped to mode2+pure-leg. Use CAO_PURE=1
-# explicitly for leg-only runs.
+# CAO_PURE=1 selects leg-only operation.
 _pure_leg = os.environ.get("CAO_PURE", "0") == "1"
 if _pure_leg:
     cfg.stance_use_props = False
     cfg.prop_base_thrust_ratio = 0.0
-# stance virtual-spring stiffness: default 1100 N/m is stiff (little visible
-# compression). Lower it (e.g. 500) for SLIP-style touchdown buffering.
 cfg.stance_kp_z = float(os.environ.get("CAO_KZ", "1100"))
 cfg.stance_kd_z = float(os.environ.get("CAO_KDZ", "20"))
 # optional attitude-loop overrides for the sim plant (defaults = core.py values)
 if os.environ.get("CAO_ST_KR"):
-    cfg.stance_kpp_x = cfg.stance_kpp_y = float(os.environ["CAO_ST_KR"])
+    cfg.stance_kpp = float(os.environ["CAO_ST_KR"])
 if os.environ.get("CAO_ST_KW"):
-    cfg.stance_kpd_x = cfg.stance_kpd_y = float(os.environ["CAO_ST_KW"])
+    cfg.stance_kpd = float(os.environ["CAO_ST_KW"])
 # SLIP-style stance allocation A/B (1=axial/side split, 0=legacy z/xy+lever).
 if os.environ.get("CAO_LEG_ALLOC"):
     cfg.stance_leg_frame_alloc = bool(int(os.environ["CAO_LEG_ALLOC"]))
 if os.environ.get("CAO_FL_KR"):
-    cfg.flight_kR_roll = cfg.flight_kR_pitch = float(os.environ["CAO_FL_KR"])
+    cfg.flight_kR = float(os.environ["CAO_FL_KR"])
 if os.environ.get("CAO_FL_KW"):
-    cfg.flight_kW_roll = cfg.flight_kW_pitch = float(os.environ["CAO_FL_KW"])
+    cfg.flight_kW = float(os.environ["CAO_FL_KW"])
 if os.environ.get("CAO_PROP_BASE"):
     cfg.prop_base_thrust_ratio = float(os.environ["CAO_PROP_BASE"])
 # Friction-cone modulation: total prop DOWNforce (N) in stance; leg fz raised
@@ -58,8 +49,6 @@ if os.environ.get("CAO_DOWNFORCE_TD"):
 # Controller-side friction coefficient (should match the plant floor mu).
 if os.environ.get("CAO_MU"):
     cfg.stance_mu = float(os.environ["CAO_MU"])
-if os.environ.get("CAO_S2S_BETA"):
-    cfg.s2s_pole_beta = float(os.environ["CAO_S2S_BETA"])
 # swing (flight foot tracking) gains — the closed-chain sim leg has more inertia
 # and joint damping than the real delta leg, so it may need stiffer swing PD.
 if os.environ.get("CAO_SW_KP"):
@@ -80,7 +69,10 @@ lcm_cfg.tau_out_max_nm = float(os.environ.get("CAO_TAU", "9.0"))
 # joint limit); their default safe_q_max=1.38 SAFE-latches mid-flight otherwise
 lcm_cfg.safe_q_max = 1.62
 
-print(f"ModeE on OUR model: l0={cfg.leg_l0_m} mode={cfg.control_mode} 1d={cfg.mode_1d}")
+print(
+    f"ModeE on OUR model: m={cfg.mass_kg} l0={cfg.leg_l0_m} "
+    f"hop={cfg.hop_height_m} mode=1 1d={cfg.mode_1d}"
+)
 ctl = ModeELCMController(modee_cfg=cfg, lcm_cfg=lcm_cfg)
 t1 = threading.Thread(target=ctl.run_lcm_handler, daemon=False)
 t2 = threading.Thread(target=ctl.run_controller, daemon=False)

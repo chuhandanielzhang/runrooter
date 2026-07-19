@@ -6,11 +6,16 @@ pkill -9 -f modee_fake_robot 2>/dev/null
 pkill -9 -f run_cao_on_our_model 2>/dev/null
 sleep 0.5
 
+CAO_L0=${CAO_L0:-0.42}
+CAO_HOP_H=${CAO_HOP_H:-0.20}
+
 FAKE_TAU=${FAKE_TAU:-25} MFR_PERM_BRANCH=${MFR_PERM_BRANCH:-0} python3 -u modee_fake_robot.py --duration-s ${DUR:-15} --drop-start-s 1.5 \
   --record-gif "${GIF:-/tmp/modee_on_sim.gif}" > /tmp/mfr.log 2>&1 &
 MJ=$!
 sleep 2
-CAO_L0=${CAO_L0:-0.42} CAO_HOP_H=${CAO_HOP_H:-0.20} CAO_MODE=${CAO_MODE:-3} CAO_TAU=${CAO_TAU:-25} CAO_ST_KR=${CAO_ST_KR:-} CAO_ST_KW=${CAO_ST_KW:-} CAO_FL_KR=${CAO_FL_KR:-} CAO_FL_KW=${CAO_FL_KW:-} CAO_PROP_BASE=${CAO_PROP_BASE:-} CAO_SW_KP=${CAO_SW_KP:-} CAO_SW_KD=${CAO_SW_KD:-} \
+CAO_L0=$CAO_L0 CAO_HOP_H=$CAO_HOP_H CAO_MASS=${CAO_MASS:-2.73} CAO_TAU=${CAO_TAU:-25} \
+  CAO_ST_KR=${CAO_ST_KR:-} CAO_ST_KW=${CAO_ST_KW:-} CAO_FL_KR=${CAO_FL_KR:-} CAO_FL_KW=${CAO_FL_KW:-} \
+  CAO_PROP_BASE=${CAO_PROP_BASE:-} CAO_SW_KP=${CAO_SW_KP:-} CAO_SW_KD=${CAO_SW_KD:-} \
   timeout 120 python3 -u run_cao_on_our_model.py > /tmp/mfr_ctl.log 2>&1 &
 CT=$!
 wait $MJ
