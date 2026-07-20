@@ -890,6 +890,13 @@ class ModeELCMController:
                 "v_to_cmd_m_s",
                 "desired_vz_from_apex_m_s",
                 "hop_height_m",
+                # FB-SLIP: TD-sized constant brake/push forces + plan
+                "fbslip_v_td_m_s",
+                "fbslip_f_brake_n",
+                "fbslip_x_c_plan_m",
+                "fbslip_f_push_n",
+                "fbslip_t_bottom_s",
+                "vz_lo_m_s",
                 # MPC debug
                 "mpc_status",
                 "mpc_u0_fx",
@@ -1343,6 +1350,12 @@ class ModeELCMController:
                 float(v_to_cmd_m_s),
                 float(desired_vz_from_apex_m_s),
                 float(hop_height_m),
+                float(info.get("fbslip_v_td_m_s", float("nan"))),
+                float(info.get("fbslip_f_brake_n", float("nan"))),
+                float(info.get("fbslip_x_c_plan_m", float("nan"))),
+                float(info.get("fbslip_f_push_n", float("nan"))),
+                float(info.get("fbslip_t_bottom_s", float("nan"))),
+                float(info.get("vz_lo_m_s", float("nan"))),
                 # MPC debug
                 str(info.get("mpc_status", "")),
                 float(mpc_u0[0]),

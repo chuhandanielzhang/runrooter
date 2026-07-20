@@ -360,51 +360,104 @@ class ModeEConfig:
     dt: float = 0.002
     mode_1d: bool = False
 
-    # ==================== STANCE Z: impedance + push spring ===============
-    # 2026-07-21 energyfail: MATLAB-style additive Kp*(E_des-E) pump was tried
-    # and reverted; keep the Mode1 push-spring law below.
-    # 2026-07-19 rollback (per user): the adaptive-stiffness compression
-    # spring, its k ceiling, and the command-force LPF were removed as
-    # unphysical patches -- the auto-sized k (3300..8000 N/m) excited the
-    # ~33 Hz leg mode through the sensing/actuation delay, which the legacy
-    # fixed-gain impedance never did. What remains:
-    #   COMPRESSION: the original world-height impedance (physical,
-    #     delay-stable):  f = kz*(l0 + hop_height_m - h_com) - bz*vz_up.
-    #     The compression depth is whatever m, v_td and kz give.
-    #   PUSH (world-Z gated, latched): one spring re-size at the bottom so
-    #     the work released from depth x0 back to l0 leaves the body at the
-    #     takeoff speed for hop_height_m plus the learned per-hop loss:
-    #       0.5*k_push*x0^2 = 0.5*m*v_to^2 + m*g_st*x0 + E_loss,
-    #       v_to = sqrt(2*g_up*hop_height_m).
-    #     Force blends over stance_push_blend_tau_s and is spring-shaped:
-    #     max at the bottom, zero at l0 (replaces the old chattering
-    #     energy pump).
-    #   DISCRETE layer (hop to hop): at every touchdown the measured apex
-    #   of the hop that just ended updates E_loss by
-    #   gamma*m*g*(hop_height_m - h_apex) (mode1_apex_adapt_gamma). Ideal
-    #   apex-error dynamics: e(n+1) = (1-gamma)*e(n) -- a 1-D contraction,
-    #   deadbeat at gamma = 1 (Koditschek-Buehler / Saranli energy
-    #   regulation).
+    # ============ STANCE Z: FORCE-BUDGETED SLIP (FB-SLIP, 2026-07-21) ======
+    # ONE task-level knob: hop_height_m. Everything else is derived from the
+    # ballistics of the CURRENT hop plus fixed ROBOT constants (mass, leg
+    # force budget, leg stroke). No per-height gain retuning, no memory of
+    # previous hops.
+    #
+    #   Ballistic pair:  v_to = sqrt(2*g_up*h),   v_td = measured at TD.
+    #
+    #   CONSTANT-FORCE stance (2026-07-21 v2). v1 realized compression as a
+    #   TD-sized linear spring; the budget-consistent stiffness came out at
+    #   8000-11000 N/m and rang the leg mode through the sensing/actuation
+    #   delay (02:45 log: vz swung -3.0 -> +2.8 m/s in 6 ms, the vibration
+    #   spike latched PUSH at x_z ~ 20 mm and the remaining stroke could
+    #   not reach v_to -> hops decayed). Any position-spring realization
+    #   inherits that trade-off, so both sub-phases are now PURE FORCE
+    #   schedules -- zero position gain, zero velocity gain, nothing to
+    #   ring -- and constant force is also the MINIMUM-PEAK-FORCE solution
+    #   for a given stroke (half the peak of a linear spring).
+    #
+    #   COMPRESSION (sized once at touchdown, from the measured v_td):
+    #     Brake at the design force F_b = stance_brake_force_g * m * g_st.
+    #     Constant deceleration stops the body in
+    #       x_c = m*v_td^2 / (2*(F_b - m*g_st))
+    #     Higher hop -> larger v_td -> DEEPER compression at the SAME gentle
+    #     force; lower hop -> shallow. If x_c would exceed the stroke, the
+    #     force is raised to m*g_st + m*v_td^2/(2*stroke) and capped at
+    #     F_max = leg_force_budget_g * m * g. The force ramps in over
+    #     stance_brake_ramp_s (no impact step at touchdown).
+    #
+    #   PUSH (world-Z gated, latched): constant force sized so the work
+    #     over the remaining stroke x_up (current height deficit to l0)
+    #     delivers the takeoff energy:
+    #       F_push = m*g_st + m*v_to^2 / (2*x_up),   F_push <= F_max
+    #     A current-hop velocity floor keeps pushing while vz_up < v_to;
+    #     no previous-hop apex or loss estimate enters the command.
+    #
+    #   FLIGHT (ballistic touchdown guard): after liftoff at measured vz_lo
+    #     the body physically cannot return to the ground before
+    #     T_return = 2*vz_lo/g. Touchdown is accepted only after
+    #     flight_td_guard_kappa * T_return AND while the body is descending,
+    #     so flight-phase leg retraction/vibration can no longer enter
+    #     stance mid-air.
     use_energy_compensation: bool = True
     hop_height_m: float = 0.07
+    # ---- Robot constants for FB-SLIP (not per-height tuning knobs) ----
+    # Hard peak-force budget as a multiple of body weight (F_max = beta*m*g).
+    leg_force_budget_g: float = 5.0
+    # Usable vertical leg stroke for compression (m).
+    leg_stroke_max_m: float = 0.06
+    # Design braking force as a multiple of stance weight (alpha*m*g_st).
+    # Must be > 1 (net upward force while braking). Sets how deep a given
+    # landing speed compresses: x_c = v_td^2 / (2*g_st*(alpha-1)).
+    stance_brake_force_g: float = 3.0
+    # Brake force rise time after touchdown (s); avoids a force step at TD.
+    stance_brake_ramp_s: float = 0.015
+    # Ballistic TD guard: accept TD after kappa*T_return (T_return=2*vz_lo/g).
+    # 03:52 log: kappa=0.5 opens the window exactly at the apex, and the
+    # kinematic vz_lo under-reads near full leg extension (logged 0.74 vs
+    # 1.15 true from the 232 ms flight time), so a leg-retraction crossing
+    # at 78 ms was accepted as touchdown -> 26 ms fake stance -> 275 N cap
+    # kick -> tumble. The body cannot physically return before T_return
+    # (descent brake only makes it later), so a large kappa is safe on
+    # flat ground; 0.75 gives margin against the vz_lo under-estimate.
+    flight_td_guard_kappa: float = 0.75
+    # Accept TD only while descending: vz_up <= this gate (m/s).
+    flight_td_descend_vz_mps: float = 0.05
     # PUSH gate on WORLD-Z upward velocity (m/s) + consecutive-tick confirm.
-    stance_push_vz_mps: float = 0.05
-    stance_push_confirm_steps: int = 3
+    stance_push_vz_mps: float = 0.02
+    stance_push_confirm_steps: int = 2
     # First-order blend of the push spring force at the latch (s).
     stance_push_blend_tau_s: float = 0.01
     # Sensor LPF on the world-Z velocity used by the PUSH gate only (leg
     # vibration puts +-2 m/s spikes on the kinematic vz estimate).
-    stance_vz_lpf_tau_s: float = 0.015
-    # Earliest PUSH latch after touchdown (s). Real bottoms arrive >= 30 ms
-    # after TD at these drop heights; chatter stances latched PUSH at 16 ms.
-    stance_push_min_stance_s: float = 0.03
+    stance_vz_lpf_tau_s: float = 0.008
+    # SENSOR floor on the earliest PUSH latch (s). The real gate is
+    # PHYSICAL, computed per hop at TD from constant-deceleration
+    # kinematics (a = v_td^2 / (2*x_c)  =>  stop time t = v_td/a):
+    #   t_bottom = t_ramp/2 + 2*x_c/v_td
+    # (first term: deceleration not yet built up during the force ramp).
+    # PUSH is blocked before stance_push_bottom_eta * t_bottom, so impact
+    # ringing right after TD can no longer latch PUSH ahead of the true
+    # bottom (03:29 log ST2: +2.9 m/s spike latched at 36 ms while the
+    # bottom arrived at ~60 ms).
+    stance_push_min_stance_s: float = 0.01
+    # Safety factor (<1) on the predicted time-to-bottom: v_td is a noisy
+    # kinematic measurement and a genuinely early bottom must not be missed.
+    stance_push_bottom_eta: float = 0.8
+    # Current-hop takeoff-speed feedback. During PUSH:
+    #   F_catch = m*g_st + kp_v*max(0, v_to-vz_up)
+    # and the commanded force is max(push spring, F_catch). Units N/(m/s).
+    stance_push_vz_kp: float = 100.0
 
     # Leg length, contact phases, and vertical stance force.
     leg_l0_m: float = 0.461
-    # Original world-height impedance gains (proven delay-stable; the ~33 Hz
-    # leg mode only rang once stiffness went well above this level).
+    # Fallback world-height impedance (used only if the TD-sized FB-SLIP
+    # spring is unavailable, e.g. controller enabled mid-stance).
     stance_kp_z: float = 1400.0
-    stance_kd_z: float = 10.0
+    stance_kd_z: float = 6.0
     stance_fz_min: float = 0.0
     # Per-sample cap on the commanded vertical force; the downstream
     # joint-torque rescale remains the hardware protection.
@@ -429,7 +482,7 @@ class ModeEConfig:
     qd_ema_lambda: float = 0.4
 
     # Flight placement (classic Raibert) / swing PD.
-    flight_kv: float = 0.14
+    flight_kv: float = 0.16
     flight_kr: float = 0.09
     flight_stepper_lim_m: float = 0.13
     swing_kp_xy: float = 60.0
@@ -467,6 +520,19 @@ class ModeEConfig:
     prop_flight_brake_ratio: float = 0.10
     # Descent detection threshold on world vz (m/s, up-positive).
     prop_flight_brake_vz_mps: float = 0.10
+    # FLIGHT world-Z prop force budget (fraction of m*g), dual to the leg's
+    # F_max = beta*m*g. The attitude allocator's forward-floor collective
+    # lift silently raises the TOTAL thrust far above the commanded
+    # baseline (03:36 log: baseline 0.55-5.5 N commanded, 4-19.5 N
+    # delivered = up to 0.35*m*g), so the effective descent gravity
+    # wandered between 0.65g and g. That unmodeled vertical force breaks
+    # exactly the ballistics FB-SLIP plans on (v_td, apex, TD guard) and
+    # produced the weak-hop chatter. In FLIGHT the allocation sum cap is
+    #   sum(thrusts) <= flight_thrust_sum_max_ratio * m * g,
+    # the attitude differential is scaled direction-preserving to fit, so
+    # props remain a BOUNDED gravity modulation:
+    #   g_dn >= g*(1 - flight_thrust_sum_max_ratio).
+    flight_thrust_sum_max_ratio: float = 0.20
     # 2026-07-19 (per user): 3D / bidirectional thrust DISABLED everywhere.
     # prop_bidir=False makes negative thrust idle at pwm_min in the PWM map,
     # forces forward-only floors in the stance overlays / daisy chain, and
@@ -481,9 +547,6 @@ class ModeEConfig:
     pwm_min_us: float = 1000.0
     pwm_max_us: float = 2000.0
     prop_k_thrust: float = 1.24e-5
-
-    # Hop-to-hop apex return-map gain for the active push spring.
-    mode1_apex_adapt_gamma: float = 0.4
 
     # State estimation.
     use_fc_quat: bool = False
@@ -814,18 +877,18 @@ class ModeECore:
         self._push_vel_ring = np.zeros((_tail_n, 3), dtype=float)
         self._push_vel_ring_i: int = 0
         self._push_vel_ring_cnt: int = 0
-        # Mode1 push-spring state (per-stance parts reset at touchdown;
-        # _mode1_Eloss persists across hops -- it is the apex adaptation).
+        # Mode1 push-spring state (reset at every touchdown).
         self._mode1_push_latched: bool = False
         self._mode1_push_confirm_count: int = 0
-        self._mode1_k_comp: float | None = None
+        self._mode1_f_brake: float | None = None
+        self._mode1_x_c_plan: float = 0.0
+        self._mode1_t_bottom: float = 0.0
         self._mode1_k_boost: float = 0.0
         self._mode1_v_td: float = 0.0
         self._mode1_x0: float = 0.0
         self._mode1_boost_f_state: float = 0.0
         # LPF'd world-Z up-velocity used only inside the stance-Z law.
         self._mode1_vz_lpf: float | None = None
-        self._mode1_Eloss: float = 0.0
         # "auto" reverse-policy hysteresis latch (see _allocate_prop_thrust).
         self._prop_rev_on: bool = False
         # Stance kW rate observer state (see stance_kw_obs_* config):
@@ -1024,13 +1087,14 @@ class ModeECore:
         self._push_vel_ring_cnt = 0
         self._mode1_push_latched = False
         self._mode1_push_confirm_count = 0
-        self._mode1_k_comp = None
+        self._mode1_f_brake = None
+        self._mode1_x_c_plan = 0.0
+        self._mode1_t_bottom = 0.0
         self._mode1_k_boost = 0.0
         self._mode1_v_td = 0.0
         self._mode1_x0 = 0.0
         self._mode1_boost_f_state = 0.0
         self._mode1_vz_lpf = None
-        self._mode1_Eloss = 0.0
         self._prop_rev_on = False
         self._kw_obs_w[:] = 0.0
         self._kw_obs_tau_prev[:] = 0.0
@@ -1857,7 +1921,46 @@ class ModeECore:
         if (not bool(self._stance)) and np.isfinite(float(q_shift)):
             lo_t = float(self._lo_t) if self._lo_t is not None else 0.0
             t_in_flight = float(self.sim_time) - lo_t
-            cond_td = (float(q_shift) <= -td_thr) and (t_in_flight >= phase_min_t)
+            # ---- FB-SLIP ballistic touchdown guard ----
+            # After liftoff at measured vz_lo the body cannot physically be
+            # back at the ground before T_return = 2*vz_lo/g. Block TD for
+            # kappa*T_return, and additionally require the body to be
+            # DESCENDING: mid-flight leg retraction/vibration crosses the
+            # length threshold while ascending and used to fake a stance.
+            t_td_guard = float(phase_min_t)
+            if (
+                self._lo_t is not None
+                and self._vz_lo is not None
+                and np.isfinite(float(self._vz_lo))
+                and float(self._vz_lo) > 0.05
+            ):
+                kappa_td = float(_clipf(
+                    float(getattr(self.cfg, "flight_td_guard_kappa", 0.5)),
+                    0.0, 1.0,
+                ))
+                t_return = 2.0 * float(self._vz_lo) / float(
+                    max(1e-3, float(self.gravity))
+                )
+                t_td_guard = float(_clipf(
+                    kappa_td * t_return, float(phase_min_t), 0.5
+                ))
+            vz_up_now = -float(self._v_hat_w[2])
+            descending_ok = (not np.isfinite(vz_up_now)) or (
+                vz_up_now <= float(getattr(
+                    self.cfg, "flight_td_descend_vz_mps", 0.05
+                ))
+            )
+            # Safety: the descend gate uses the IMU-integrated flight
+            # velocity; if that estimate misbehaves it must never block a
+            # real landing forever. Past twice the guard window (>=0.6 s)
+            # fall back to the plain length threshold.
+            if t_in_flight >= max(0.6, 2.0 * t_td_guard):
+                descending_ok = True
+            cond_td = (
+                (float(q_shift) <= -td_thr)
+                and (t_in_flight >= t_td_guard)
+                and bool(descending_ok)
+            )
 
             if bool(cond_td):
                 touchdown_evt = True
@@ -1869,9 +1972,8 @@ class ModeECore:
                 # T = sqrt(2h/g_up) + sqrt(2h/g_dn)
                 #   => h = T^2 / (2*(1/sqrt(g_up) + 1/sqrt(g_dn))^2)
                 # (reduces to g*T^2/8 when g_up == g_dn).
-                # Window >= 0.12 s (apex >= ~1.8 cm): the 23:14 log had 90 ms
-                # chatter "flights" pass the old 0.06 s window with a fake
-                # 1 cm apex, each pumping ~1.3 J into E_loss.
+                # Window >= 0.12 s rejects short chatter "flights". This apex
+                # estimate is diagnostic only; it does not affect later hops.
                 if self._lo_t is not None:
                     T_fl = float(self.sim_time) - float(self._lo_t)
                     if 0.12 <= T_fl <= 1.5:
@@ -1904,23 +2006,6 @@ class ModeECore:
                         self._z_apex_actual = float(
                             T_fl * T_fl / (2.0 * s_arc * s_arc)
                         )
-                        # Discrete apex-return-map layer (Koditschek-Buehler /
-                        # Saranli energy regulation): fold the apex error of
-                        # the hop that just ended into E_loss, consumed by the
-                        # next push-spring sizing. Ideal-model error dynamics
-                        # are e(n+1) = (1-gamma)*e(n): a 1-D contraction,
-                        # deadbeat at gamma=1.
-                        gam = float(_clipf(
-                            float(self.cfg.mode1_apex_adapt_gamma), 0.0, 1.0
-                        ))
-                        self._mode1_Eloss += (
-                            gam * float(self.mass) * float(self.gravity)
-                            * (float(self.cfg.hop_height_m)
-                               - float(self._z_apex_actual))
-                        )
-                        self._mode1_Eloss = float(_clipf(
-                            self._mode1_Eloss, -2.0, 8.0
-                        ))
                 self._apex_reached = False
                 # Trigger MPC solve on the very first stance step.
                 self._mpc_counter = max(1, int(self.cfg.mpc_decimation)) - 1
@@ -1937,11 +2022,12 @@ class ModeECore:
                 self._push_vel_ring[:] = 0.0
                 self._push_vel_ring_i = 0
                 self._push_vel_ring_cnt = 0
-                # Re-seed the Mode-1 two-spring per-stance state (E_loss is the
-                # cross-hop apex adaptation and intentionally survives).
+                # Re-seed the Mode-1 push-spring state for this stance.
                 self._mode1_push_latched = False
                 self._mode1_push_confirm_count = 0
-                self._mode1_k_comp = None
+                self._mode1_f_brake = None
+                self._mode1_x_c_plan = 0.0
+                self._mode1_t_bottom = 0.0
                 self._mode1_k_boost = 0.0
                 self._mode1_v_td = 0.0
                 self._mode1_x0 = 0.0
@@ -1976,6 +2062,94 @@ class ModeECore:
                     )
                 except Exception:
                     self._stance_prof_inited = False
+
+                # ---- FB-SLIP: size the constant BRAKE force ONCE at TD ----
+                # Constant-deceleration braking at the design force
+                # F_b = alpha*m*g_st stops the measured v_td in
+                #   x_c = m*v_td^2 / (2*(F_b - m*g_st)).
+                # If x_c exceeds the stroke, raise the force to
+                # m*g_st + m*v_td^2/(2*stroke) and cap at F_max. Pure
+                # feedforward: no position/velocity gain, nothing to ring.
+                try:
+                    m_td = float(self.mass)
+                    g_raw = float(self.gravity)
+                    rho_st_td = (
+                        float(_clipf(
+                            float(self.cfg.prop_stance_base_thrust_ratio),
+                            0.0, 0.8,
+                        ))
+                        if (
+                            bool(self._props_armed_rt)
+                            and bool(self.cfg.stance_use_props)
+                        )
+                        else 0.0
+                    )
+                    g_st_td = g_raw * (1.0 - rho_st_td)
+                    v_dn = float(v_base_from_foot_w[2])
+                    if not np.isfinite(v_dn):
+                        v_dn = float(self._v_hat_w[2])
+                    v_td_meas = float(max(0.0, v_dn))
+                    # BALLISTIC floor on v_td from the CURRENT flight time
+                    # (03:59 log: kinematic read 0.34 m/s on a 220 ms
+                    # flight whose ballistics say 1.05; the low v_td
+                    # collapsed t_bottom to 27 ms, PUSH latched at 28 ms
+                    # while still descending, 247 N fired before the
+                    # bottom -> bounce chatter). Symmetric-arc kinematics
+                    #   v_td = g*T_flight/2
+                    # uses only the phase-machine timestamps, no velocity
+                    # estimator. With the descent brake it slightly
+                    # OVER-estimates v_td, which only opens the PUSH gate
+                    # later (conservative); the constant F_brake does not
+                    # depend on v_td at all.
+                    if self._lo_t is not None:
+                        T_fl_td = float(self.sim_time) - float(self._lo_t)
+                        if 0.1 <= T_fl_td <= 1.0:
+                            v_td_bal = float(_clipf(
+                                0.5 * g_raw * T_fl_td, 0.0, 3.0
+                            ))
+                            v_td_meas = float(max(v_td_meas, v_td_bal))
+                    self._mode1_v_td = v_td_meas
+                    f_max_td = float(max(
+                        2.0 * m_td * g_raw,
+                        float(self.cfg.leg_force_budget_g) * m_td * g_raw,
+                    ))
+                    alpha_b = float(max(
+                        1.2, float(self.cfg.stance_brake_force_g)
+                    ))
+                    f_b = alpha_b * m_td * g_st_td
+                    x_c = (
+                        m_td * v_td_meas * v_td_meas
+                        / max(1e-6, 2.0 * (f_b - m_td * g_st_td))
+                    )
+                    stroke = float(max(
+                        0.015, float(self.cfg.leg_stroke_max_m)
+                    ))
+                    if x_c > stroke:
+                        x_c = stroke
+                        f_b = (
+                            m_td * g_st_td
+                            + m_td * v_td_meas * v_td_meas
+                            / (2.0 * stroke)
+                        )
+                    self._mode1_x_c_plan = float(x_c)
+                    self._mode1_f_brake = float(min(f_b, f_max_td))
+                    # Predicted time-to-bottom (constant-deceleration
+                    # kinematics + half the force ramp, during which the
+                    # deceleration is not yet built up):
+                    #   a = v_td^2/(2*x_c)  =>  t_stop = v_td/a = 2*x_c/v_td
+                    #   t_bottom = t_ramp/2 + 2*x_c/v_td
+                    # Consumed by the PUSH gate: no latch before
+                    # stance_push_bottom_eta * t_bottom.
+                    t_ramp_td = float(max(
+                        1e-3, float(self.cfg.stance_brake_ramp_s)
+                    ))
+                    self._mode1_t_bottom = float(
+                        0.5 * t_ramp_td
+                        + 2.0 * x_c / max(0.1, v_td_meas)
+                    )
+                except Exception:
+                    self._mode1_f_brake = None
+                    self._mode1_t_bottom = 0.0
 
         # ===== Hopper4-style liftoff =====
         if bool(self._stance) and np.isfinite(float(q_shift)):
@@ -2450,7 +2624,14 @@ class ModeECore:
                 # also acts on h_com.
                 x_z = float(max(0.0, l0 - h_com))
                 vz_up = -float(self._v_hat_w[2])
-                fz_cap = float(self.cfg.stance_fz_max)
+                # Peak-force budget: the FB-SLIP F_max = beta*m*g, further
+                # limited by the absolute hardware cap stance_fz_max.
+                f_max_z = float(max(
+                    2.5 * float(self.mass) * float(self.gravity),
+                    float(self.cfg.leg_force_budget_g)
+                    * float(self.mass) * float(self.gravity),
+                ))
+                fz_cap = float(min(float(self.cfg.stance_fz_max), f_max_z))
 
                 props_z = bool(self._props_armed_rt)
                 rho_st = (
@@ -2492,34 +2673,57 @@ class ModeECore:
                     )
                 vz_f = float(self._mode1_vz_lpf)
 
-                # COMPRESSION: the ORIGINAL world-height impedance
-                # (2026-07-19 rollback per user -- the adaptive-stiffness
-                # spring rang the ~33 Hz leg mode; this fixed-gain law
-                # never did). Preload at touchdown ~ kz*hop_height plus
-                # a modest slope; depth is whatever m, v_td and kz give.
-                kz = float(self.cfg.stance_kp_z)
-                h_des = l0 + float(self.cfg.hop_height_m)
-                f_comp = kz * (h_des - h_com) - bz * vz_up
-
-                # PUSH latch on the FILTERED world-Z velocity: the body
-                # has passed the bottom when vz turns positive.
-                # Debounced, blocked for the first
-                # stance_push_min_stance_s of the stance (real bottoms
-                # arrive later; only chatter latched at 16 ms), then
-                # held until liftoff.
+                # COMPRESSION (FB-SLIP v2): CONSTANT brake force sized
+                # once at TD (see the TD block), ramped in over
+                # stance_brake_ramp_s so there is no force step at
+                # impact. Pure feedforward -- no position or velocity
+                # gain, so the sensing/actuation delay has nothing to
+                # ring (the TD-sized linear spring at 8000-11000 N/m
+                # did, 02:45 log).
                 td_t_z = (
                     float(self._td_t)
                     if self._td_t is not None
                     else float(self.sim_time)
                 )
                 t_in_st_z = float(self.sim_time) - td_t_z
+                if self._mode1_f_brake is not None:
+                    t_ramp = float(max(
+                        1e-3, float(self.cfg.stance_brake_ramp_s)
+                    ))
+                    ramp = float(_clipf(t_in_st_z / t_ramp, 0.0, 1.0))
+                    f_comp = ramp * float(self._mode1_f_brake)
+                else:
+                    # Fallback fixed impedance (only if the controller was
+                    # enabled mid-stance and no TD sizing exists).
+                    kz = float(self.cfg.stance_kp_z)
+                    h_des = l0 + float(self.cfg.hop_height_m)
+                    f_comp = kz * (h_des - h_com) - bz * vz_up
+                f_comp = float(min(float(f_comp), f_max_z))
+
+                # PUSH latch on the FILTERED world-Z velocity: the body
+                # has passed the bottom when vz turns positive.
+                # Debounced, and PHYSICALLY gated: constant-deceleration
+                # braking predicts the bottom at
+                #   t_bottom = t_ramp/2 + 2*x_c/v_td
+                # so no latch is accepted before eta_b*t_bottom -- impact
+                # ringing right after TD cannot fire PUSH ahead of the
+                # true bottom. stance_push_min_stance_s remains only as a
+                # small sensor floor.
+                eta_b = float(_clipf(
+                    float(getattr(
+                        self.cfg, "stance_push_bottom_eta", 0.8
+                    )),
+                    0.0, 1.0,
+                ))
+                t_push_gate = float(max(
+                    float(self.cfg.stance_push_min_stance_s),
+                    eta_b * float(self._mode1_t_bottom),
+                ))
                 latch_evt = False
                 if not bool(self._mode1_push_latched):
                     if (
                         vz_f > float(self.cfg.stance_push_vz_mps)
-                        and t_in_st_z >= float(
-                            self.cfg.stance_push_min_stance_s
-                        )
+                        and t_in_st_z >= t_push_gate
                     ):
                         self._mode1_push_confirm_count += 1
                     else:
@@ -2534,33 +2738,27 @@ class ModeECore:
                         latch_evt = True
 
                 if latch_evt:
-                    # Push spring: released work from the current depth
-                    # x0 back to l0 equals the takeoff kinetic energy
-                    # for hop_height_m, the lift against the STANCE
-                    # effective gravity, and the per-hop loss estimate
-                    # learned by the apex return map:
-                    #   0.5*k_push*x0^2
-                    #     = 0.5*m*v_to^2 + m*g_st*x0 + E_loss
+                    # CONSTANT push force (FB-SLIP v2): the work over the
+                    # remaining stroke x0 (current height deficit to l0)
+                    # delivers the takeoff energy for hop_height_m:
+                    #   F_push*x0 = 0.5*m*v_to^2 + m*g_st*x0
+                    #   => F_push = m*g_st + m*v_to^2/(2*x0)
                     # with v_to = sqrt(2*g_up*h): the ascent collective
                     # keeps pushing after liftoff, so the leg only has
                     # to supply the (1 - rho_up) share of the apex
-                    # energy. x0 is the WORLD-Z height deficit at the
-                    # bottom, not the leg compression.
-                    x0 = float(max(5e-3, x_z))
+                    # energy. Capped at the F_max budget. Feedforward
+                    # only -- no gain on position/velocity, no ringing.
+                    x0 = float(max(0.01, x_z))
                     v_to = float(np.sqrt(
                         2.0 * g_up
                         * float(max(0.0, float(self.cfg.hop_height_m)))
                     ))
-                    E_need = (
-                        0.5 * m * v_to * v_to
-                        + m * g_st * x0
-                        + float(self._mode1_Eloss)
+                    f_push = (
+                        m * g_st
+                        + m * v_to * v_to / (2.0 * x0)
                     )
-                    E_need = float(max(0.25 * m * g_st * x0, E_need))
-                    k_push = 2.0 * E_need / (x0 * x0)
-                    self._mode1_k_boost = float(
-                        min(k_push, fz_cap / x0)
-                    )
+                    # _mode1_k_boost now stores the CONSTANT push force (N).
+                    self._mode1_k_boost = float(min(f_push, fz_cap))
                     self._mode1_x0 = x0
                     # Blend starts from the compression force for
                     # continuity.
@@ -2571,10 +2769,24 @@ class ModeECore:
                     getattr(self.cfg, "use_energy_compensation", True)
                 )
                 if energy_gate:
-                    # Pure spring during push (no damping), on the
-                    # WORLD-Z height deficit: force reaches zero exactly
-                    # when the body height reaches l0, moving at v_to.
-                    f_push_tgt = float(self._mode1_k_boost) * x_z
+                    # CONSTANT push force until liftoff (LO event zeroes
+                    # it); a current-hop velocity floor keeps pushing
+                    # while vz_up < v_to.
+                    f_push_const = float(self._mode1_k_boost)
+                    v_to_now = float(np.sqrt(
+                        2.0 * g_up
+                        * float(max(0.0, float(self.cfg.hop_height_m)))
+                    ))
+                    v_err = float(max(0.0, v_to_now - vz_f))
+                    f_push_catch = (
+                        m * g_st
+                        + float(self.cfg.stance_push_vz_kp) * v_err
+                        if v_err > 0.0
+                        else 0.0
+                    )
+                    f_push_tgt = float(max(
+                        f_push_const, f_push_catch
+                    ))
                     tau_blend = float(max(
                         0.0, float(self.cfg.stance_push_blend_tau_s)
                     ))
@@ -2606,10 +2818,12 @@ class ModeECore:
                     springForce_scalar = 0.0
 
                 f_ref[2] = float(springForce_scalar)
+                # Hard force budget: never exceed F_max (nor the hardware
+                # cap), in ANY stance sub-phase.
                 f_ref[2] = float(_clipf(
                     float(f_ref[2]),
                     float(self.cfg.stance_fz_min),
-                    float(self.cfg.stance_fz_max),
+                    float(fz_cap),
                 ))
         except Exception:
             pass
@@ -2875,6 +3089,18 @@ class ModeECore:
         props_on = bool(props_enabled_ctrl)
         if not props_on:
             thrust_sum_max = 0.0
+        elif not bool(self._stance):
+            # FLIGHT: hard world-Z force budget so the props stay a BOUNDED
+            # gravity modulation (see flight_thrust_sum_max_ratio). The big
+            # stance cap (thrust_total_ratio_max) exists for contact attitude
+            # authority and must not leak into the ballistic phase.
+            thrust_sum_max = float(min(
+                thrust_sum_max,
+                float(self.mass) * float(self.gravity)
+                * float(max(0.0, float(
+                    self.cfg.flight_thrust_sum_max_ratio
+                ))),
+            ))
         if bool(self._stance):
             # --- Stance: closed-form leg (fz + fxy) + prop collaboration ---
             F_des = np.asarray(f_ref, dtype=float).reshape(3).copy()
@@ -3310,6 +3536,15 @@ class ModeECore:
             "vz_lo_m_s": float(self._vz_lo) if self._vz_lo is not None else float("nan"),
             "v_to_cmd_m_s": float(self._v_to_cmd),
             "hop_height_m": float(self.cfg.hop_height_m),
+            # FB-SLIP telemetry: TD-sized constant brake force and plan.
+            "fbslip_v_td_m_s": float(self._mode1_v_td),
+            "fbslip_f_brake_n": (
+                float(self._mode1_f_brake)
+                if self._mode1_f_brake is not None else float("nan")
+            ),
+            "fbslip_x_c_plan_m": float(self._mode1_x_c_plan),
+            "fbslip_f_push_n": float(self._mode1_k_boost),
+            "fbslip_t_bottom_s": float(self._mode1_t_bottom),
             # Flight-time apex measurement h = g*T^2/8 (log-only telemetry).
             "z_apex_actual_m": float(self._z_apex_actual),
             # MPC debug
