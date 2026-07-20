@@ -361,6 +361,8 @@ class ModeEConfig:
     mode_1d: bool = False
 
     # ==================== STANCE Z: impedance + push spring ===============
+    # 2026-07-21 energyfail: MATLAB-style additive Kp*(E_des-E) pump was tried
+    # and reverted; keep the Mode1 push-spring law below.
     # 2026-07-19 rollback (per user): the adaptive-stiffness compression
     # spring, its k ceiling, and the command-force LPF were removed as
     # unphysical patches -- the auto-sized k (3300..8000 N/m) excited the
