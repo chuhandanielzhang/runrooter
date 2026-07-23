@@ -23,4 +23,6 @@ fi
 # IMU coordinate UNCHANGED: --rot z150,y-90 makes the DDS transform EXACTLY reproduce the
 # old USB px4_bridge (--raw --rot z150,y-90) frame. Only comms (DDS/TELEM2) + rate (500Hz)
 # changed -- the published rpy/acc/gyro/quat are byte-for-byte the same as before.
-exec python3 "$HERE/px4_dds_bridge.py" --rot z150,y-90 --publish-hz 500 --print-hz 2 $IMU_ARGS "$@"
+# 2026-07-23: props run UNIDIRECTIONAL (--no-bidir): ESC 3D mode kept OFF (it did not
+# persist across power cycles on the Hobbywing 4-in-1). Requires DSHOT_3D_ENABLE=0.
+exec python3 "$HERE/px4_dds_bridge.py" --rot z150,y-90 --publish-hz 500 --print-hz 2 --no-bidir --prop-reverse "" $IMU_ARGS "$@"

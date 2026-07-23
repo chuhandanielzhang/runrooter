@@ -1,12 +1,17 @@
 # CANable2 (slcan firmware, CDC-ACM tty) -> stable name + systemd device unit.
 #
 # Why: /dev/ttyACM* renumbers on every USB re-enumeration, and slcand keeps the
-# DEAD old tty open forever ("can0 up but zero frames"). This rule gives the
-# adapter a stable /dev/canable symlink AND a systemd device unit
-# (dev-canable.device via SYSTEMD_ALIAS), so canable.service can use
-# BindsTo=dev-canable.device: unplug/re-enumerate -> systemd kills the zombie
+# DEAD old tty open forever ("can0 up but zero frames"). These rules give each
+# adapter a stable /dev/canable* symlink AND a systemd device unit
+# (dev-canable*.device via SYSTEMD_ALIAS), so canable*.service can use
+# BindsTo=dev-canable*.device: unplug/re-enumerate -> systemd kills the zombie
 # slcand; device back -> the device unit's Wants pulls the service up again.
 #
-# Match by ID_SERIAL (contains "CANable2") instead of VID:PID so a firmware
-# update or replacement unit keeps working. Install to /etc/udev/rules.d/.
-SUBSYSTEM=="tty", ENV{ID_SERIAL}=="*CANable2*", SYMLINK+="canable", TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/canable"
+# TWO adapters since 2026-07-23 (wheel bus added), so matching must be by the
+# UNIQUE serial suffix -- a bare "*CANable2*" pattern made the /dev/canable
+# symlink flip to whichever adapter enumerated last (legs on the wrong bus!).
+#   207D36B73945 -> /dev/canable  (legs AK60/DM4310 bus, can0)
+#   209736B03945 -> /dev/canable2 (DM-H6215 wheel bus,   can1)
+# Replacing an adapter = update the serial here. Install to /etc/udev/rules.d/.
+SUBSYSTEM=="tty", ENV{ID_SERIAL}=="*CANable2*207D36B73945", SYMLINK+="canable", TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/canable"
+SUBSYSTEM=="tty", ENV{ID_SERIAL}=="*CANable2*209736B03945", SYMLINK+="canable2", TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/canable2"

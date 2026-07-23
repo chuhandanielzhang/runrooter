@@ -232,10 +232,11 @@ def parse_args():
                    help="disable prop bridging (IMU only)")
     p.add_argument("--pwm-channel", default="motor_pwm_lcmt",
                    help="LCM channel carrying prop PWM commands")
-    p.add_argument("--prop-map", default="1,2,3",
+    p.add_argument("--prop-map", default="1:1,2:2,3:3",
                    help="pwm_values index -> actuator-set index, as a CSV of "
-                        "'pwmIdx:setN' or just '1,2,3' meaning pwm[1]->set1, "
-                        "pwm[2]->set2, pwm[3]->set3 (DO_SET_ACTUATOR param1..3).")
+                        "'pwmIdx:setN'. 2026-07-18 physical map: "
+                        "M1 pwm[1]->MAIN1/set1, M2 pwm[2]->MAIN2/set2, "
+                        "M3 pwm[3]->MAIN3/set3.")
     p.add_argument("--pwm-min", type=float, default=1000.0, help="pwm_us at 0 throttle")
     p.add_argument("--pwm-max", type=float, default=2000.0, help="pwm_us at full throttle")
     p.add_argument("--prop-rate", type=float, default=150.0,

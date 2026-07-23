@@ -12,3 +12,4 @@ from .hopper_imu_lcmt import hopper_imu_lcmt as hopper_imu_lcmt
 from .motor_pwm_lcmt import motor_pwm_lcmt as motor_pwm_lcmt
 from .rm_esc_cmd_lcmt import rm_esc_cmd_lcmt as rm_esc_cmd_lcmt
 from .rm_esc_data_lcmt import rm_esc_data_lcmt as rm_esc_data_lcmt
+from .wheel_cmd_lcmt import wheel_cmd_lcmt as wheel_cmd_lcmt

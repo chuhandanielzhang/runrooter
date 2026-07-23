@@ -9,11 +9,11 @@ import struct
 
 class hopper_cmd_lcmt(object):
 
-    __slots__ = ["tau_ff", "q_des", "qd_des", "kp_joint", "kd_joint", "rm_iq_des"]
+    __slots__ = ["tau_ff", "q_des", "qd_des", "kp_joint", "kd_joint", "rm_iq_des", "rm_zero_at_rad", "rm_set_zero"]
 
-    __typenames__ = ["float", "float", "float", "float", "float", "float"]
+    __typenames__ = ["float", "float", "float", "float", "float", "float", "float", "int8_t"]
 
-    __dimensions__ = [[3], [3], [3], [3], [3], [3]]
+    __dimensions__ = [[3], [3], [3], [3], [3], [3], None, None]
 
     def __init__(self):
         self.tau_ff = [ 0.0 for dim0 in range(3) ]
@@ -34,6 +34,17 @@ class hopper_cmd_lcmt(object):
         LCM Type: float[3]
         """
 
+        self.rm_zero_at_rad = 0.0
+        """
+        RM logical-position initialization: on a 0->nonzero rm_set_zero edge,
+        the Jetson driver chooses its offset so the CURRENT physical shaft
+        position reads rm_zero_at_rad. This changes coordinates only; it does
+        not energize or move the motor.
+        LCM Type: float
+        """
+
+        self.rm_set_zero = 0
+        """ LCM Type: int8_t """
 
     def encode(self):
         buf = BytesIO()
@@ -48,6 +59,7 @@ class hopper_cmd_lcmt(object):
         buf.write(struct.pack('>3f', *self.kp_joint[:3]))
         buf.write(struct.pack('>3f', *self.kd_joint[:3]))
         buf.write(struct.pack('>3f', *self.rm_iq_des[:3]))
+        buf.write(struct.pack(">fb", self.rm_zero_at_rad, self.rm_set_zero))
 
     @staticmethod
     def decode(data: bytes):
@@ -68,12 +80,13 @@ class hopper_cmd_lcmt(object):
         self.kp_joint = struct.unpack('>3f', buf.read(12))
         self.kd_joint = struct.unpack('>3f', buf.read(12))
         self.rm_iq_des = struct.unpack('>3f', buf.read(12))
+        self.rm_zero_at_rad, self.rm_set_zero = struct.unpack(">fb", buf.read(5))
         return self
 
     @staticmethod
     def _get_hash_recursive(parents):
         if hopper_cmd_lcmt in parents: return 0
-        tmphash = (0xcfebad2f9c48def) & 0xffffffffffffffff
+        tmphash = (0x48b12f7526e691ba) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

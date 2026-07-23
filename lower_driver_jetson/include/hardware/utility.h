@@ -1,6 +1,18 @@
 #ifndef UTILITY_H
 #define UTILITY_H
 
+// ===== Leg motor protocol =====
+// 1 = DaMiao DM-J4310 (MIT-compatible CAN). Ranges below MUST equal the
+//     motor's own registers (read from the actual units, 2026-07-18):
+//     PMAX=12.5, VMAX=45, TMAX=10, CTRL_MODE=1 (MIT).
+//     P/V happen to match the old AK60 constants; only torque differs.
+//     Feedback frame data[0] = (status<<4)|motor_id, status: 0=disabled,
+//     1=enabled, >=0x8 fault (overvolt/undervolt/overcurr/overtemp/...).
+//     Feedback arbitration ID = Master ID (0x10|motor_id), payload id nibble
+//     is what we key on.
+// 0 = legacy CubeMars AK60-6 (plain id in data[0], torque +/-15).
+#define MOTOR_PROTOCOL_DAMIAO 1
+
 #define P_MIN -12.5f
 #define P_MAX 12.5f
 #define V_MIN -45.0f
@@ -9,8 +21,13 @@
 #define KP_MAX 500.0f
 #define KD_MIN 0.0f
 #define KD_MAX 5.0f
+#if MOTOR_PROTOCOL_DAMIAO
+#define T_MIN -10.0f
+#define T_MAX 10.0f
+#else
 #define T_MIN -15.0f
 #define T_MAX 15.0f
+#endif
 
 #include <math.h>
 #include <stdint.h>

@@ -8,8 +8,10 @@ struct hopper_cmd_lcmt {
     // the Jetson driver forwards this to the Pixhawk ONLY in PD/PWMPD mode
     // (gamepad X arms, B stops); every other mode streams 0 A.
     float rm_iq_des[3];
-    // RM re-zero trigger: on a 0->nonzero edge the Jetson driver latches the
-    // CURRENT RM shaft position as the new zero (hopper_data_lcmt.rm_q reads 0
-    // there). Same effect as the gamepad SET_ZERO combo, but RM-only.
+    // RM logical-position initialization: on a 0->nonzero rm_set_zero edge,
+    // the Jetson driver chooses its offset so the CURRENT physical shaft
+    // position reads rm_zero_at_rad. This changes coordinates only; it does
+    // not energize or move the motor.
+    float rm_zero_at_rad;
     int8_t rm_set_zero;
 }

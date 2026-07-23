@@ -2,6 +2,10 @@
 Description=Hopper leg motor driver (AK60 via CAN)
 After=canable.service
 Requires=canable.service
+# Wheel bus (can1) is OPTIONAL: order after it so DmWheelController::init sees
+# can1 when the adapter is present, but never block hop-only operation on it.
+After=canable2.service
+Wants=canable2.service
 
 [Service]
 Type=simple

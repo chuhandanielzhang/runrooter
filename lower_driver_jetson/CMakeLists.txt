@@ -39,6 +39,7 @@ add_executable(hopper_driver
     src/hardware/utility.cpp
     src/hardware/hopper_hardware.cpp
     src/hardware/ak60_controller.cpp
+    src/hardware/dm_wheel_controller.cpp
     src/hardware/linmot_util.cpp
 )
 

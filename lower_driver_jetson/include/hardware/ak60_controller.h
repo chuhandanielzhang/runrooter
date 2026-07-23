@@ -9,9 +9,13 @@
 #include <mutex>
 // Constants
 const int MOTOR_COUNT_PER_PORT = 3;  // Number of motors per CAN port
-// Legs-only build: 3 AK60 leg motors live on a single SocketCAN bus (can0),
-// driven from the Jetson via a USB-CAN adapter. Wheel motors (added later)
-// belong on a SEPARATE bus / controller, not here.
+// Legs-only build: 3 leg motors live on a single SocketCAN bus (can0),
+// driven from the Jetson via a USB-CAN adapter.
+// 2026-07-18: leg motors are DaMiao DM-J4310 (CAN IDs 0x01-0x03, Master IDs
+// 0x11-0x13, MIT mode). Same MIT-Cheetah CAN framing as the old AK60s, so this
+// class is reused unchanged; protocol differences (torque range +/-10 Nm,
+// feedback id/status nibble) are selected in utility.h (MOTOR_PROTOCOL_DAMIAO).
+// Wheel motors (added later) belong on a SEPARATE bus / controller, not here.
 const int CAN_PORT_COUNT = 1;        // Number of CAN ports (legs-only -> 1)
 const int TOTAL_MOTORS = MOTOR_COUNT_PER_PORT * CAN_PORT_COUNT;  // Total motors
 const int LOOP_FREQ = 500;           // 500Hz control loop

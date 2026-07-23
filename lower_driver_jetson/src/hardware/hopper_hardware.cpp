@@ -68,7 +68,10 @@ HopperHardware::HopperHardware(bool is_publish_lcm_data):
         if (env_port != nullptr && env_port[0] != '\0') ports.push_back(env_port);
         ports.push_back("/dev/ttyUSB0");
         ports.push_back("/dev/ttyUSB1");
-        ports.push_back("/dev/ttyACM2");
+        // NO ttyACM* fallback: since 2026-07-23 /dev/ttyACM2 is the wheel-bus
+        // CANable2 (see 99-canable.rules), and the IG1 baud probe wedges its
+        // CDC endpoint (write -> EIO until USB re-enumeration). If the IG1 is
+        // ever attached over ACM again, point HOPPER_IMU_PORT at it.
 
         std::string imu_port;
         int imu_baud = 0;
@@ -120,7 +123,12 @@ HopperHardware::HopperHardware(bool is_publish_lcm_data):
             }
         }
     }
-    std::cout << "Driver: 3x AK60 (can0) + Lpms IMU -> hopper_data_lcmt / hopper_imu_lcmt @ 500Hz" << std::endl;
+    // MOBILE kiwi wheels: 3x DaMiao DM-H6215, velocity mode, dedicated can1.
+    // init() degrades gracefully (prints a WARN and no-ops) when the bus is
+    // not attached, so hop-only operation is unaffected.
+    wheel_controller_ptr_ = new DmWheelController();
+    wheel_controller_ptr_->init("can1");
+    std::cout << "Driver: 3x DaMiao DM4310 (can0, MIT, IDs 1-3) + Lpms IMU -> hopper_data_lcmt / hopper_imu_lcmt @ 500Hz" << std::endl;
     std::cout << "Propellers remain on Pixhawk (px4_bridge); disable px4-dds-bridge to avoid duplicate IMU." << std::endl;
     // initialize the xbox controller
     xbox_controller_ptr_ = new XboxController();
@@ -191,6 +199,7 @@ void HopperHardware::step_with_only_receiving(){
     }
     _store_motor_state(temp_pos, temp_vel, temp_tau);
     _publish_rm_cmd(false);   // OFF: M2006 zero current (leg-class gating)
+    _update_wheels(false);    // OFF: wheels disabled (freewheel)
 
     step_counter++;
 }
@@ -215,6 +224,7 @@ void HopperHardware::step_with_damping(){
     }
     _store_motor_state(temp_pos, temp_vel, temp_tau);
     _publish_rm_cmd(false);   // DAMP (B): M2006 zero current, same as legs stopping
+    _update_wheels(false);    // DAMP (B): wheels disabled (freewheel)
 
     step_counter++;
 }
@@ -259,6 +269,7 @@ void HopperHardware::step_with_pd_control(){
     }
     _store_motor_state(temp_pos, temp_vel, temp_tau);
     _publish_rm_cmd(true);    // PD (X): M2006 armed, forward rm_iq_des
+    _update_wheels(true);     // PD (X): wheels armed (msg.enable still gates)
 }
 
 void HopperHardware::step_with_pd_pwm_control(){
@@ -296,6 +307,7 @@ void HopperHardware::step_with_pd_pwm_control(){
     }
     _store_motor_state(temp_pos, temp_vel, temp_tau);
     _publish_rm_cmd(true);    // PWMPD: M2006 armed, forward rm_iq_des
+    _update_wheels(true);     // PWMPD: wheels armed (msg.enable still gates)
 }
 
 void HopperHardware::step_with_pwm_only(){
@@ -324,6 +336,7 @@ void HopperHardware::step_with_pwm_only(){
     }
     _store_motor_state(temp_pos, temp_vel, temp_tau);
     _publish_rm_cmd(false);   // PWM_ONLY: legs free -> M2006 zero current too
+    _update_wheels(false);    // PWM_ONLY: wheels disabled (freewheel)
 
     step_counter++;
 }
@@ -335,6 +348,7 @@ void HopperHardware::step_with_pwm_only(){
     Controller2Robot.subscribe("hopper_cmd_lcmt", &HopperHardware::handleController2RobotLCM, this);
     Controller2Robot.subscribe("motor_pwm_lcmt", &HopperHardware::handleMotorPwmLCM, this);
     Controller2Robot.subscribe("rm_esc_data_lcmt", &HopperHardware::handleRmEscDataLCM, this);
+    Controller2Robot.subscribe("wheel_cmd_lcmt", &HopperHardware::handleWheelCmdLCM, this);
     // NOTE: do NOT subscribe gamepad_lcmt here. This driver is the PUBLISHER of
     // gamepad_lcmt; subscribing to it (empty handler) made our own 200Hz publication
     // loop back into the receive queue and waste dispatch slots ahead of hopper_cmd.
@@ -368,15 +382,21 @@ void HopperHardware::handleController2RobotLCM(const lcm::ReceiveBuffer* rbuf,
         std::lock_guard<std::mutex> lock(lcm_cmd_mutex);
         memcpy(&hopper_cmd_lcmt_, msg, sizeof(hopper_cmd_lcmt));
     }
-    // RM re-zero trigger (0 -> nonzero edge): latch the current RM shaft angle
-    // as the new zero, same as the gamepad SET_ZERO combo but RM-only.
+    // RM logical-position initialization (0 -> nonzero edge). Choose the
+    // offset so the current physical shaft position reads rm_zero_at_rad:
+    //   rm_q = shaft - offset  =>  offset = shaft - requested_q.
+    // This is coordinate-only and never energizes the M2006s, so it is safe
+    // in OFF/DAMP as required by the whole-robot actuator interlock.
     const bool rz_now = (msg->rm_set_zero != 0);
     if (rz_now && !rm_set_zero_prev_) {
         std::lock_guard<std::mutex> lock(motor_state_mutex);
+        const float requested_q = msg->rm_zero_at_rad;
         for (int i = 0; i < 3; i++) {
-            rm_q_offset_[i] = rm_esc_data_lcmt_.shaft_angle_rad[i];
+            rm_q_offset_[i] =
+                rm_esc_data_lcmt_.shaft_angle_rad[i] - requested_q;
         }
-        std::cout << "RM re-zero (LCM rm_set_zero): current position -> 0" << std::endl;
+        std::cout << "RM logical init (LCM): current position -> "
+                  << requested_q << " rad" << std::endl;
     }
     rm_set_zero_prev_ = rz_now;
 }
@@ -407,6 +427,41 @@ void HopperHardware::handleRmEscDataLCM(const lcm::ReceiveBuffer* rbuf,
     rm_esc_data_lcmt_ = *msg;
     rm_data_rx_t_ = std::chrono::steady_clock::now();
     rm_data_seen_ = true;
+}
+
+void HopperHardware::handleWheelCmdLCM(const lcm::ReceiveBuffer* rbuf,
+                                       const std::string& chan,
+                                       const wheel_cmd_lcmt* msg) {
+    (void)rbuf;
+    (void)chan;
+    std::lock_guard<std::mutex> lock(lcm_cmd_mutex);
+    wheel_cmd_lcmt_ = *msg;
+    wheel_cmd_rx_t_ = std::chrono::steady_clock::now();
+    wheel_cmd_seen_ = true;
+}
+
+void HopperHardware::_update_wheels(bool enabled) {
+    // Leg-class gate (same policy as _publish_rm_cmd) + msg.enable + a
+    // 200 ms freshness watchdog: if the PC controller dies mid-drive the
+    // wheels stop here, and the motor's own comm-loss protection is the
+    // final layer below that.
+    if (wheel_controller_ptr_ == nullptr) return;
+    float w_des[3] = {0.0f, 0.0f, 0.0f};
+    bool armed = false;
+    {
+        std::lock_guard<std::mutex> lock(lcm_cmd_mutex);
+        const bool fresh = wheel_cmd_seen_ &&
+            std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - wheel_cmd_rx_t_).count()
+            < 0.2f;
+        armed = enabled && fresh && (wheel_cmd_lcmt_.enable != 0);
+        if (armed) {
+            for (int i = 0; i < 3; i++) {
+                w_des[i] = wheel_cmd_lcmt_.speed_des_rad_s[i];
+            }
+        }
+    }
+    wheel_controller_ptr_->update(armed, w_des);
 }
 
 void HopperHardware::_publish_rm_cmd(bool enabled) {
@@ -447,7 +502,6 @@ void HopperHardware::set_value_zero(){
         hopper_data_lcmt_.tauIq[i] = 0.0;
 
         hopper_cmd_lcmt_.rm_iq_des[i] = 0.0;
-        hopper_cmd_lcmt_.rm_set_zero = 0;
         hopper_data_lcmt_.rm_q[i] = 0.0;
         hopper_data_lcmt_.rm_qd[i] = 0.0;
         hopper_data_lcmt_.rm_iq[i] = 0.0;
@@ -457,6 +511,10 @@ void HopperHardware::set_value_zero(){
         rm_esc_data_lcmt_.rpm[i] = 0;
         rm_esc_data_lcmt_.angle_raw[i] = 0;
     }
+    hopper_cmd_lcmt_.rm_zero_at_rad = 0.0f;
+    hopper_cmd_lcmt_.rm_set_zero = 0;
+    for (int i = 0; i < 3; i++) wheel_cmd_lcmt_.speed_des_rad_s[i] = 0.0f;
+    wheel_cmd_lcmt_.enable = 0;
     hopper_data_lcmt_.rm_online = 0;
     rm_esc_data_lcmt_.online_mask = 0;
 
@@ -626,6 +684,7 @@ HopperHardware::~HopperHardware()
     // Allow a short time for threads to exit
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     delete ak60_controller_ptr_;
+    delete wheel_controller_ptr_;   // sends zero speed + disable on close
     delete imu_wrapper_ptr_;
     delete xbox_controller_ptr_;
 }

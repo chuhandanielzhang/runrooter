@@ -81,7 +81,7 @@ Examples:
         dest="prop_bidir",
         action="store_true",
         default=None,
-        help="Enable bidirectional (3D) prop thrust (pwm<1000 = reverse). Default: off.",
+        help="Enable bidirectional (3D) prop thrust (pwm<1000 = reverse). Default: off (2026-07-23, ESC 3D dropped).",
     )
     ap.add_argument(
         "--no-prop-bidir",
@@ -195,7 +195,9 @@ Examples:
         "--prop-k-thrust",
         type=float,
         default=None,
-        help="Calibrated thrust coefficient in N/(PWM delta)^2. Default: 1.24e-5.",
+        help="Thrust coefficient in N/(PWM delta)^2. Default: 2.25e-5 "
+             "(F100+7in scale-CALIBRATED 2026-07-23 on the 1500-1700us push "
+             "range; old F40+5in: 1.24e-5).",
     )
 
     # Flight phase attitude control gains (shared roll/pitch)

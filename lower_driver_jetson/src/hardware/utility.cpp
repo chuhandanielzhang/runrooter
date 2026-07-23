@@ -207,9 +207,28 @@ void canChannel::receive_process_frame() {
     int nbytes = 1;
     while(nbytes > 0){
         nbytes = read(fd, &rx_frame, sizeof(rx_frame));
-        if(nbytes > 0 && rx_frame.data[0] <= numOfDevice && rx_frame.data[0] > 0) {
+        if (nbytes <= 0) break;
+#if MOTOR_PROTOCOL_DAMIAO
+        // DaMiao feedback: data[0] = (status<<4) | motor_id.
+        // status: 0 disabled, 1 enabled, >=0x8 fault codes.
+        const uint8_t dm_id = rx_frame.data[0] & 0x0F;
+        const uint8_t dm_status = rx_frame.data[0] >> 4;
+        if (dm_id >= 1 && dm_id <= numOfDevice) {
+            if (dm_status >= 0x8) {
+                // Fault (8 overvolt, 9 undervolt, A overcurrent, B MOS overtemp,
+                // C coil overtemp, D comm lost, E overload). Rate-limited print.
+                static int fault_print_cnt = 0;
+                if ((fault_print_cnt++ % 500) == 0) {
+                    fprintf(stderr, "DAMIAO M%u FAULT status=0x%X\n", dm_id, dm_status);
+                }
+            }
             unpack_reply();
         }
+#else
+        if(rx_frame.data[0] <= numOfDevice && rx_frame.data[0] > 0) {
+            unpack_reply();
+        }
+#endif
     }
 }
 
@@ -239,7 +258,11 @@ void canChannel::pack_cmd(const float * motor_cmd){
 
 void canChannel::unpack_reply() {
     /// unpack ints from can buffer ///
+#if MOTOR_PROTOCOL_DAMIAO
+    uint8_t id = rx_frame.data[0] & 0x0F;  // high nibble = status, low = motor id
+#else
     uint8_t id = rx_frame.data[0];
+#endif
     uint16_t p_int = (rx_frame.data[1]<<8)|rx_frame.data[2];
     uint16_t v_int = (rx_frame.data[3]<<4)|(rx_frame.data[4]>>4);
     uint16_t i_int = ((rx_frame.data[4]&0xF)<<8)|rx_frame.data[5];

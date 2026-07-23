@@ -16,7 +16,9 @@
 #include "motor_pwm_lcmt.hpp"
 #include "rm_esc_cmd_lcmt.hpp"
 #include "rm_esc_data_lcmt.hpp"
+#include "wheel_cmd_lcmt.hpp"
 #include "ak60_controller.h"
+#include "dm_wheel_controller.h"
 #include "ImuWrapper.h"
 #include "xbox_controller.hpp"
 
@@ -69,6 +71,9 @@ class HopperHardware
         void handleRmEscDataLCM(const lcm::ReceiveBuffer* rbuf,
                                 const std::string& chan,
                                 const rm_esc_data_lcmt* msg);
+        void handleWheelCmdLCM(const lcm::ReceiveBuffer* rbuf,
+                               const std::string& chan,
+                               const wheel_cmd_lcmt* msg);
         void handleGamepadLCM(const lcm::ReceiveBuffer* rbuf,
                               const std::string& chan,
                               const gamepad_lcmt* msg);
@@ -94,11 +99,22 @@ class HopperHardware
         // gamepad SET_ZERO action latches the current angle here so that
         // hopper_data_lcmt.rm_q reads 0 at the zeroing pose (same UX as AK60s).
         float rm_q_offset_[3] = {0.0f, 0.0f, 0.0f};
-        // Edge detector for hopper_cmd_lcmt.rm_set_zero (LCM-triggered re-zero).
+        // Edge detector for RM logical-position initialization.
         bool rm_set_zero_prev_ = false;
         // Publish the (gated) M2006 current command. Call once per control step:
         // enabled=true forwards rm_iq_des, enabled=false streams zero current.
         void _publish_rm_cmd(bool enabled);
+        // ---- MOBILE kiwi wheels: 3x DaMiao DM-H6215 on can1 (velocity) ----
+        // Leg-class gating, same policy as rm_iq_des: only PD/PWMPD forward
+        // wheel_cmd_lcmt (and only with msg.enable set and the command fresh
+        // within 200 ms); every other mode disables the wheels (freewheel).
+        wheel_cmd_lcmt wheel_cmd_lcmt_;
+        std::chrono::steady_clock::time_point wheel_cmd_rx_t_;
+        bool wheel_cmd_seen_ = false;
+        // Drive/disable the wheels. Call once per control step with the same
+        // enabled flag as _publish_rm_cmd.
+        void _update_wheels(bool enabled);
+        DmWheelController* wheel_controller_ptr_ = nullptr;
         AK60Controller* ak60_controller_ptr_ = nullptr;
         ImuWrapper* imu_wrapper_ptr_ = nullptr;
         IG1ImuDataI imu_raw_data_;

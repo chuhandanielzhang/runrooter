@@ -33,11 +33,16 @@ fi
 # Optional: generate Python types (not required for C++ build)
 if lcm-gen -p ${SCRIPT_DIR}/../*.lcm >/dev/null 2>&1; then
     mkdir -p python
-    mv -f *.py python/
+    mv -f *.py python/ 2>/dev/null || true
+    mv -f lcmtypes/*.py python/ 2>/dev/null || true
+    rm -rf lcmtypes
 fi
 
 # Optional: generate Java types for lcm-spy decoding
-if command -v javac >/dev/null 2>&1 && command -v jar >/dev/null 2>&1; then
+# The lower driver consumes C++ only. Java is opt-in so a normal rebuild does
+# not leave untracked lcmtypes/*.java, *.class and jar artifacts in the tree.
+if [ "${LCM_GEN_JAVA:-0}" = "1" ] && \
+   command -v javac >/dev/null 2>&1 && command -v jar >/dev/null 2>&1; then
     LCM_JAR=""
     for p in /usr/local/share/java/lcm.jar /usr/share/java/lcm.jar; do
         if [ -f "$p" ]; then

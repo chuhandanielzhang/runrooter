@@ -1,0 +1,21 @@
+[Unit]
+Description=CANable slcan bridge as can1 (DM-H6215 wheel bus, 1Mbit)
+# Same self-healing pattern as canable.service (see comments there): lifecycle
+# bound to the USB device unit from 99-canable.rules, so a USB glitch kills the
+# zombie slcand and the device's return restarts us with the fresh tty.
+BindsTo=dev-canable2.device
+After=dev-canable2.device
+StartLimitIntervalSec=0
+
+[Service]
+Type=forking
+# /dev/canable2 = stable udev symlink (serial 209736B03945).
+ExecStart=/usr/bin/slcand -o -s8 /dev/canable2 can1
+ExecStartPost=/bin/sleep 1
+ExecStartPost=/sbin/ip link set can1 up
+ExecStartPost=/sbin/ip link set can1 txqueuelen 65536
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=dev-canable2.device multi-user.target

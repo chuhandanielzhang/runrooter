@@ -1,0 +1,13 @@
+struct wheel_cmd_lcmt {
+    int64_t timestamp;
+    // MOBILE kiwi drive: 3 hub-motor wheels evenly spaced 120 deg apart
+    // on the base circle, hub axes pointing at the chassis center, so
+    // each wheel drives tangentially (omni rollers carry the side slip).
+    // Wheel angular speed command (rad/s), positive = wheel rolls CCW
+    // about its hub axis as seen from OUTSIDE the chassis.
+    float speed_des_rad_s[3];
+    // 1 = drive (upper controller is in MOBILE and enabled);
+    // 0 = coast/stop (every other mode). The Jetson driver must also
+    // apply its own mode gating (X arms / B cuts), same as rm_iq_des.
+    int8_t enable;
+}

@@ -397,6 +397,9 @@ class DdsImuBridge(Node):
             print("!! --prop-map empty; prop uplink disabled", flush=True)
             return
         self._prop_bidir = bool(args.bidir)
+        self._prop_reverse = {
+            int(x.strip()) for x in str(args.prop_reverse).split(",") if x.strip()
+        }
         self._pwm_min = float(args.pwm_min)
         self._pwm_span = max(1.0, float(args.pwm_max) - float(args.pwm_min))
         self._prop_arm_mode = int(args.prop_arm_mode)
@@ -405,6 +408,17 @@ class DdsImuBridge(Node):
             VehicleCommand, "VEHICLE_CMD_DO_SET_ACTUATOR", 187))
         self._pwm_state = {"pwm": [self._pwm_min] * 6, "mode": 0, "rx_t": 0.0}
         self._pwm_lock = threading.Lock()
+        # MAIN (PX4IO) outputs stay locked at the disarmed value (1500 = stop)
+        # until the vehicle is armed, unlike the old AUX/FMU setup. So the
+        # bridge force-arms PX4 while prop commands are active and disarms
+        # after --auto-disarm-delay of idle. Disarmed outputs are 1500 = stop,
+        # so arming by itself never spins anything.
+        self._auto_arm = bool(args.auto_arm)
+        self._arm_disarm_cmd = int(getattr(
+            VehicleCommand, "VEHICLE_CMD_COMPONENT_ARM_DISARM", 400))
+        self._auto_disarm_delay = float(args.auto_disarm_delay)
+        self._armed_wanted = False
+        self._idle_since = time.time()
 
         # /fmu/in/* uplink topics use default RELIABLE QoS (px4_ros_com convention).
         self._cmd_pub = self.create_publisher(
@@ -432,8 +446,11 @@ class DdsImuBridge(Node):
                   else f"pwm {args.pwm_min:.0f}->0, {args.pwm_max:.0f}->1")
         print(f">>> prop uplink (DDS): '{args.pwm_channel}' -> /fmu/in/vehicle_command "
               f"DO_SET_ACTUATOR @ {prop_hz:.0f}Hz | pwm_idx->set {self._prop_map} "
+              f"| reverse pwm_idx={sorted(self._prop_reverse)} "
               f"({_map_s}) | arm_mode="
-              f"{self._prop_arm_mode} rx-timeout {self._prop_rx_timeout:.2f}s", flush=True)
+              f"{self._prop_arm_mode} rx-timeout {self._prop_rx_timeout:.2f}s "
+              f"| auto-arm={'ON' if self._auto_arm else 'off'} "
+              f"(disarm after {self._auto_disarm_delay:.1f}s idle)", flush=True)
 
     # ------------------------------------------------------------------
     # RM C610/M2006 relay.
@@ -537,6 +554,7 @@ class DdsImuBridge(Node):
             self._pwm_state["rx_t"] = time.time()
 
     def _actuator_vals(self, force_idle=False):
+        """Returns (vals6, active). active = a fresh prop-ON command stream exists."""
         NAN = float("nan")
         with self._pwm_lock:
             pwm = list(self._pwm_state["pwm"])
@@ -554,6 +572,8 @@ class DdsImuBridge(Node):
                         v = (float(pwm[pwm_idx]) - 1000.0) / 1000.0
                     else:
                         v = 0.0
+                    if pwm_idx in self._prop_reverse:
+                        v = -v
                     vals[sidx - 1] = max(-1.0, min(1.0, v))
                 else:
                     if armed and (0 <= pwm_idx < len(pwm)):
@@ -562,7 +582,7 @@ class DdsImuBridge(Node):
                         thr = 0.0
                     thr = max(0.0, min(1.0, thr))
                     vals[sidx - 1] = 2.0 * thr - 1.0
-        return vals
+        return vals, armed
 
     def _send_actuator_cmd(self, vals6):
         msg = VehicleCommand()
@@ -582,20 +602,54 @@ class DdsImuBridge(Node):
         msg.from_external = True
         self._cmd_pub.publish(msg)
 
+    def _send_arm_cmd(self, arm: bool):
+        msg = VehicleCommand()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)  # us
+        msg.command = self._arm_disarm_cmd
+        msg.param1 = 1.0 if arm else 0.0
+        msg.param2 = 21196.0  # force: bypass prearm checks (bench use, no RC/GPS)
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 255
+        msg.source_component = 190
+        msg.from_external = True
+        self._cmd_pub.publish(msg)
+
+    def _auto_arm_tick(self, active: bool):
+        now = time.time()
+        if active:
+            self._idle_since = None
+            if not self._armed_wanted:
+                self._armed_wanted = True
+                print(">>> props active -> ARM", flush=True)
+                self._send_arm_cmd(True)
+        else:
+            if self._idle_since is None:
+                self._idle_since = now
+            if self._armed_wanted and (now - self._idle_since) >= self._auto_disarm_delay:
+                self._armed_wanted = False
+                print(f">>> props idle {self._auto_disarm_delay:.1f}s -> DISARM", flush=True)
+                self._send_arm_cmd(False)
+
     def on_prop_tick(self):
         if self._prop_enabled:
-            self._send_actuator_cmd(self._actuator_vals())
+            vals, active = self._actuator_vals()
+            if self._auto_arm:
+                self._auto_arm_tick(active)
+            self._send_actuator_cmd(vals)
 
     def prop_shutdown(self):
-        """Command every mapped set to idle (-1) a few times so props stop quietly."""
+        """Command every mapped set to idle a few times so props stop quietly."""
         if not self._prop_enabled:
             return
         self._prop_stop.set()
         try:
-            idle = self._actuator_vals(force_idle=True)
+            idle, _ = self._actuator_vals(force_idle=True)
             for _ in range(5):
                 self._send_actuator_cmd(idle)
                 time.sleep(0.02)
+            if self._auto_arm and self._armed_wanted:
+                self._send_arm_cmd(False)
         except Exception:
             pass
 
@@ -690,9 +744,11 @@ def parse_args():
                    help="disable the prop uplink (IMU downlink only)")
     p.add_argument("--pwm-channel", default="motor_pwm_lcmt",
                    help="LCM channel carrying prop PWM commands")
-    p.add_argument("--prop-map", default="1,2,3",
+    p.add_argument("--prop-map", default="1:1,2:2,3:3",
                    help="pwm_values index -> actuator-set index (DO_SET_ACTUATOR "
-                        "param1..6), '1,2,3' or explicit 'pwmIdx:setN,...' pairs")
+                        "param1..6), as explicit 'pwmIdx:setN,...' pairs. "
+                        "2026-07-18 physical map: M1 pwm[1]->set1->MAIN8 (+x,+y), "
+                        "M2 pwm[2]->set2->MAIN2 (-y), M3 pwm[3]->set3->MAIN3 (-x,+y).")
     p.add_argument("--pwm-min", type=float, default=1000.0, help="pwm_us at 0 throttle")
     p.add_argument("--pwm-max", type=float, default=2000.0, help="pwm_us at full throttle")
     p.add_argument("--bidir", dest="bidir", action="store_true", default=True,
@@ -702,6 +758,10 @@ def parse_args():
     p.add_argument("--no-bidir", dest="bidir", action="store_false",
                    help="legacy unidirectional mapping (only for PWM ESC mode with "
                         "DSHOT_3D_ENABLE=0; idle sends -1.0)")
+    p.add_argument("--prop-reverse", default="1,2",
+                   help="comma-separated PWM indices whose bidirectional command is "
+                        "inverted around stop. 2026-07-18 hardware: reverse M1/M2 "
+                        "(pwm[1],pwm[2]); M3 remains normal.")
     p.add_argument("--prop-rate", type=float, default=250.0,
                    help="DO_SET_ACTUATOR re-stream rate (Hz) over DDS. Unlike the USB "
                         "MAVLink path there is no COMMAND_ACK return flood (we never "
@@ -712,6 +772,15 @@ def parse_args():
     p.add_argument("--prop-arm-mode", type=int, default=3,
                    help="motor_pwm_lcmt.control_mode value that means 'props ON' "
                         "(default 3 = PWMPD); anything else idles the props")
+    p.add_argument("--auto-arm", dest="auto_arm", action="store_true", default=True,
+                   help="force-ARM PX4 while prop commands are active and DISARM "
+                        "after --auto-disarm-delay of idle. Needed since 2026-07-18: "
+                        "props on MAIN (PX4IO) outputs, which stay at the disarmed "
+                        "1500us stop value until armed (default on)")
+    p.add_argument("--no-auto-arm", dest="auto_arm", action="store_false",
+                   help="never send ARM/DISARM from the bridge")
+    p.add_argument("--auto-disarm-delay", type=float, default=2.0,
+                   help="seconds of prop-idle before the bridge auto-DISARMs (s)")
     # ---- RM C610/M2006 relay (custom rm_c610 PX4 module) ----
     p.add_argument("--rm-esc", dest="rm_esc", action="store_true", default=True,
                    help="enable the rm_esc_cmd_lcmt <-> /fmu/in|out/rm_esc_* relay "

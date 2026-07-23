@@ -46,10 +46,13 @@ public final class hopper_cmd_lcmt implements lcm.lcm.LCMEncodable
     public float rm_iq_des[];
 
     /**
-     * RM re-zero trigger: on a 0->nonzero edge the Jetson driver latches the
-     * CURRENT RM shaft position as the new zero (hopper_data_lcmt.rm_q reads 0
-     * there). Same effect as the gamepad SET_ZERO combo, but RM-only.
+     * RM logical-position initialization: on a 0->nonzero rm_set_zero edge,
+     * the Jetson driver chooses its offset so the CURRENT physical shaft
+     * position reads rm_zero_at_rad. This changes coordinates only; it does
+     * not energize or move the motor.
      */
+    public float rm_zero_at_rad;
+
     public byte rm_set_zero;
 
  
@@ -64,7 +67,7 @@ public final class hopper_cmd_lcmt implements lcm.lcm.LCMEncodable
     }
  
     public static final long LCM_FINGERPRINT;
-    public static final long LCM_FINGERPRINT_BASE = 0x05debe732ba9c8f9L;
+    public static final long LCM_FINGERPRINT_BASE = 0x48b12f7526e691baL;
  
     static {
         LCM_FINGERPRINT = _hashRecursive(new ArrayList<Class<?>>());
@@ -113,6 +116,8 @@ public final class hopper_cmd_lcmt implements lcm.lcm.LCMEncodable
         for (int a = 0; a < 3; a++) {
             outs.writeFloat(this.rm_iq_des[a]); 
         }
+ 
+        outs.writeFloat(this.rm_zero_at_rad); 
  
         outs.writeByte(this.rm_set_zero); 
  
@@ -170,6 +175,8 @@ public final class hopper_cmd_lcmt implements lcm.lcm.LCMEncodable
             this.rm_iq_des[a] = ins.readFloat();
         }
  
+        this.rm_zero_at_rad = ins.readFloat();
+ 
         this.rm_set_zero = ins.readByte();
  
     }
@@ -189,6 +196,8 @@ public final class hopper_cmd_lcmt implements lcm.lcm.LCMEncodable
         System.arraycopy(this.kd_joint, 0, outobj.kd_joint, 0, 3); 
         outobj.rm_iq_des = new float[(int) 3];
         System.arraycopy(this.rm_iq_des, 0, outobj.rm_iq_des, 0, 3); 
+        outobj.rm_zero_at_rad = this.rm_zero_at_rad;
+ 
         outobj.rm_set_zero = this.rm_set_zero;
  
         return outobj;
