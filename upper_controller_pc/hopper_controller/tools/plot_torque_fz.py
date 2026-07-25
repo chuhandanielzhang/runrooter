@@ -84,6 +84,9 @@ def main() -> None:
     if "fbslip_x_c_plan_m" in x.columns:
         ax4b.plot(t, x["fbslip_x_c_plan_m"] * 100.0, color="tab:red",
                   lw=1.0, ls="--", alpha=0.7, label="compression plan x_c")
+    if "fbslip_s_tgt_m" in x.columns:
+        ax4b.plot(t, x["fbslip_s_tgt_m"] * 100.0, color="darkgreen",
+                  lw=1.0, ls="-.", alpha=0.9, label="design-map s_tgt")
     ax4b.set_ylabel("Compression (cm)", color="tab:red")
     ax4b.tick_params(axis="y", labelcolor="tab:red")
     ax4b.set_ylim(bottom=0)

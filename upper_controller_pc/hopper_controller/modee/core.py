@@ -493,21 +493,33 @@ class ModeEConfig:
     # and the energy budget is re-solved so the SAME planned bottom absorbs
     # KE + the extra gravity work:  F_bot = (2-c0)*m*g_st + m*v_td^2/T.
     stance_recv_preload_frac: float = 0.3
-    # TARGET compression travel (m), touchdown-relative.  2026-07-25 07:32
-    # (user: "压缩行程要到7") + 07:35 ("第二跳没达到压缩量", 073401 log):
-    # energy-sized springs stall shallow no matter how v_td is measured --
-    # the ballistic arc reads the PRE-impact speed (hop1 sized 230 N and
-    # stalled at 2.8/11.3 cm) while the post-impact KF vz rings, and the
-    # linkage friction eats the true KE anyway.  The reception is therefore
-    # POSITIONAL: the spring force stays BELOW body weight until this depth
-    # (crossing m*g exactly here), so gravity itself guarantees the sink,
-    # independent of every velocity estimate.  Past it the force rises to
-    # the full leg budget at the planned bottom (the catch).  Capped by
-    # leg_stroke_max_m (9 cm).
-    # 2026-07-25 09:13 (user: "我想压缩 5cm"): 0.070 -> 0.050.
-    # 09:15 (user: "我只要 4-5 就好"): 0.050 -> 0.045 (body settles just
-    # past the crossing, observed +0.1-0.3 cm, so 4.5 targets mid 4-5).
-    stance_travel_min_m: float = 0.045
+    # ---- DESIGN MAP (2026-07-25 12:09): depth is DERIVED, not tuned ----
+    # The positional-reception target depth s_tgt (see the COMP force law)
+    # used to be the hand constant stance_travel_min_m = 0.045.  It is now
+    # solved at touchdown from the push-side energy balance: pushing with
+    # the DESIGN force F_des = w_push * F_max over the absolute deficit
+    # x0 = x_td + s_tgt must deliver the takeoff energy,
+    #   (F_des - m*g_st) * x0 = 0.5*m*v_to^2
+    #   => s_tgt* = m*v_to^2 / (2*(w_push*F_max - m*g_st)) - x_td
+    # so the squat depth tracks the height target (v_to) and the prop
+    # setting (g_st) automatically, and the push rides at a chosen
+    # fraction of the force budget instead of whatever a fixed depth
+    # implies.  w_push < 1 reserves the rest of the budget for the
+    # reception catch.
+    # Calibration (reference log modee_20260725_094638, the hand-tuned
+    # 0.045 run): v_to_cmd 0.90, m*g_st 53-60 N, x_td 2.1-2.8 cm, actual
+    # push force 87-98 N = 0.38-0.43 of the 230 N budget.  w_push = 0.42
+    # reproduces s_tgt ~= 0.044, so the derived map matches that log.
+    stance_push_force_frac: float = 0.42
+    # FLOOR for the derived target depth (m), touchdown-relative.  Safety
+    # bound only -- the derived s_tgt* governs.  History of the positional
+    # reception (2026-07-25 07:32/07:35, "压缩行程要到7"/"第二跳没达到压缩
+    # 量"): energy-sized springs stall shallow no matter how v_td is
+    # measured, so the reception is POSITIONAL -- force stays BELOW body
+    # weight until the target depth, gravity itself guarantees the sink.
+    # 09:15: hand target 0.045 for the 0.10 apex; 12:09: that value now
+    # comes out of the design map above, this floor dropped 0.045 -> 0.020.
+    stance_travel_min_m: float = 0.020
     # Fraction of stance weight the reception spring reaches AT the target
     # depth (< 1 keeps a net downward pull through linkage friction there).
     stance_recv_tgt_weight_frac: float = 0.95
@@ -941,7 +953,15 @@ class ModeEConfig:
     vel_kf_z_l_stance: float = 12.0
     # MATLAB / Hopper4 Raibert (active when use_hfbslip_placement=False):
     #   target_xy = kv * v_xy + kr * v_des
-    flight_kv: float = 0.18
+    # 2026-07-25 09:44 (user: "速度不收敛", 094151 log vy 0.08->0.54->1.17):
+    # kv covers BOTH the Raibert neutral point v*T_st/2 AND the correction
+    # margin.  The positional reception deepened the squat (5-7 cm) and
+    # stretched stance ~0.13 -> ~0.25 s, so the neutral share grew to
+    # ~0.125*v and the old 0.18 left only ~0.055*v of correction -- half
+    # the pre-change damping.  0.18 -> 0.26 restores the margin (the
+    # H-FB-SLIP coupled placement derives this from the height plan's
+    # T_st; the fixed-gain Raibert must track it by hand).
+    flight_kv: float = 0.26
     flight_kr: float = 0.09
     flight_stepper_lim_m: float = 0.13
     swing_kp_xy: float = 62.0
@@ -1488,6 +1508,10 @@ class ModeECore:
         # the fusion recovers the true CoM state for the stance laws.
         self._vel_kf_z: float = 0.0
         self._mode1_k_boost: float = 0.0
+        # DESIGN-MAP reception target depth (m, touchdown-relative),
+        # solved at TD from v_to and the push force budget (see
+        # stance_push_force_frac).  0 = not sized yet.
+        self._mode1_s_tgt: float = 0.0
         # Persistent hop-to-hop loss estimate for the restored 2aa050e7
         # two-spring height controller.
         self._mode1_Eloss: float = 0.0
@@ -1812,6 +1836,7 @@ class ModeECore:
         self._vel_kf_xy = np.zeros(2, dtype=float)
         self._vel_kf_z = 0.0
         self._mode1_k_boost = 0.0
+        self._mode1_s_tgt = 0.0
         self._mode1_Eloss = 0.0
         self._mode1_v_td = 0.0
         self._mode1_x0 = 0.0
@@ -3279,6 +3304,7 @@ class ModeECore:
                 self._mode1_k_up = None
                 self._mode1_fcomp_lpf = None
                 self._mode1_k_boost = 0.0
+                self._mode1_s_tgt = 0.0
                 self._mode1_v_td = 0.0
                 self._mode1_x0 = 0.0
                 self._mode1_boost_f_state = 0.0
@@ -3469,16 +3495,51 @@ class ModeECore:
                     stroke = float(max(
                         0.015, float(self.cfg.leg_stroke_max_m)
                     ))
-                    # TRAVEL FLOOR (2026-07-25 07:32, user: "压缩行程要到7"):
-                    # never plan a shorter travel than this -- a longer
-                    # travel makes the spring proportionally SOFTER
-                    # (F_bot ~ m*v^2/T), which is what lets the body sink
-                    # through impact losses instead of stalling shallow.
+                    # ---- DESIGN MAP (2026-07-25 12:09): derive the
+                    # reception target depth from the height target ----
+                    # Pushing with the design force w_push*F_max over the
+                    # absolute deficit x0 = x_td + s_tgt must deliver the
+                    # takeoff energy:
+                    #   (w_push*F_max - m*g_st) * x0 = 0.5*m*v_to^2
+                    # so the squat tracks v_to (and through it the apex
+                    # target) and the prop g_st automatically.  See the
+                    # stance_push_force_frac config for the calibration
+                    # against the hand-tuned 0.045 reference log.
+                    w_push_des = float(_clipf(float(getattr(
+                        self.cfg, "stance_push_force_frac", 0.42
+                    )), 0.05, 1.0))
+                    # Net specific push force; floor at 0.15*g so a
+                    # mis-set w_push cannot blow the depth to infinity.
+                    a_net_des = float(max(
+                        0.15 * g_raw,
+                        (w_push_des * f_max_td) / m_td - g_st_td,
+                    ))
+                    x0_des = (
+                        v_to_pl * v_to_pl / (2.0 * a_net_des)
+                    )
                     trav_min = float(_clipf(float(getattr(
                         self.cfg, "stance_travel_min_m", 0.0
                     )), 0.0, stroke))
+                    catch_span_td = float(max(0.005, float(getattr(
+                        self.cfg, "stance_recv_catch_span_m", 0.015
+                    ))))
+                    # Derived target depth, floored and kept inside the
+                    # stroke with room for the catch to fit past it.
+                    s_tgt_des = float(_clipf(
+                        x0_des - x_td0,
+                        trav_min,
+                        max(trav_min, stroke - catch_span_td),
+                    ))
+                    self._mode1_s_tgt = float(s_tgt_des)
+                    # Plan bottom: deepest of the push need, the
+                    # KE-absorption travel, and the derived target plus
+                    # its catch span (so the catch never clips).
                     x_b = float(min(
-                        max(x_c_need, x_td0 + x_c_v, x_td0 + trav_min),
+                        max(
+                            x_c_need,
+                            x_td0 + x_c_v,
+                            x_td0 + s_tgt_des + catch_span_td,
+                        ),
                         x_td0 + stroke,
                     ))
                     travel = float(max(0.01, x_b - x_td0))
@@ -4759,11 +4820,19 @@ class ModeECore:
                         self.cfg, "stance_recv_tgt_weight_frac", 0.95
                     )), 0.5, 1.0))
                     f_mid = float(max(f0_recv, w_tgt * m * g_st))
-                    s_tgt = float(_clipf(
-                        float(getattr(
+                    # Target depth: the TD-latched DESIGN-MAP value
+                    # (derived from v_to and the push force budget, see
+                    # touchdown sizing); config floor is the fallback if
+                    # the controller was enabled mid-stance.
+                    s_tgt_raw = float(getattr(
+                        self, "_mode1_s_tgt", 0.0
+                    ) or 0.0)
+                    if not (np.isfinite(s_tgt_raw) and s_tgt_raw > 0.0):
+                        s_tgt_raw = float(getattr(
                             self.cfg, "stance_travel_min_m", 0.0
-                        )),
-                        0.01, 0.9 * trav_pl,
+                        ))
+                    s_tgt = float(_clipf(
+                        s_tgt_raw, 0.01, 0.9 * trav_pl,
                     ))
                     if s_tr <= s_tgt:
                         f_brk = (
@@ -5957,6 +6026,9 @@ class ModeECore:
             # TD pre-load (height deficit below l0 at touchdown); plan
             # minus pre-load = true travel budget for this stance.
             "fbslip_x_td_m": float(self._mode1_x_td),
+            # DESIGN-MAP reception target depth (derived from v_to and
+            # the push budget at TD; was the hand constant 0.045).
+            "fbslip_s_tgt_m": float(self._mode1_s_tgt),
             "fbslip_f_push_n": float(self._mode1_k_boost),
             "fbslip_t_bottom_s": float(self._mode1_t_bottom),
             # Kept for analysis-script compatibility; the sink state was
