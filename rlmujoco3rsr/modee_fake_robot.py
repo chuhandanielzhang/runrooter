@@ -37,7 +37,7 @@ from python.hopper_cmd_lcmt import hopper_cmd_lcmt      # type: ignore
 from python.hopper_imu_lcmt import hopper_imu_lcmt      # type: ignore
 from python.gamepad_lcmt import gamepad_lcmt            # type: ignore
 from python.motor_pwm_lcmt import motor_pwm_lcmt        # type: ignore
-from modee.controllers.motor_utils import MotorTableModel  # type: ignore
+from modee.core import ModeEConfig  # type: ignore
 
 XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "three_leg_3rsr_closed.xml")
 
@@ -128,9 +128,20 @@ def main():
     ap.add_argument("--floor-mu", type=float, default=None,
                     help="tangential friction of floor AND foot geoms (MuJoCo pairs "
                          "take the elementwise max, so both must be set)")
+    ap.add_argument("--total-mass", type=float, default=None,
+                    help="uniformly scale all MuJoCo body masses/inertias to this total "
+                         "mass. Use the current ModeEConfig.mass_kg for a current-core run.")
     args = ap.parse_args()
 
     m = mujoco.MjModel.from_xml_path(XML)
+    core_defaults = ModeEConfig()
+    if args.total_mass is not None:
+        m0 = float(np.sum(m.body_mass))
+        scale = float(args.total_mass) / max(1e-9, m0)
+        m.body_mass[:] *= scale
+        m.body_inertia[:] *= scale
+        print(f"plant mass scaled {m0:.3f} -> {np.sum(m.body_mass):.3f} kg "
+              f"(mass/inertia scale {scale:.3f})")
     if args.floor_mu is not None:
         for gname in ("floor", "foot_collision"):
             gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, gname)
@@ -138,7 +149,9 @@ def main():
         print(f"floor/foot tangential friction set to mu={args.floor_mu}")
     # Bidirectional ESC model: controller side maps thrust<0 to pwm<1000 (3D mode);
     # widen the sim thrust actuators so reverse (downforce) actually acts.
-    m.actuator_ctrlrange[6:9, 0] = -10.0
+    tmax = float(core_defaults.thrust_max_each_n)
+    m.actuator_ctrlrange[6:9, 0] = -tmax
+    m.actuator_ctrlrange[6:9, 1] = +tmax
     # controller sends torques; bypass hip position actuators (unless --hold-hips)
     if not args.hold_hips:
         m.actuator_gainprm[0:3, :] = 0.0
@@ -175,7 +188,6 @@ def main():
     print("PWM ch -> sim thrust actuator:",
           {k: f"thrust_{v[0]+1} (err {v[1]:.0f} deg)" for k, v in pwm_to_act.items()})
 
-    motor_table = MotorTableModel.default_from_table()
     # SIM ISOLATION: default to a loopback-only bus (7669, ttl=0) so the fake
     # robot can NEVER talk to the real Jetson driver (7667, ttl=255). Sweep
     # scripts that export LCM_DEFAULT_URL keep working (env wins).
@@ -257,19 +269,19 @@ def main():
             d.ctrl[0:3] = home_ctrl[0:3]
         d.ctrl[3:6] = home_ctrl[3:6]  # servos frozen
 
-        # props: PWM -> thrust -> mapped sim thrust actuator.
-        # pwm >= 1000: forward, measured table. pwm < 1000: REVERSE (3D-mode ESC),
-        # thrust = -k*(1000-pwm)^2 mirroring the controller's bidir sqrt law
-        # (core.py _pwm_from_arm_thrusts, prop_k_thrust=1.10e-4).
+        # Props: use the SAME current ModeEConfig PWM law in both directions.
+        # This intentionally does not use the legacy F40 measured table: the current
+        # core uses the F100+7in square-root map, so the inverse plant relation is
+        # thrust = sign(dpwm) * prop_k_thrust * dpwm^2.
         if armed[0]:
-            thr6 = motor_table.thrust_from_pwm(np.maximum(pwm_cmd, 1000.0))
-            rev = pwm_cmd < 1000.0
-            thr6[rev] = -1.10e-4 * np.square(1000.0 - pwm_cmd[rev])
+            stop = float(core_defaults.pwm_min_us)
+            dpwm = np.asarray(pwm_cmd, dtype=float) - stop
+            thr6 = np.sign(dpwm) * float(core_defaults.prop_k_thrust) * np.square(dpwm)
         else:
             thr6 = np.zeros(6)
         d.ctrl[6:9] = 0.0
         for pwm_idx, (act_i, _) in pwm_to_act.items():
-            d.ctrl[6 + act_i] = float(np.clip(thr6[pwm_idx], -10.0, 10.0))
+            d.ctrl[6 + act_i] = float(np.clip(thr6[pwm_idx], -tmax, tmax))
         thrust_min_seen = min(thrust_min_seen, float(np.min(d.ctrl[6:9])))
         thrust_max_seen = max(thrust_max_seen, float(np.max(d.ctrl[6:9])))
 

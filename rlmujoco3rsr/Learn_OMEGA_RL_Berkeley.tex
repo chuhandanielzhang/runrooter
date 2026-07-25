@@ -1,0 +1,655 @@
+% ============================================================================
+%  OMEGA × CS285 联合讲义（小白详细扩展版）
+%  课件对照：UC Berkeley CS285 Deep RL (Sergey Levine)
+%    https://rail.eecs.berkeley.edu/deeprlcourse/
+%  论文：Zhang et al. Learning to Hop... Parallel Mechanism (OMEGA)
+%  编译：xelatex Learn_OMEGA_RL_Berkeley.tex  （两遍）
+% ============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb,amsfonts,bm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\geometry{margin=2.1cm}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\title{\textbf{CS285 课件 $\times$ OMEGA 论文}\\[0.35em]
+\large 强化学习零基础详细讲义\\[0.2em]
+\normalsize （并联单足跳跃机器人 RL 精读）}
+\author{教学笔记\\
+\small 课件：Berkeley CS285 Deep RL（Levine）\quad
+论文：Zhang et al., \textit{Learning to Hop for a Single-Legged Robot
+with Parallel Mechanism}}
+\date{}
+
+\newenvironment{csbox}[1][CS285 课件]{%
+  \par\medskip\noindent\fbox{\begin{minipage}{0.96\linewidth}
+  \textbf{【课件・#1】}\par\smallskip\begingroup\small}%
+  {\endgroup\end{minipage}}\par\medskip}
+\newenvironment{paperbox}[1][OMEGA 论文]{%
+  \par\medskip\noindent\fbox{\begin{minipage}{0.96\linewidth}
+  \textbf{【论文・#1】}\par\smallskip\begingroup\small}%
+  {\endgroup\end{minipage}}\par\medskip}
+\newenvironment{keyidea}[1][先记住]{%
+  \par\medskip\noindent\fbox{\begin{minipage}{0.96\linewidth}
+  \textbf{【#1】}\par\smallskip}%
+  {\end{minipage}}\par\medskip}
+\newenvironment{example}[1][例子]{%
+  \par\medskip\noindent\fbox{\begin{minipage}{0.96\linewidth}
+  \textbf{【#1】}\par\smallskip}%
+  {\end{minipage}}\par\medskip}
+\newenvironment{warnbox}[1][易混]{%
+  \par\medskip\noindent\fbox{\begin{minipage}{0.96\linewidth}
+  \textbf{【#1】}\par\smallskip}%
+  {\end{minipage}}\par\medskip}
+\newenvironment{bridge}[1][课件 $\leftrightarrow$ 论文对接]{%
+  \par\medskip\noindent\rule{\linewidth}{0.4pt}\par\noindent
+  \textbf{#1}\par\smallskip}%
+  {\par\noindent\rule{\linewidth}{0.4pt}\par\medskip}
+\newcommand{\csref}[1]{\texttt{[CS285~#1]}}
+\newcommand{\papref}[1]{\texttt{[论文~#1]}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+本讲义\emph{严格按} UC Berkeley \textbf{CS285} 的课程序列展开，
+每一讲都给出：
+(1) 课件在讲什么；(2) 公式与直觉；(3) OMEGA 论文对应段落/公式/图；
+(4) 你该会复述的句子。面向\textbf{RL 零基础}。
+课件主页：\url{https://rail.eecs.berkeley.edu/deeprlcourse/}。
+本地论文稿：\texttt{Hopper-mujoco-standalone/ppopaper}。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\part{总路线：课件目录如何映射到论文}
+%==============================================================================
+
+\section{对照总表（请贴墙上）}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.6cm}p{5.0cm}p{5.0cm}@{}}
+\hline
+\textbf{CS285 讲次（典型）} & \textbf{你要学会的概念} & \textbf{OMEGA 落点} \\
+\hline
+Lec1--2 Intro / Supervised behavior
+& 试错学习 vs 模仿学习 & 为什么不用纯专家示教，而用奖励 \\
+\hline
+Lec4 Intro to RL
+& Agent, MDP 组件, episode & §III 总览；Isaac 循环 \\
+\hline
+Lec5 Policy Gradients
+& $\pi_\theta$, $J(\theta)$, REINFORCE & 策略输出期望角；优化长期跳得好 \\
+\hline
+Lec6 Actor--Critic
+& $V$, $A$, actor/critic & 非对称 Actor--Critic，Fig.\,4 \\
+\hline
+Lec7--8 Value / Q（可略读）
+& 价值在干嘛 & Critic 估 $V$；他们不用 DQN \\
+\hline
+Lec9 Advanced PG / PPO
+& PPO clip / TRPO 直觉 & 正文：Isaac Gym + PPO \\
+\hline
+Lec10 Optimal Control
+& model-based 控制 & 对比：SLIP/Cao QP vs RL；底层 PD \\
+\hline
+Lec11--12 Model-based RL（可选）
+& 学模型再规划 & 论文\emph{不}走这条；他们走 model-free \\
+\hline
+Lec18 VAE / Generative
+& latent、重建、KL & $\beta$-VAE encoder--decoder，Fig.\,4 \\
+\hline
+Lec22 Transfer
+& sim-to-real, DR & §III Domain Rand；§V torque mapping \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{keyidea}
+学法：先读本讲义一讲 $\to$ 打开 CS285 对应视频/slide 扫一遍（可 1.5 倍速）
+$\to$ 立刻读论文对应小节，用荧光笔标公式编号。
+\end{keyidea}
+
+\begin{paperbox}[摘要里的问题陈述]
+论文 abstract 三点困难：
+(1) 并联难仿真；(2) 长空欠驱动；(3) 奖励稀疏。
+对策：long-history；serial 简化；torque-level conversion。
+整份讲义就是把这三点翻译成 CS285 语言。
+\end{paperbox}
+
+\newpage
+%==============================================================================
+\part{Part I —— CS285 Lec4：强化学习入门（零基础）}
+%==============================================================================
+
+\section{Lec4.1 \; 什么是强化学习（对照监督）}
+
+\begin{csbox}[Lec4 Anatomy of RL]
+课件指出：RL 算法收集数据（交互）$\to$ 用数据改进策略或价值。
+数据类型不是「$(x,y)$ 标签」，而是「轨迹：状态、动作、奖励」。
+\end{csbox}
+
+\begin{example}[监督学习]
+给出很多「传感器读数 $\to$ 人手动示范的电机角」，拟合网络。
+需要大量示范；示范越难（跳跃），越贵。
+\end{example}
+
+\begin{example}[强化学习]
+不给标准动作；给规则：「跟上 $0.2$\,m/s、不倒」。
+机器人自己试，好就奖励高。代价是样本多、奖励难调。
+\end{example}
+
+\begin{bridge}
+课件问：rl 适合何时场景？高频最优解难写、交互可仿真。\\
+论文答：并联动力学难准写 + 连续跳跃难调参 $\Rightarrow$ 用 RL。
+同时他们用底层 PD（频域分离）——课件 Lec10「把高层决策与低层控制分层」。
+\end{bridge}
+
+\section{Lec4.2 \; 五个名词 + 回路图}
+
+\textbf{Agent}：决策器。\quad
+\textbf{Environment}：Isaac/真机。\quad
+\textbf{State $s$}：完整真相。\quad
+\textbf{Observation $o$}：可测子集。\quad
+\textbf{Action $a$}：控制量。\quad
+\textbf{Reward $r$}：标量反馈。\quad
+\textbf{Policy $\pi$}：观测$\mapsto$动作。
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw,rounded corners,align=center,inner sep=4pt,font=\small}]
+\node[box,fill=blue!8] (obs) {观测 $o_t$\\Eq.\,8};
+\node[box,right=1.1cm of obs,fill=orange!12] (pi) {策略 $\pi_\theta$\\Actor};
+\node[box,right=1.1cm of pi,fill=green!10] (act) {动作 $a_t$\\期望角};
+\node[box,right=1.1cm of act,fill=gray!12] (env) {环境\\Serial $+$ 映射};
+\node[box,below=1.0cm of env,fill=yellow!15] (r) {$r_t$, $o_{t+1}$};
+\draw[-Latex] (obs)--(pi); \draw[-Latex] (pi)--(act);
+\draw[-Latex] (act)--(env); \draw[-Latex] (env)--(r);
+\draw[-Latex] (r)-| node[near start,left,font=\scriptsize]{下一拍} (obs);
+\end{tikzpicture}
+\end{center}
+
+\begin{paperbox}[§III Framework]
+「policy receives history of proprioceptive measurements；
+critic has ground truth；VAE-style encoder；MSE velocity；Isaac+PPO。」
+上面这句话几乎是 Fig.\,4 的文字版。
+\end{paperbox}
+
+\section{Lec4.3 \; Episode、horizon、折扣回报}
+
+一局（episode）：重置到倒下/超时。\\
+即时奖励 $r_t$；回报
+\[
+G_t=r_t+\gamma r_{t+1}+\gamma^2 r_{t+2}+\cdots,\quad \gamma\in[0,1).
+\]
+
+\begin{csbox}[Lec4 Value]
+$V^\pi(s)=\mathbb{E}[G_t\mid s_t=s]$：从这个状态按 $\pi$ 玩下去平均能得多少分。
+\end{csbox}
+
+\begin{example}
+起跳「疼」（落地冲击惩罚）但总回报高——因为后面连续跳成功。
+所以\textbf{不能}只贪每一步最大 $r$。
+\end{example}
+
+\newpage
+%==============================================================================
+\part{Part II —— MDP / POMDP（课件核心＋论文设定）}
+%==============================================================================
+
+\section{Lec4.4 \; MDP 五元组}
+
+\begin{csbox}[Lec4 MDP]
+$\mathcal{M}=(\mathcal{S},\mathcal{A},P,r,\gamma,\rho_0)$。
+转移 $s_{t+1}\sim P(\cdot|s_t,a_t)$；奖励 $r_t=r(s_t,a_t)$。
+目标：$\max_\theta J(\theta)=\mathbb{E}_{\tau\sim\pi_\theta}[\sum_t\gamma^t r_t]$。
+\end{csbox}
+
+\textbf{马尔可夫性}：有了完整 $s_t$，未来与更早历史无关。
+
+\section{Lec4.5 \; POMDP —— 论文显式采用}
+
+\begin{csbox}
+真实机器人几乎总是 POMDP：测量噪声、不可见接触力/滑移/速度。
+习惯解法：堆栈历史、RNN、或学 latent state。
+\end{csbox}
+
+\begin{paperbox}[§III ``We formulate this control problem as a POMDP'']
+观测 Eq.\,8（不给真线速度）：
+\begin{equation}
+o_t=\big[
+\hat q_{m,t}^{\mathcal{P}},\;
+\hat q_{[r,p,y],t},\;
+\hat{\dot q}_{[r,p,y],t},\;
+\cos q_{\mathrm{phase}},\;
+\sin q_{\mathrm{phase}},\;
+\dot q_{[x,y]}^{d},\;
+T,\;
+a_{t-1}^{\mathcal{P}}
+\big].
+\tag{论文 Eq.8}
+\end{equation}
+并用 $H=5$ 历史输入 Encoder（约 $0.1$\,s）。
+\end{paperbox}
+
+\subsection*{逐项人话（Eq.\,8）}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.3cm}p{10.2cm}@{}}
+\hline
+符号 & 解释 \\
+\hline
+$\hat q_m^{\mathcal{P}}$ &
+三电机角，\emph{并联坐标}。注意：仿真里身子是串联，但喂给网络前先换成并联角。 \\
+姿态 / 角速度 & IMU；真机可得。 \\
+$\cos,\sin$ phase &
+开环时钟：支撑/腾空参考。$q_{\mathrm{phase}}$ 在 $[-2\pi,2\pi]$ 扫，
+$<0$ stance，$>0$ swing（论文原文）。 \\
+$\dot q^d$, $T$ & 命令：水平速度 + 周期（任务条件）。 \\
+$a_{t-1}$ & 上一步输出，抗抖。 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{warnbox}
+Phase \emph{不是}两个控制器切换开关；是观测与奖励里的参考节律。
+真正一个 Actor 全程输出 $a_t$。
+\end{warnbox}
+
+\section{Lec4.6 \; 欠驱动：为何跳跃「更 POMDP」}
+
+\begin{paperbox}[§II-D Underactuation]
+飞行 $0.2$--$0.4$\,s 几乎只受重力；支撑相才有大力。
+控制器必须在空中就「为落地准备」。假设：难点在长欠驱动窗口；
+需要从历史估计尤其 $z$ 向速度。
+\end{paperbox}
+
+\begin{bridge}
+\textbf{课件语言}：长 horizon credit assignment + partial observability。\\
+\textbf{论文语言}：prolonged aerial phase；history encoder + explicit $v$ estimate。
+\end{bridge}
+
+\newpage
+%==============================================================================
+\part{Part III —— 动作、底层 PD、奖励（分层控制）}
+%==============================================================================
+
+\section{动作空间：策略输出「目标角」}
+
+\begin{paperbox}[§III Action]
+Actor $@50$\,Hz 输出并联期望角 $a_t$。\\
+PD $@500$\,Hz（训练叙述）或文中也写 $200$\,Hz：
+\[
+\tau^{\mathcal{P}}=K_p(a_t-q^{\mathcal{P}})-K_d\dot q^{\mathcal{P}},
+\quad K_p=20,\; K_d=0.5.
+\tag{论文 Eq.9c}
+\]
+仿真中再映射成 $\tau^{\mathcal{S}}$；真机直接用 $\tau^{\mathcal{P}}$。
+\end{paperbox}
+
+\begin{csbox}[Lec10 Optimal Control 直觉]
+工业界常态：RL/规划输出参考；高频伺服（PD/阻抗）执行。
+这样 RL 不必在 kHz 力矩环上做探索。
+\end{csbox}
+
+\begin{keyidea}
+把系统想成两层：上层 RL「慢思考」；下层 PD「快执行」。
+\end{keyidea}
+
+\section{奖励设计（课件：「奖励塑造」）}
+
+\begin{csbox}
+奖励工程 = 定义任务。过稀：学不动。过偏：reward hacking。
+课件反复强调 reward 是归纳偏置。
+\end{csbox}
+
+\begin{paperbox}[§III Rewards]
+三类：tracking / phase schedule / auxiliary（细节在附录）。
+即：跟指令；跟节律接触；别乱动。
+\end{paperbox}
+
+\begin{example}
+若只奖励「高度最大值」偶发一次，几乎无梯度（稀疏）。
+加相位匹配与速度跟踪后，每一步都有学习信号（dense shaping）。
+\end{example}
+
+\newpage
+%==============================================================================
+\part{Part IV —— Policy Gradient \& PPO（课件 Lec5 / Lec9）}
+%==============================================================================
+
+\section{Lec5 \; 策略梯度在说什么}
+
+\begin{csbox}[Lec5]
+目标 $J(\theta)=\mathbb{E}_{\tau\sim\pi_\theta}[R(\tau)]$。\\
+策略梯度定理（直觉版）：
+\[
+\nabla_\theta J(\theta)=\mathbb{E}\Big[\sum_t\nabla_\theta\log\pi_\theta(a_t|s_t)\, \Psi_t\Big],
+\]
+$\Psi_t$ 可用回报 $G_t$、或优势 $A_t$ 等。
+「好动作提高 log 概率」。
+\end{csbox}
+
+\textbf{高方差问题}：只用整条回报估 $\Psi$，噪声大。$\Rightarrow$ 引入 baseline / Critic。
+
+\section{Lec6 \; Actor--Critic}
+
+\begin{csbox}[Lec6]
+Actor：$\pi_\theta$。Critic：$\hat V_\phi$。\\
+优势例子（GAE 等）：$\hat A_t \approx r_t+\gamma\hat V(s_{t+1})-\hat V(s_t)$。\\
+用 $\hat A$ 减方差；有偏但实用（bias--variance）。
+\end{csbox}
+
+\begin{paperbox}[§III asymmetric AC]
+Actor 看可部署信息；Critic 看「actor 观测 + 仿真真值」。
+这是腿足常见的特权学习（privileged learning），不是标准对称 AC 课本最小例子，
+但是 Lec6 思想的直接工程加强。
+\end{paperbox}
+
+\section{Lec9 \; PPO（论文优化器）}
+
+\begin{csbox}[Advanced Policy Gradients]
+PPO 用概率比
+$r_t(\theta)=\pi_\theta(a_t|s_t)/\pi_{\theta_{\mathrm{old}}}(a_t|s_t)$，
+裁剪避免更新过大：
+\[
+L^{\mathrm{CLIP}}=\mathbb{E}\big[\min(
+r_t\hat A_t,\;
+\mathrm{clip}(r_t,1-\epsilon,1+\epsilon)\hat A_t)\big].
+\]
+实现上：并行环境采大量轨迹，多 epoch 更新，加 value loss、entropy。
+\end{csbox}
+
+\begin{paperbox}
+「training is done in Isaac Gym using PPO」。\\
+大规模并行（课件也强调 sample efficiency / throughput）是腿足可训的关键工程点。
+\end{paperbox}
+
+\begin{keyidea}
+你不必手推 PPO；你要能说：论文 = \textbf{model-free on-policy} + PPO + 并行仿真。
+\end{keyidea}
+
+\newpage
+%==============================================================================
+\part{Part V —— 表示学习（课件 Lec18 × 论文 Fig.4）}
+%==============================================================================
+
+\section{为何要「压缩历史」}
+
+输入：最近 $H$ 帧观测拼接，维度高、冗余。\\
+需要短向量 $\mu_t$ 总结「对跳跃有用的记忆」。
+
+\section{VAE / $\beta$-VAE（对上课件生成模型）}
+
+\begin{csbox}[Lec18 Variational Inference]
+VAE：Encoder $q(\mu|h)$，Decoder $p(o|\mu)$。\\
+损失 $\approx$ 重建误差 $+\;\beta\,\mathrm{KL}(q\|p)$。
+$\beta$ 控压缩强度。
+\end{csbox}
+
+\begin{paperbox}[Fig.\,4 文字]
+Encoder $\Phi$：历史 $o_{t-1:t-H}$ $\to$ latent $\mu_t$，外加速度/接触估计头。\\
+Decoder $\beta$：$\mu_t\to\hat o_{t+1}$。按 $\beta$-VAE：重建 + KL。\\
+Actor：$\pi(a_t\mid \mu_t,\hat{\dot q}_t,o_t)$。
+\end{paperbox}
+
+\section{显式速度回归（辅助任务）}
+
+\begin{paperbox}
+$\hat{\dot q}_{[x,y,z]}$ 用 MSE 拟合仿真真值。\\
+消融 §IV：
+\begin{itemize}
+  \item Proposed = latent + 显式估计；
+  \item State Estimation Only；
+  \item Latent Only。
+\end{itemize}
+结论：长空时显式速度\textbf{至关重要}；纯 latent 不够。
+\end{paperbox}
+
+\begin{bridge}
+\textbf{课件}：multi-task / auxiliary losses 改善表示。\\
+\textbf{论文}：控制主损失（PPO）+ VAE + MSE 速度头。
+\end{bridge}
+
+\begin{center}
+\begin{tikzpicture}[box/.style={draw,align=center,rounded corners,font=\scriptsize,inner sep=3pt}]
+\node[box,fill=blue!10] (h) {历史 $H=5$};
+\node[box,right=0.8cm of h,fill=blue!15] (e) {$\Phi$ Encoder};
+\node[box,above right=0.25cm and 0.7cm of e,fill=green!12] (m) {$\mu_t$};
+\node[box,below right=0.25cm and 0.7cm of e,fill=green!12] (v) {$\hat v$};
+\node[box,right=2.6cm of e,fill=orange!15] (pi) {$\pi$};
+\node[box,right=0.7cm of pi,fill=red!12] (a) {$a_t$};
+\node[box,below=0.9cm of e,fill=gray!15] (d) {$\beta$ Decoder $\hat o_{t+1}$};
+\node[box,below=0.9cm of pi,fill=purple!12] (c) {Critic (+特权)};
+\draw[-Latex] (h)--(e); \draw[-Latex] (e)--(m); \draw[-Latex] (e)--(v);
+\draw[-Latex] (e)--(d); \draw[-Latex] (m)|-(pi); \draw[-Latex] (v)|-(pi);
+\draw[-Latex] (pi)--(a); \draw[-Latex,dashed] (c)--(pi);
+\end{tikzpicture}
+\end{center}
+
+\newpage
+%==============================================================================
+\part{Part VI —— Sim-to-Real（课件 Transfer $\times$ 论文 §III-C / §V）}
+%==============================================================================
+
+\section{课件视角：两种缺口}
+
+\begin{csbox}[Transfer / DR]
+(1) \textbf{动力学缺口}：质量摩擦等 $\Rightarrow$ Domain Randomization。\\
+(2) \textbf{模型结构缺口}：并联仿不准 $\Rightarrow$ 换模板 / 特殊转换。
+论文两刀都用了。
+\end{csbox}
+
+\section{Domain Randomization（论文明文）}
+
+\begin{paperbox}
+随机动力学与控制参数；地形：缓坡、糙坡、台阶（Fig.\,5）。\\
+真机：平地 + $10^\circ$ 坡；相对 SLIP 基线存活时间与位置误差更优（Table\,I）。
+\end{paperbox}
+
+\section{Serial Template —— 结构性 sim2real}
+
+\begin{paperbox}[§II-C / §III-C]
+为避免直接仿 3D 并联，建 DoF 相同的串联模板 $S$：
+Roll--Pitch--Shift。工作空间相近；动力学在 Isaac 可训。
+\end{paperbox}
+
+你本地可看：
+\texttt{hopper\_serial.urdf} / \texttt{hopperHFAcase2026/model/hopper\_serial.xml}。
+
+\section{Eq.\,9 逐行精读（务必过一遍）}
+
+\begin{subequations}
+\begin{align}
+q^{\mathcal{P}} &= IK^{\mathcal{P}}\!\big(FK^{\mathcal{S}}(q^{\mathcal{S}})\big)
+\tag{9a}\\
+\dot q^{\mathcal{P}} &= (J^{\mathcal{P}})^{-1} J^{\mathcal{S}}\dot q^{\mathcal{S}}
+\tag{9b}\\
+\tau^{\mathcal{P}} &= K_p(a_t-q^{\mathcal{P}})-K_d\dot q^{\mathcal{P}}
+\tag{9c}\\
+\tau^{\mathcal{S}} &= (J^{\mathcal{S}})^{T}(J^{\mathcal{P}})^{-T}\tau^{\mathcal{P}}
+\tag{9d}
+\end{align}
+\end{subequations}
+
+\begin{description}[style=nextline,leftmargin=1.6cm]
+\item[(9a)] 串联位形 $\xrightarrow{\text{FK}}$ 脚点 $\xrightarrow{IK^{\mathcal{P}}}$ 等价并联角。策略看见并联角。
+\item[(9b)] 速度层同样换坐标（雅可比）。
+\item[(9c)] PD 在并联误差上算「并联世界该有的力矩」。
+\item[(9d)] 同一只脚的力 $f$：$\;\tau=J^\top f\;\Rightarrow$
+可从 $\tau^{\mathcal{P}}$ 换 $\tau^{\mathcal{S}}$（静力虚功）。
+\end{description}
+
+\begin{keyidea}
+策略接口永远是「并联」；仿真动力学是「串联」。映射垫在中间。
+部署：垫片拿走。
+\end{keyidea}
+
+\section{三种基线（§V）——考试必背}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.5cm}p{5cm}p{5cm}@{}}
+\hline
+方法 & 做法 & 论文结果 \\
+\hline
+Torque mapping（本文） & 训时 Eq.\,9；部署无映射 & 成；力矩曲线 sim≈real \\
+Joint target mapping & 只做角度运动学 remap & 败 \\
+Parallel MuJoCo 直接训 & 硬仿 3-RSR & 仿真不可靠，败 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{bridge}
+\textbf{课件}：model mismatch 不能只靠「看起来差不多的状态映射」。\\
+\textbf{论文}：力/力矩层对齐比位置层对齐更贴近接触动力学。
+\end{bridge}
+
+\newpage
+%==============================================================================
+\part{Part VII —— Model-free vs Model-based（Lec10--12 对照）}
+%==============================================================================
+
+\section{论文选择 model-free；底层仍有模型式 PD}
+
+\begin{csbox}[Lec10--12]
+Model-based：学/用 $P$，再规划。\\
+Model-free：直接学 $\pi$ 或 $Q$。\\
+还有混用。最优控制（LQR/MPC/QP）属「有模型」。
+\end{csbox}
+
+\begin{paperbox}
+骨干：model-free PPO（无显式学 $P$）。\\
+但：腿有解析 FK/IK/J（式 1--7）；底层 PD；对比基线是 SLIP model-based。\\
+即：\textbf{混合系统}——RL 决策 + 经典低层 + 运动学工具。
+\end{paperbox}
+
+\begin{example}[和你们实验室栈]
+Cao HFA：整段偏 model-based QP。\\
+OMEGA：整段偏 RL。\\
+你们 MJX 路线：RL + 原生并联模型（与 OMEGA「避开并联仿真」相反）。
+\end{example}
+
+\newpage
+%==============================================================================
+\part{Part VIII —— 把一局训练「逐步播放」}
+%==============================================================================
+
+\section{伪代码（对照课件 ``anatomy of RL algorithm''）}
+
+\begin{verbatim}
+初始化 Actor π_θ, Critic V_φ, Encoder Φ, Decoder β
+循环 iter = 1..N:
+  用当前 π 在 Isaac 并行环境 rollout:
+    读 serial 状态 q^S
+    用 (9a)(9b) 得 q^P, dq^P，拼 o_t（Eq.8）
+    历史窗口 H=5 → Φ → (μ, vhat)
+    a ~ π(.|μ,vhat,o); PD → τ^P → (9d) → τ^S → 步进物理
+    记录 r, 存缓冲；VAE 重建目标 o_{t+1}；速度 MSE 目标 v_gt
+  用 PPO 更新 π、V（非对称观测）
+  更新 Φ,β（重建+KL）与速度头（MSE）
+导出 Actor（及必要的估计头）到真机；去掉 (9a)(9b)(9d)
+\end{verbatim}
+
+\begin{paperbox}[频率]
+策略 $50$\,Hz；PD $200$--$500$\,Hz（文中两处数字，抓住「慢策略快伺服」即可）。
+\end{paperbox}
+
+\newpage
+%==============================================================================
+\part{Part IX —— 消融、真机、你怎么自学}
+%==============================================================================
+
+\section{§IV 消融：用课件语言复述}
+
+「表示是否包含任务关键物理量」决定长时部分观测控制的成败。\\
+仅生成式重建（latent）不保证 $v_z$ 可解码成控制有用信号 $\Rightarrow$ 要 auxiliary supervised head。
+
+\section{§V 真机：zero-shot}
+
+\begin{paperbox}
+同策略 $\beta=0.005$ 平地 $0.2$\,m/s、$T\approx0.38$\,s；无微调。\\
+Fig.\,13：映射后仿真力矩与真机力矩后期形态接近。
+\end{paperbox}
+
+\section{小白 14 日学习计划（课件+论文）}
+
+\begin{enumerate}[leftmargin=*]
+  \item Day1--2：本讲义 Part I--II + CS285 Lec4 视频；只求懂 MDP/POMDP。
+  \item Day3--4：Part III--IV + Lec5/6；能复述 Actor Critic。
+  \item Day5：Lec9 PPO 概念 + 论文一句 ``Isaac+PPO''。
+  \item Day6--7：Part V + 论文 Fig.\,4；自己画 Encoder 图。
+  \item Day8--10：Part VI；手抄 Eq.\,9；解释 9d。
+  \item Day11：读 §IV 消融，对照三条 baseline。
+  \item Day12：读 §V 真机段。
+  \item Day13：对照你们 \texttt{train\_hop.py}（相同点/不同点）。
+  \item Day14：闭卷写「7 句复述」（见下）。
+\end{enumerate}
+
+\section*{附录 A：闭卷 7 句（答辩用）}
+
+\begin{enumerate}
+  \item 跳跃控制写成 POMDP，因传感器不全且空中久欠驱动。
+  \item 用历史 + $\beta$-VAE + 显式速度估计补信息。
+  \item 非对称 Actor--Critic：Critic 训练看特权，Actor 可上真机。
+  \item 优化器用 PPO，仿真用 Isaac 大规模并行。
+  \item 因 3D 并联难仿，改用串联模板训。
+  \item 力矩级 Jacobian 映射对齐并联接口与串联动力学；部署去映射。
+  \item DR + 地形随机提升 sim-to-real；实验里优于 SLIP 基线。
+\end{enumerate}
+
+\section*{附录 B：符号速查}
+
+\begin{tabular}{@{}ll@{}}
+$\pi_\theta$ & 策略（Actor）\\
+$V_\phi$ & 价值（Critic）\\
+$o_t$ / $a_t$ / $r_t$ & 观测 / 动作 / 奖励\\
+$\mu_t$ & VAE latent\\
+$\mathcal{P},\mathcal{S}$ & Parallel / Serial\\
+$J$ & Jacobian\\
+$\gamma$ & 折扣\\
+\end{tabular}
+
+\section*{附录 C：和你们代码的桥}
+
+\begin{tabular}{@{}p{4.5cm}p{9cm}@{}}
+\hline
+OMEGA & 你们常见对应物 \\
+\hline
+Isaac Gym + PPO & Brax PPO + MJX \\
+Serial template & （论文路线）本地 \texttt{hopper\_serial.*} \\
+并联难仿假设 & 被 MJX \texttt{equality connect} 挑战 \\
+History $H=5$ & \texttt{HW\_HIST=5}\\
+Phase clock & \texttt{cos/sin(phase)} in \texttt{train\_hop.py}\\
+Torque mapping Eq.\,9 & 你们路线通常\emph{不做}；改 DR + 标定 \\
+\hline
+\end{tabular}
+
+\section*{推荐资源}
+
+\begin{itemize}
+  \item CS285 主页与 slides：\url{https://rail.eecs.berkeley.edu/deeprlcourse/}
+  \item 中英字幕检索：「UC Berkeley CS285」「Sergey Levine Deep RL」
+  \item PPO：Schulman et al.\ arXiv:1707.06347
+  \item $\beta$-VAE：Higgins et al.\ ICLR 2017
+  \item 论文本地：\texttt{ppopaper}；开源脚注：\texttt{CUHK-BRME/OMEGA}（复现需另取代码）
+\end{itemize}
+
+\begin{keyidea}[收束]
+\textbf{课件}教你：MDP、策略梯度、AC、PPO、VAE、迁移。\\
+\textbf{论文}教你：把它们组装成「可部署的并联腿跳跃」——关键增量在
+欠驱动表示 与 serial/torque sim-to-real，而不是发明全新优化器。
+\end{keyidea}
+
+\end{document}

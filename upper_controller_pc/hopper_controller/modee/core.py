@@ -401,50 +401,39 @@ class ModeEConfig:
     #     kappa*T_return TIME window was DELETED 2026-07-23 09:44 per user
     #     ("不要什么时间保护窗了"): a corrupted vz_lo latch turned it into
     #     up to 0.46 s of touchdown blindness that broke hop chaining.
+    # Height controller restored from GitHub commit 2aa050e7 (2026-07-20).
+    # Newer work-allocation/energy-shaping implementations remain in this
+    # file for comparison but are bypassed while this switch is true.
+    # 2026-07-25 06:58 (user): OFF -- height back to 51b4c2d FB-SLIP v3.
+    github_mode1_height_control: bool = False
     use_energy_compensation: bool = True
-    # 2026-07-23 06:51: 0.12 with the old 5g force budget was WRONG -- it
-    # commanded 329 N / 18-21 Nm while the AK60 tau_meas clips at +-10 Nm
-    # (~165 N vertical) and the leg just rattled.
-    # 06:57 (user: "加大压缩量"): reach the height through STROKE instead
-    # of force. With F capped at 2.5*m*g (deliverable) and stroke raised
-    # to 9 cm, the planner sizes x_c_need = v_to^2/(2*(alpha-1)*g)
-    # and F_push rides the honest 165 N ceiling: v_to from
-    # 0.5*m*v^2 = (F-mg)*x.
-    # 07:01 log at 0.12: squat 8 cm, 421 ms flight -- WORKS, but user:
-    # "压缩太多了 跳太高了". 0.09 sizes x_c ~6 cm, v_to 1.33.
-    # 07:17 user: 0.09 -> 0.07 (x_c ~4.7 cm, v_to 1.17).
+    # MATLAB pump gain (bypassed while github_mode1_height_control=False).
+    energy_comp_kp: float = 12.0
+    energy_comp_qd_ramp_mps: float = 0.08
+    mode1_apex_adapt_gamma: float = 0.4
+    # 2026-07-25 06:58: restore 51b4c2d FB-SLIP v3 apex TARGET (do not
+    # raise this to get more push -- use takeoff_height_m below).
     hop_height_m: float = 0.1
-    # ---- Apex tracking: inter-hop energy regulation ----
-    # Closes the "single-knob height" loop with discrete INTEGRAL action
-    # in the ENERGY domain (2026-07-24, 04:38 log).  The old estimate was
-    # the RATIO eta = vz_meas/v_cmd, but the leg linkage returns a
-    # roughly FIXED elastic energy each hop: delivery is v_meas^2 ~=
-    # v_cmd^2 + 2*b, an additive offset, so the ratio GROWS as the
-    # command shrinks and eta chased it 1.0 -> 1.72 while cutting
-    # v_to_cmd 1.17 -> 0.68 ("越跳越低").  Integral action on the apex
-    # energy error assumes NO delivery model at all:
-    #   b_{k+1} = b_k + gamma*w_k * g_up*(h_apex_meas - h*)
-    #   v_cmd^2 = max(2*g_eff*h* - 2*b, v_min^2)
-    # and converges for any monotonic delivery curve.  w_k in [0,1] is
-    # the measurement confidence, the ratio of the observed flight time
-    # to the expected ballistic round trip -- a 60 ms double-contact
-    # stutter (04:38 log) carries ~5% weight instead of poisoning the
-    # estimate (smooth weighting, not a cut).  Anti-windup: b stops
-    # integrating while v_cmd sits on its clip.
+    # Ballistic height that sizes ONLY takeoff speed:
+    #   v_to = sqrt(2*g_eff*takeoff_height_m)
+    # Decoupled from hop_height_m so push energy can be raised without
+    # moving the apex feedback setpoint (07:07 user).
+    # 2026-07-25 09:39 (user: "stance phase 出这么大的力没必要, 实际跳太高
+    # 了", 093419 apex 0.13-0.22 on the 0.10 target): 0.15 -> 0.10.  The
+    # 0.15 boost dated from the weak-delivery era; with the latched push +
+    # positional reception delivery is ~100%, so size v_to for the apex
+    # target itself.
+    takeoff_height_m: float = 0.08
+    # 2026-07-25 06:58: re-enable apex energy bias (51b4c2d).
     apex_adapt_enable: bool = True
     apex_adapt_gamma: float = 0.5
-    # |b| bound (m^2/s^2 of specific energy, = g*0.3 m of apex height).
     apex_adapt_bias_max: float = 3.0
-    # Prior on b at reset (m^2/s^2) -- a MACHINE CONSTANT, calibrated
-    # like mass.  Two independent runs at different targets converged to
-    # the same value (sample1 @ h*=0.07: b=0.54; 053421 @ h*=0.10:
-    # b=0.55, apex landed 0.102), confirming the leg linkage returns a
-    # fixed ~0.55 m^2/s^2 of specific energy per hop regardless of
-    # command.  Seeding it here makes hop 1 land on target instead of
-    # overshooting 50% and needing 3 hops to converge.
     apex_adapt_bias0: float = 0.55
-    # Per-hop |db| rate limit: one bad arc can nudge, not whip, the
-    # command.
+    # 2026-07-25 09:22 (user: "第一跳跳的太高了", 092100 log): standing hop
+    # flew 16.4 cm on the 10 cm target while hop2 hit 10.1 exactly, so only
+    # the standing elastic-return constant is short.  1.0 -> 1.4 trims the
+    # standing v_to_cmd 0.96 -> ~0.4 m/s (energy comes from the preload).
+    apex_e_bias_standing: float = 1.4
     apex_adapt_bias_rate: float = 0.15
     # ---- Robot constants for FB-SLIP (not per-height tuning knobs) ----
     # Hard peak-force budget as a multiple of body weight (F_max = beta*m*g).
@@ -452,20 +441,82 @@ class ModeEConfig:
     # (tau_meas hard-clips there while 18-21 Nm was commanded), which is
     # ~165 N vertical = 2.5x weight at m=6.7. Budgeting above the hardware
     # ceiling only breaks the constant-force model (bang-bang rattle).
-    leg_force_budget_g: float = 2.5
+    # 2026-07-23 06:51: 5.0 -> 2.5 (AK60 +-10 Nm ~165 N = 2.5 mg).
+    # 2026-07-25 07:03 (user "腿部 push可以再加大"): 2.5 -> 3.0
+    # 07:06 (user "还没跳起来"): 3.0 -> 3.5 (~230 N). Motors still
+    # clip near 10 Nm; the deficit law rides this ceiling longer.
+    leg_force_budget_g: float = 3.5
     # Usable vertical leg stroke for compression (m).
     # 2026-07-23 06:57 (user: "加大压缩量"): 0.06 -> 0.09. With the force
     # ceiling fixed at ~165 N (+-10 Nm actuators), stroke is the only
     # energy lever: E = (F - m*g)*x. 9 cm gives (165-66)*0.09 = 8.9 J.
     # Bottom height l0 - 0.09 = 0.371 m stays above z_guard (0.35), and
     # soft_land_depth_max_m (0.15) shows the linkage allows it.
-    leg_stroke_max_m: float = 0.09
+    # 2026-07-24 11:02 (user: "缩短stance行程"): 0.09 -> 0.06.  Stance was
+    # ringing throughout (110124 log: tau slope flipping every ~2 ticks,
+    # fz std 20-40 N, comp 26-53 mm); a shorter reception spends less
+    # time on the resonant linkage.  Costs energy headroom: usable
+    # E = (165-66)*0.06 ~= 5.9 J -> v_to ceiling ~1.3 m/s (leg alone).
+    # 2026-07-24 11:40 (user: "让压缩大一点"): 0.06 -> 0.075.  The AK60s
+    # are at peak torque, so stroke is the only leg-side energy lever:
+    # E = (165-66)*0.075 ~= 7.4 J -> v_to ceiling ~1.49 m/s.  Middle
+    # ground vs the 0.09 that rang; the k-d damping (40 N*s/m) now
+    # handles the linkage resonance the old deficit law ignored.
+    # 2026-07-24 12:18 (user: "一定要压缩到8cm"): 0.075 -> 0.08.  Bottom
+    # body height l0 - 0.08 = 0.381 m stays above z_guard (0.35).
+    # 2026-07-24 12:39 (user: target height 8 cm, height24 log): deep
+    # 8-9 cm squats delivered ~24 cm apex on a 10 cm target.  Cap the
+    # stroke at 6 cm so x* for hop_height=0.08 (~5.2-5.6 cm) can be
+    # reached without the force-cap over-working a 9 cm squat.
+    # 2026-07-24 13:07 (user: "再减压缩", 130515 still ~22 cm): 0.06 ->
+    # 0.04.  Wall held ~4-5 cm but energy delivery over that stroke
+    # still overshoots height; shorten the work lever.
+    # 2026-07-24 13:09 (user: "压缩太短"): 0.04 -> 0.05.  Middle ground
+    # between the 6 cm that overshot and the 4 cm that felt too short.
+    # Fixed touchdown-relative compression target and physical control stroke.
+    # 90 mm keeps the bottom at l0-0.09 = 0.371 m, above z_guard=0.35 m.
+    leg_stroke_max_m: float = 0.090
     # Design braking force as a multiple of stance weight (alpha*m*g_st).
     # Must be > 1 (net upward force while braking). Sets how deep a given
     # landing speed compresses: x_c = v_td^2 / (2*g_st*(alpha-1)).
     # 2026-07-23: 3.0 -> 2.5, matched to the real +-10 Nm (~2.5x weight)
     # actuator ceiling so the planned decel is one the leg can deliver.
     stance_brake_force_g: float = 2.5
+    # Reception-spring PRELOAD as a fraction of stance weight (F at zero
+    # travel).  2026-07-25 07:15 ("压缩量没达到 ... 感觉卡住", 071456 log):
+    # the old law started at 1.0*m*g_st -- full weight support at first
+    # touch -- so the body could only sink on its (impact-depleted) kinetic
+    # energy and bounced around zero depth: comp peaked at 2.9 cm of the
+    # planned 9 cm and rang 1.5-2.9 cm for 50 ms before the bottom latched.
+    # With c0 < 1 the leg genuinely yields at touch (net downward force
+    # (1-c0)*m*g_st), the spring equilibrium moves to an interior depth,
+    # and the energy budget is re-solved so the SAME planned bottom absorbs
+    # KE + the extra gravity work:  F_bot = (2-c0)*m*g_st + m*v_td^2/T.
+    stance_recv_preload_frac: float = 0.3
+    # TARGET compression travel (m), touchdown-relative.  2026-07-25 07:32
+    # (user: "压缩行程要到7") + 07:35 ("第二跳没达到压缩量", 073401 log):
+    # energy-sized springs stall shallow no matter how v_td is measured --
+    # the ballistic arc reads the PRE-impact speed (hop1 sized 230 N and
+    # stalled at 2.8/11.3 cm) while the post-impact KF vz rings, and the
+    # linkage friction eats the true KE anyway.  The reception is therefore
+    # POSITIONAL: the spring force stays BELOW body weight until this depth
+    # (crossing m*g exactly here), so gravity itself guarantees the sink,
+    # independent of every velocity estimate.  Past it the force rises to
+    # the full leg budget at the planned bottom (the catch).  Capped by
+    # leg_stroke_max_m (9 cm).
+    # 2026-07-25 09:13 (user: "我想压缩 5cm"): 0.070 -> 0.050.
+    # 09:15 (user: "我只要 4-5 就好"): 0.050 -> 0.045 (body settles just
+    # past the crossing, observed +0.1-0.3 cm, so 4.5 targets mid 4-5).
+    stance_travel_min_m: float = 0.045
+    # Fraction of stance weight the reception spring reaches AT the target
+    # depth (< 1 keeps a net downward pull through linkage friction there).
+    stance_recv_tgt_weight_frac: float = 0.95
+    # CATCH span (m): depth past the target within which the reception
+    # force rises from the target weight fraction to the full leg budget.
+    # 2026-07-25 09:30 ("compression 太深了"): the catch previously ended
+    # at the energy-planned bottom (11-12 cm), so its slope was too soft
+    # and landings overshot the target by ~1 cm.
+    stance_recv_catch_span_m: float = 0.015
     # Brake force rise time after touchdown (s); avoids a force step at TD.
     stance_brake_ramp_s: float = 0.015
     # First-order blend on the stance-Z force REFERENCE (s). 07:00 log: the
@@ -496,6 +547,14 @@ class ModeEConfig:
     # lasted longer than the old window and latched a false bottom at
     # 0.7 cm).  The window must outlast the ringing; a re-descending body
     # resets the counter, so a longer window cannot dead-lock.
+    # 2026-07-24 11:51 ("假跳", 115015 log): 30 -> 10 ms.  The passive
+    # linkage rebounds the body off the true bottom in ~35 ms; waiting
+    # 30 ms more (latch at 78-93 ms, st3 never) let the leg re-extend
+    # before k_up was sized -- zero remaining stroke, zero push work.
+    # Under the k-d law an "early" latch is harmless: the ascent spring
+    # F = m*g + k_up*x_z is a spring either way, and a re-descending
+    # body just loads it.  The 30 ms anti-false-bottom rationale
+    # belonged to the old constant-force push.
     stance_bottom_confirm_s: float = 0.030
     # First-order blend of the push spring force at the latch (s).
     stance_push_blend_tau_s: float = 0.01
@@ -506,6 +565,8 @@ class ModeEConfig:
     # PHYSICAL, computed per hop at TD from constant-deceleration
     # kinematics (a = v_td^2 / (2*x_c)  =>  stop time t = v_td/a).
     stance_push_min_stance_s: float = 0.01
+    stance_push_vz_mps: float = 0.05
+    stance_push_confirm_steps: int = 3
     # ---- ENERGY-DEFICIT SHAPING (FB-SLIP v3, 2026-07-24) ----
     # ONE continuous stance force law, re-planned every tick, both
     # sub-phases are the same equation "deliver the remaining energy
@@ -525,7 +586,177 @@ class ModeEConfig:
     # depth gates, no stroke gates, no sink state, no time cuts (04:27
     # log: the depth gate dead-locked COMP for 411 ms when v_td was
     # overestimated and the planned depth exceeded the real stroke).
-    stance_bottom_settle_mps: float = 0.05
+    # 2026-07-24 11:51: 0.05 -> 0.10.  The LPF'd kinematic vz carries
+    # +-0.15 residual ringing; at -0.05 the confirm counter kept
+    # resetting through the rebound (115015 st3: 87 ms stance, never
+    # latched).  A -0.10 threshold cannot false-trigger mid-descent: at
+    # v_td ~1.5 the descent crosses -0.10 only once, at the bottom.
+    stance_bottom_settle_mps: float = 0.10
+    # Position-based rebound latch (m): the body rising THIS far off its
+    # stance-max depth is past the bottom by definition, whatever the vz
+    # estimate says.  Direct kinematic bottom detector, immune to the
+    # velocity noise that gates the vz-settle path.
+    stance_bottom_rebound_m: float = 0.004
+    # ---- MATLAB-STYLE k-d + ENERGY STANCE Fz (2026-07-24 11:19) ----
+    # 111228 log: the v3 deficit law parked Fz at ~m*g for the whole
+    # descent (energy_comp_fz = 0 all COMP) and the underdamped linkage
+    # rang against that soft support ("腿一直抖 是fz的问题"), then PUSH
+    # stepped 72->90 N at the latch.  A monotone min->max quadratic
+    # profile over the WHOLE stance was simulated first (user request)
+    # and is physically infeasible: reception needs force ABOVE m*g
+    # early in the descent, a rising parabola delivers it late -- point
+    # -mass sims sank 10-47 cm on a 6 cm stroke and blew through v_to.
+    # Per the user's own fallback ("做不好耦合就改回matlab一样的 k d
+    # 加energy"), stance Fz is now the classic two-spring energy law
+    # with POSITION stiffness (which the deficit law never had -- that
+    # is what let the linkage ring freely):
+    #   descent:  F = m*g_st + k_dn*(x_z - x_td) - d*vz
+    #             k_dn = m*(v_td/travel)^2   (absorbs exactly the
+    #             landing KE by the planned bottom: 0.5*k*trav^2 =
+    #             0.5*m*v_td^2)
+    #   ascent:   F = m*g_st + k_up*x_z      (k_up sized ONCE at the
+    #             measured bottom x_b: 0.5*k_up*x_b^2 = 0.5*m*v_to^2
+    #             + m*g_st*x_b  ->  k_up = m*(v_to^2 + 2*g_st*x_b)/x_b^2,
+    #             spring PE releases exactly the takeoff energy)
+    # Point-mass sims: depth tracks the plan within ~10%, v_lo within
+    # 0.06-0.2 of v_to over v_td 0.6-1.4, F peaks at the bottom (SLIP
+    # shape).  Bottom detection reuses the existing vz-settle latch;
+    # the fz blend LPF smooths the k_dn -> k_up handover.
+    stance_matlab_kd: bool = False
+    # Descent damping (N*s/m).  Sim: 40 trims the bottom overshoot and
+    # bleeds the ~15-25 Hz linkage ringing that the pure deficit force
+    # ignored; 80 starts eating takeoff energy.
+    stance_matlab_d_n_s_m: float = 40.0
+
+    # ==== ENERGY-SHAPING STANCE (2026-07-24 12:08; stroke-coupled
+    # 12:33) ====
+    # Literature: Raibert (1984) regulates hopping height by measuring
+    # total system energy and injecting compensating work each stance.
+    # Modern virtual-model control does the same with negative virtual
+    # damping on extension.  ONE continuous law, live every tick:
+    #   E   = 0.5*m*vz^2 + m*g*(h - l0)           (measured)
+    #   E*  = m*g_eff_flight*hop_height           (single knob)
+    #   x*  = E* / (F_max - m*g_st)               (height→compression)
+    #   F   = m*g_st + k*(x - x*) - d*vz + c*(E*-E)*vz
+    # The spring is CENTERED on x*: while the body is shallower than
+    # the energy-required squat, (x-x*) < 0 softens the catch and the
+    # body sinks; past x* it pushes back.  That is the explicit
+    # hop_height → compression coupling (123247 log: without it the
+    # squat collapsed 36→12→0 mm as hops got lower, push stroke
+    # vanished, and the last hops never left the ground -- force-cap
+    # work = (Fmax-mg)*x cannot deliver E* from a shallow squat).
+    # The pump term still injects on ascent / softens on descent under
+    # deficit, floored at -pump_dn_frac*m*g_st.
+    stance_energy_shaping: bool = False
+    # Reception spring about the energy-sized setpoint x* (N/m).
+    stance_es_k_n_m: float = 1500.0
+    # Fixed stance damping (N*s/m) for the linkage ringing.
+    stance_es_d_n_s_m: float = 20.0
+    # Energy pump gain c (N per J*(m/s)).
+    stance_es_pump_gain: float = 150.0
+    # Descent softening floor on the pump term only.
+    stance_es_pump_dn_frac: float = 0.5
+    # Margin on x* = margin * E* / (Fmax - mg).  >1 leaves stroke for
+    # unmodeled linkage losses so the force-cap work can still hit E*.
+    # 2026-07-24 12:39: with hop_height=0.08, margin 1.2 → x* ≈ 5.2 cm
+    # (clipped by leg_stroke_max_m=0.06).  Was 1.3 → 7.1 cm at h*=0.10,
+    # which overshot to ~24 cm (height24 log).
+    # 2026-07-24 13:07: 1.2 -> 1.0, stroke 4 cm — x* sits on the wall.
+    # 2026-07-24 13:09: stroke back to 5 cm; keep margin 1.0 so x* ≈ 4.4
+    # cm (spring setpoint) with wall at 5 cm.
+    stance_es_x_star_margin: float = 1.0
+    # Unilateral wall stiffness (N/m) for x > leg_stroke_max_m.  Without
+    # this, stroke_max only clips the setpoint x* and the soft spring
+    # k*(x-x*) lets the body punch through (124117: plan 59 mm, actual
+    # 76 mm).  2e4 N/m adds ~200 N per cm past the limit -- above the
+    # force cap within 1 cm, so the hardware torque rescale holds the
+    # body near the stroke.
+    stance_es_stroke_wall_n_m: float = 20000.0
+
+    # ==== APEX-TO-APEX HYBRID WORK CONTROL (2026-07-24 13:19) ====
+    # Active height controller. The previous instantaneous energy pump is
+    # left below as an A/B fallback but is bypassed when this flag is true.
+    #
+    # At touchdown, the completed flight gives a robust apex energy E_k.
+    # The next stance work is planned once:
+    #   W*_k = E_target - E_k + Lhat_k
+    #   Lhat_{k+1} = LPF[W_k - (E_{k+1} - E_k)]
+    # Unknown impact/linkage losses therefore appear in one observable
+    # stride-domain disturbance, rather than in touchdown/bottom heuristics.
+    #
+    # Work is split analytically between the leg and props. During stance:
+    #   descent: soft virtual spring toward x*
+    #   ascent:  F_leg = m*g_st + W_leg/x_bottom - d*vz
+    # Constant excess force is the minimum-peak-force profile for fixed work
+    # and stroke (Raibert-style fixed thrust). No online energy pump or
+    # bottom confirmation window enters the force command.
+    # 2026-07-25 05:33: DISABLED (user) in favour of the restored GitHub
+    # MATLAB-style spring controller (github_mode1_height_control above).
+    height_work_control: bool = False
+    # Residual loss prior after the modeled touchdown reception work below.
+    height_loss_init_j: float = 0.0
+    # The constant-force catch removes the landing kinetic energy rather than
+    # storing it as an ideal spring. Reinject that known work feedforward;
+    # the observer estimates only the remaining unmodeled loss.
+    height_reception_loss_fraction: float = 1.0
+    # Standing start already contains linkage/preload energy. Direct zero-work
+    # calibration (13:54 log) produced a 4.5 cm apex = 2.93 J, therefore the
+    # measured stored contribution is 2.93/6.7 = 0.437 J/kg. Subtract it only
+    # from the first standing launch; landing hops use the loss observer.
+    height_standing_stored_specific_j_kg: float = 0.437
+    height_loss_observer_gain: float = 0.25
+    height_loss_observer_max_j: float = 8.0
+    height_loss_observer_step_j: float = 1.5
+    height_work_max_j: float = 10.0
+    # Discrete apex-energy feedback gain. 1.0 = DEADBEAT (one-step
+    # convergence, Koditschek-Buehler energy return map): the full apex
+    # energy error of hop k is commanded as extra work on hop k+1.
+    # Error dynamics e_{k+1} = (1 - eta_true/eta_model) * e_k, so with the
+    # calibrated efficiencies (leg 0.72, prop 0.88) even a 20% model error
+    # still contracts at 0.2/hop instead of oscillating. One-step holds
+    # only while the required work stays inside the actuator capacity
+    # (work cap / 10 Nm torque / prop ratio); saturated hops take longer.
+    height_apex_kp: float = 1.0
+    # Additive hybrid work: preserve the previous 90% leg command and add
+    # 30% direct propulsive work on top (user: "腿不要 cut，再加上腿").
+    # The apex observer sees the total commanded work and removes any steady
+    # over-delivery on following hops.
+    height_leg_work_share: float = 0.90
+    # Add 50% prop work on top of the 90% leg work during PUSH. Compression
+    # keeps only the low stance baseline so prop lift does not prevent squat.
+    height_prop_work_share: float = 0.50
+    height_prop_ratio_max: float = 0.66
+    # Measured command-to-COM work efficiencies (14:12 hardware log):
+    # leg 3.21/4.49 = 0.72, props 0.445/0.502 = 0.88. These enter both
+    # capacity planning and force/thrust execution, not telemetry only.
+    height_leg_work_efficiency: float = 0.72
+    height_prop_work_efficiency: float = 0.88
+    # Compression target x* = margin*W_leg/(F_leg,max-m*g_st).
+    height_x_margin: float = 1.0
+    # min == leg_stroke_max_m makes x* exactly 90 mm every hop; touchdown
+    # speed changes the catch force, not the commanded compression depth.
+    height_x_min_m: float = 0.090
+    height_force_ramp_s: float = 0.005
+    # ---- FINITE-TIME CAPTURE MANIFOLD (compression, 2026-07-25) ----
+    # Compression tracks the constant-deceleration braking manifold
+    #   xdot_ref(x) = sqrt(2*a0*(x* - x)),  a0 = v_td^2 / (2*x*)
+    # with F = m*(g_st + a0) + c*(xdot - xdot_ref).  Every trajectory on
+    # the manifold terminates at (x*, 0) in finite time, so the commanded
+    # depth is reached for ANY touchdown speed: v_td only scales the
+    # constant feedforward a0 (minimum-peak force, same optimality as the
+    # push), never the endpoint.  Off-manifold error contracts exactly as
+    # de/dt = -(c/m)*e.  Light landings use the a_min floor so a standing
+    # squat still completes in ~sqrt(2*x*/a_min) s.
+    # Tracking pole (Hz): c = 2*pi*f*m (~168 N*s/m at 4 Hz, m=6.7).
+    height_capture_pole_hz: float = 4.0
+    # Feedforward deceleration floor (m/s^2) for near-zero touchdown speed.
+    height_capture_a_min_mps2: float = 2.0
+    # Leg force headroom: plan/execute leg Fz at most this fraction of the
+    # hardware cap, so PUSH never rides the 10 Nm torque ceiling and the
+    # attitude force always has authority. Overflow work is re-routed to
+    # the props in _plan_height_work.
+    height_push_force_margin: float = 0.85
+    height_ascent_d_n_s_m: float = 8.0
 
     # Leg length, contact phases, and vertical stance force.
     leg_l0_m: float = 0.461
@@ -547,18 +778,22 @@ class ModeEConfig:
     rt_first_hop_spring_d_n_s_m: float = 6.0
     # Fallback world-height impedance (used only if the TD-sized FB-SLIP
     # spring is unavailable, e.g. controller enabled mid-stance).
+    # 2026-07-25 06:58: restore 51b4c2d FB-SLIP v3 fallback (force law is
+    # energy-deficit; these apply only if TD sizing is missing).
     stance_kp_z: float = 1400.0
     stance_kd_z: float = 6.0
+    # UNUSED for force under FB-SLIP v3 (kept for A/B).
+    stance_push_kp_z: float = 1400.0
+    stance_push_kd_z: float = 5.0
     stance_fz_min: float = 0.0
     # Per-sample cap on the commanded vertical force; the downstream
     # joint-torque rescale remains the hardware protection.
     stance_fz_max: float = 500.0
     hopper4_td_threshold_m: float = 0.02
     hopper4_lo_threshold_m: float = 0.0
-    # Minimum dwell (ticks) in a phase before TD/LO can fire again. 23:14 log:
-    # with 1 tick (2 ms) a hard landing produced 16-28 ms fake stance/flight
-    # chatter cycles, each firing a freshly-sized 200-500 N spring. 10 ticks
-    # = 20 ms; real stances/flights here are >= 100/200 ms.
+    # UNUSED since 2026-07-25 (user: "什么时间限制 什么门都删除"): the TD/LO
+    # time dwell was replaced by physical hysteresis -- the 2 cm td/lo
+    # position band plus the DESCEND (TD) and RISING (LO) velocity gates.
     hopper4_phase_min_steps: int = 10
 
     # Stance attitude PD (one gain for roll and pitch).
@@ -706,23 +941,49 @@ class ModeEConfig:
     vel_kf_z_l_stance: float = 12.0
     # MATLAB / Hopper4 Raibert (active when use_hfbslip_placement=False):
     #   target_xy = kv * v_xy + kr * v_des
-    flight_kv: float = 0.17
+    flight_kv: float = 0.18
     flight_kr: float = 0.09
     flight_stepper_lim_m: float = 0.13
     swing_kp_xy: float = 62.0
     swing_kd_xy: float = 1.2
-    swing_kp_z: float = 1300.0
-    swing_kd_z: float = 20.0
+    # 2026-07-25 05:38 (user): stiffer FLIGHT leg-length (z) tracking so
+    # the leg holds l0 firmly through the boosted ascent and reaches
+    # touchdown at length; kd scaled with sqrt(kp) to keep the damping
+    # ratio (1300/20 -> 1600/22).
+    # 2026-07-25 09:15 (user: "flightphase腿抖动怎么办", 074452 log): the
+    # flight leg rang +-0.9 cm at ~30 Hz (qd2 to 24 rad/s, tau2 +-4.3 Nm)
+    # -- a kd-on-raw-velocity limit cycle: swing_kd_z multiplied the
+    # UNFILTERED kinematic foot velocity (J*qd) and the loop delay turned
+    # that into sustained chatter.  Two changes: the PD velocity is now
+    # low-passed (swing_vel_lpf_tau_s below), and kp_z drops 1600 -> 1200
+    # to take loop energy out of the resonance (still ~4x stiffer than
+    # the 5 cm/70 N sag case needs in flight, where the leg is unloaded).
+    swing_kp_z: float = 1200.0
+    swing_kd_z: float = 22.0
+    # First-order LPF (s) on the foot velocity used by the FLIGHT leg PD
+    # (both axial damping and XY side-force damping).  ~8 ms cuts the
+    # 30 Hz chatter band roughly in half while adding only ~1.5 ms of
+    # phase lag at the 5-6 Hz tracking band.  0 disables.
+    swing_vel_lpf_tau_s: float = 0.008
 
     # Propeller/HFA. Flight attitude PD uses one gain for roll and pitch.
     flight_kR: float = 50.0
     flight_kW: float = 8.0
     flight_tau_rp_max: float = 100
-    prop_base_thrust_ratio: float = 0.01
+    # 2026-07-25 07:05 (user): FLIGHT base = 1100 us per arm
+    # (3*k*100^2 = 0.68 N = 0.0103*m*g). Same idle in ascent and as the
+    # floor for the flight attitude allocator.
+    prop_base_thrust_ratio: float = 0.0103
     # Stance-phase propeller idle (collective). Higher than flight so props
     # unload the leg / raise effective hop energy during push. Flight still
     # uses prop_base_thrust_ratio. Typical bring-up: 0.08–0.15.
-    prop_stance_base_thrust_ratio: float = 0.12
+    # 2026-07-25 05:55 (user): COMP baseline = 1100 us per arm.  With
+    # k=2.25e-5: 3 * k * 100^2 = 0.68 N total = 0.0103 * m*g (m=6.7).
+    # Kept as a ratio so g_st and every stance coupling stay consistent.
+    # 2026-07-25 09:33 (user: "compression阶段 propellerbase 1400"):
+    # 3 * k * 400^2 = 10.8 N total = 0.164 * m*g -- props carry ~16% of
+    # the weight through COMP (g_st drops accordingly in the stance laws).
+    prop_stance_base_thrust_ratio: float = 0.164
     # PUSH-only collective boost (2026-07-24 04:09 user: "push 阶段 propeller
     # 还可以大力到 1500"). COMP keeps prop_stance_base_thrust_ratio so the
     # brake is not softened; once PUSH latches, raise the allocator
@@ -752,6 +1013,26 @@ class ModeEConfig:
     prop_flight_brake_ratio: float = 0.10
     # Descent detection threshold on world vz (m/s, up-positive).
     prop_flight_brake_vz_mps: float = 0.10
+    # ---- APEX COLLECTIVE DIP (2026-07-25) ----
+    # Smoothly lower the FLIGHT collective near the apex, weighted purely
+    # by the fused |vz| (no clock, no apex event):
+    #   ratio *= dip_frac + (1 - dip_frac) * min(1, |vz| / vz_ref)
+    # At the apex |vz| -> 0 and the collective sinks to dip_frac of its
+    # phase value; it is fully restored once |vz| exceeds vz_ref on either
+    # side of the arc. dip_frac keeps a floor so the unidirectional props
+    # retain attitude-differential authority at the top. The dip is
+    # symmetric about the apex, so its bias on the flight-time arc apex
+    # formula is second order.
+    prop_apex_dip_enable: bool = True
+    prop_apex_dip_frac: float = 0.5
+    prop_apex_dip_vz_mps: float = 0.4
+    # ---- PUSH/ASCENT COLLECTIVE BASELINE PWM ----
+    # 2026-07-25 07:05 (user): FLIGHT (ascent, LIFTOFF->APEX) base 1100 us;
+    # PUSH base 1800 us.  1100 us matches prop_base_thrust_ratio above.
+    prop_push_apex_base_pwm_us: float = 1100.0
+    # PUSH-only collective: 1700 us -> 3*11.025 N = 33.1 N ~ 0.50 m*g
+    # (pwm_max=2000 leaves attitude headroom).
+    prop_push_pwm_us: float = 1700.0
     # FLIGHT world-Z prop force budget (fraction of m*g), dual to the leg's
     # F_max = beta*m*g. The attitude allocator's forward-floor collective
     # lift silently raises the TOTAL thrust far above the commanded
@@ -786,12 +1067,11 @@ class ModeEConfig:
     # saturates (~9.8 N/arm at 1700), so real delivery at 1800 is ~10.5-11 N.
     # Total budget raised to 0.66*m*g = 43.4 N so 3x14.4 N is not clipped.
     thrust_total_ratio_max: float = 0.66
-    thrust_max_each_n: float = 14.4
+    thrust_max_each_n: float = 22.5
     pwm_min_us: float = 1000.0
-    # 2026-07-24 01:52 user: 2000 -> 1800. Matches thrust_max_each_n=14.4 N
-    # (k*(1800-1000)^2) so the PWM ceiling and the thrust cap agree; the
-    # bench ladder showed real thrust saturating ~1700 anyway.
-    pwm_max_us: float = 1800.0
+    # 2026-07-25 07:08 (user): propeller max 2000 us.
+    # k*(2000-1000)^2 = 22.5 N/arm; thrust_max_each_n matches.
+    pwm_max_us: float = 2000.0
     # CALIBRATED 2026-07-23 (scale ladder, F100 + 7" + Hobbywing 80A, unidir):
     #   pwm    1200  1300  1400  1500  1600  1700
     #   T/arm  1.96  3.60  5.56  7.19  8.67  9.81  [N]
@@ -888,6 +1168,13 @@ class ModeEConfig:
     # push-need) at every command; if the machine's elastic floor then
     # over-delivers the target, apex settles slightly high instead of
     # the gait collapsing -- the honest hardware limit.
+    # 2026-07-24 11:47 ("第一跳太高了", 114644 log): 0.90 -> 0.50.  With
+    # the 0.075 stroke the linkage's elastic return alone delivers
+    # ~0.91 m^2/s^2, so at the 0.9 clip the hop can never come DOWN to a
+    # 0.10 m target (arc 1.64 m/s -> 13.8 cm, +40%).  The old collapse
+    # mode (e_bias runaway halving v_cmd) is gone since the bias became
+    # rate-limited and correctly seeded; 0.5 still guarantees an active
+    # push (k_up > 0 at every bottom).
     v_to_min: float = 0.90
     v_to_max: float = 1.60
 
@@ -1172,6 +1459,10 @@ class ModeECore:
         # bottom plan and the depth gate subtract it to get true travel.
         self._mode1_x_td: float = 0.0
         self._mode1_t_bottom: float = 0.0
+        # MATLAB k-d stance law (stance_matlab_kd): descent spring sized
+        # at TD, ascent spring sized once at the measured bottom.
+        self._mode1_k_dn: float | None = None
+        self._mode1_k_up: float | None = None
         # Landing speed from the just-completed flight arc,
         # sqrt(2*g_dn*h_apex); None when the flight was chatter (<0.12 s).
         self._fl_v_td_bal: float | None = None
@@ -1180,6 +1471,8 @@ class ModeECore:
         # ended (depth or stroke limit reached) so PUSH may latch.
         # First-order-blended compression force reference (N).
         self._mode1_fcomp_lpf: float | None = None
+        # Blended stance spring stiffness (comp -> push after the latch).
+        self._mode1_kz_state: float = float(cfg.stance_kp_z)
         # H-FB-SLIP placement telemetry (predicted stance time / gain).
         self._hfb_T_st: float = 0.0
         self._hfb_k_dx: float = 0.0
@@ -1195,11 +1488,17 @@ class ModeECore:
         # the fusion recovers the true CoM state for the stance laws.
         self._vel_kf_z: float = 0.0
         self._mode1_k_boost: float = 0.0
+        # Persistent hop-to-hop loss estimate for the restored 2aa050e7
+        # two-spring height controller.
+        self._mode1_Eloss: float = 0.0
         self._mode1_v_td: float = 0.0
         self._mode1_x0: float = 0.0
         self._mode1_boost_f_state: float = 0.0
         # LPF'd world-Z up-velocity used only inside the stance-Z law.
         self._mode1_vz_lpf: float | None = None
+        # LPF state for the FLIGHT leg-PD foot velocity (swing chatter fix,
+        # see swing_vel_lpf_tau_s).  Reset at touchdown.
+        self._swing_xdot_lpf: np.ndarray | None = None
         # "auto" reverse-policy hysteresis latch (see _allocate_prop_thrust).
         self._prop_rev_on: bool = False
         # Stance kW rate observer state (see stance_kw_obs_* config):
@@ -1292,6 +1591,10 @@ class ModeECore:
         self._stance = False
         self._td_t: float | None = None
         self._lo_t: float | None = None
+        # Collective boost window: True from LIFTOFF until the apex
+        # (vz_up <= 0).  False at startup, so a robot standing/being put
+        # down in FLIGHT phase never spins up to the boosted baseline.
+        self._prop_ascent_boost: bool = False
         # Roll/pitch measured at the FIRST touchdown (launch); attitude
         # reference for the first stance when launch_att_hold is on.
         self._launch_rp: np.ndarray | None = None
@@ -1318,6 +1621,10 @@ class ModeECore:
         self._stance_T1: float = 0.0
         self._stance_T2: float = 0.0
         self._v_to_cmd = float(cfg.v_to_min)
+        # Was the latest touchdown a standing start (v_td ~= 0)?  Selects
+        # the standing elastic-return constant and masks the bias
+        # adaptation for that hop (see apex_e_bias_standing).
+        self._td_was_standing: bool = False
         # Learned parasitic-delivery bias b (specific energy, m^2/s^2):
         # v_cmd^2 = 2*g_eff*h* - 2*b.  Positive b = machine over-delivers
         # (elastic return of the leg linkage).
@@ -1335,6 +1642,41 @@ class ModeECore:
         # Body height at the last liftoff (m, foot-on-ground kinematic);
         # feeds the LO/TD height-difference arc correction.
         self._lo_h_com: float | None = None
+        # Apex-to-apex hybrid work controller state. All energies/work are J.
+        self._ha_loss_hat_j: float = float(getattr(
+            cfg, "height_loss_init_j", 0.0
+        ))
+        self._ha_loss_meas_j: float = float("nan")
+        self._ha_loss_ff_j: float = 0.0
+        self._ha_apex_confidence: float = 0.0
+        self._ha_prev_apex_confidence: float = 0.0
+        self._ha_apex_energy_j: float = 0.0
+        self._ha_prev_apex_energy_j: float | None = None
+        self._ha_prev_work_plan_j: float | None = None
+        self._ha_prev_loss_ff_j: float = 0.0
+        self._ha_prev_plan_standing: bool = False
+        self._ha_work_req_j: float = 0.0
+        self._ha_work_leg_j: float = 0.0
+        self._ha_work_prop_j: float = 0.0
+        self._ha_x_star_m: float = float(getattr(
+            cfg, "height_x_min_m", 0.015
+        ))
+        self._ha_x_bottom_m: float = 0.0
+        self._ha_x_work_bottom_m: float = 0.0
+        self._ha_ascent: bool = False
+        self._ha_seen_compression: bool = False
+        self._ha_v_comp_td_mps: float = 0.0
+        # Capture-manifold feedforward deceleration a0 (m/s^2); the
+        # equivalent stiffness m*a0/x* is kept for telemetry continuity.
+        self._ha_capture_a0_mps2: float = float(getattr(
+            cfg, "height_capture_a_min_mps2", 2.0
+        ))
+        self._ha_compression_k_n_m: float = 0.0
+        self._ha_leg_excess_force_n: float = 0.0
+        self._ha_brake_force_n: float = 0.0
+        self._ha_prop_push_ratio: float = float(
+            cfg.prop_stance_base_thrust_ratio
+        )
 
         # last solution hold (robustness)
         self._wbc_last_t = np.zeros(3, dtype=float)
@@ -1418,22 +1760,59 @@ class ModeECore:
         self._push_vel_ring_cnt = 0
         self._mode1_push_latched = False
         self._mode1_push_confirm_count = 0
+        self._mode1_xz_max = 0.0
+        self._td_was_standing = False
         self._mode1_f_brake = None
         self._mode1_x_c_plan = 0.0
         self._mode1_x_td = 0.0
         self._mode1_t_bottom = 0.0
+        self._mode1_k_dn = None
+        self._mode1_k_up = None
         self._fl_v_td_bal = None
         self._mode1_fcomp_lpf = None
         self._apex_e_bias = float(getattr(self.cfg, "apex_adapt_bias0", 0.25))
         self._apex_eta = 1.0
         self._eta_skip_once = False
         self._lo_h_com = None
+        self._ha_loss_hat_j = float(getattr(
+            self.cfg, "height_loss_init_j", 0.0
+        ))
+        self._ha_loss_meas_j = float("nan")
+        self._ha_loss_ff_j = 0.0
+        self._ha_apex_confidence = 0.0
+        self._ha_prev_apex_confidence = 0.0
+        self._ha_apex_energy_j = 0.0
+        self._ha_prev_apex_energy_j = None
+        self._ha_prev_work_plan_j = None
+        self._ha_prev_loss_ff_j = 0.0
+        self._ha_prev_plan_standing = False
+        self._ha_work_req_j = 0.0
+        self._ha_work_leg_j = 0.0
+        self._ha_work_prop_j = 0.0
+        self._ha_x_star_m = float(getattr(
+            self.cfg, "height_x_min_m", 0.015
+        ))
+        self._ha_x_bottom_m = 0.0
+        self._ha_x_work_bottom_m = 0.0
+        self._ha_ascent = False
+        self._ha_seen_compression = False
+        self._ha_v_comp_td_mps = 0.0
+        self._ha_capture_a0_mps2 = float(getattr(
+            self.cfg, "height_capture_a_min_mps2", 2.0
+        ))
+        self._ha_compression_k_n_m = 0.0
+        self._ha_leg_excess_force_n = 0.0
+        self._ha_brake_force_n = 0.0
+        self._ha_prop_push_ratio = float(
+            self.cfg.prop_stance_base_thrust_ratio
+        )
         self._hfb_T_st = 0.0
         self._hfb_k_dx = 0.0
         self._hfb_dx_att = np.zeros(2, dtype=float)
         self._vel_kf_xy = np.zeros(2, dtype=float)
         self._vel_kf_z = 0.0
         self._mode1_k_boost = 0.0
+        self._mode1_Eloss = 0.0
         self._mode1_v_td = 0.0
         self._mode1_x0 = 0.0
         self._mode1_boost_f_state = 0.0
@@ -1445,6 +1824,7 @@ class ModeECore:
         self._v_hat_inited = False
         self._prev_vz = None
         self._apex_reached = False
+        self._prop_ascent_boost = False
         self._z_lo = None
         self._vz_lo = None
         self._z_apex_actual = float("nan")
@@ -1476,6 +1856,261 @@ class ModeECore:
         except Exception:
             pass
         self._att_stance_tick = 0
+
+    def _plan_height_work(
+        self,
+        apex_height_m: float | None,
+        apex_confidence: float = 1.0,
+        compression_speed_mps: float | None = None,
+    ) -> None:
+        """Plan one stance from the completed flight's apex measurement.
+
+        This is the only update point of the height regulator. The stance
+        loop consumes the resulting work/depth plan without re-planning.
+        """
+        if not bool(getattr(self.cfg, "height_work_control", False)):
+            return
+        apex_confidence = float(_clipf(apex_confidence, 0.0, 1.0))
+        self._ha_apex_confidence = apex_confidence
+
+        m = float(self.mass)
+        g = float(self.gravity)
+        props = bool(self._props_armed_rt)
+        rho_flight = (
+            float(_clipf(float(self.cfg.prop_base_thrust_ratio), 0.0, 0.8))
+            if props else 0.0
+        )
+        rho_stance = (
+            float(_clipf(
+                float(self.cfg.prop_stance_base_thrust_ratio), 0.0, 0.8
+            ))
+            if props and bool(self.cfg.stance_use_props) else 0.0
+        )
+        g_flight = g * (1.0 - rho_flight)
+        g_stance = g * (1.0 - rho_stance)
+        target_h = float(max(0.0, float(self.cfg.hop_height_m)))
+        target_energy = m * g_flight * target_h
+
+        valid_apex = (
+            apex_height_m is not None
+            and np.isfinite(float(apex_height_m))
+            and float(apex_height_m) >= 0.0
+        )
+        standing_launch = bool(
+            self._ha_prev_work_plan_j is None
+            and (not valid_apex or float(apex_height_m) <= 1e-6)
+        )
+        v_comp_td = (
+            0.0
+            if standing_launch
+            else float(max(
+                0.0,
+                float(compression_speed_mps)
+                if compression_speed_mps is not None else 0.0,
+            ))
+        )
+        if valid_apex:
+            apex_energy = m * g_flight * float(apex_height_m)
+            self._ha_apex_energy_j = float(apex_energy)
+            if (
+                self._ha_prev_apex_energy_j is not None
+                and self._ha_prev_work_plan_j is not None
+                and not self._ha_prev_plan_standing
+            ):
+                # E_{k+1}-E_k = W_k-L_k  =>  L_k = W_k-delta_E.
+                loss_total_meas = float(
+                    self._ha_prev_work_plan_j
+                    - (apex_energy - self._ha_prev_apex_energy_j)
+                )
+                loss_meas = float(
+                    loss_total_meas - self._ha_prev_loss_ff_j
+                )
+                loss_max = float(max(0.0, float(getattr(
+                    self.cfg, "height_loss_observer_max_j", 8.0
+                ))))
+                loss_meas = float(_clipf(
+                    loss_meas, -loss_max, loss_max
+                ))
+                self._ha_loss_meas_j = loss_meas
+                observer_confidence = min(
+                    apex_confidence, self._ha_prev_apex_confidence
+                )
+                gain = observer_confidence * float(_clipf(float(getattr(
+                    self.cfg, "height_loss_observer_gain", 0.25
+                )), 0.0, 1.0))
+                step_max = float(max(0.0, float(getattr(
+                    self.cfg, "height_loss_observer_step_j", 1.5
+                ))))
+                correction = float(_clipf(
+                    gain * (loss_meas - self._ha_loss_hat_j),
+                    -step_max, step_max,
+                ))
+                self._ha_loss_hat_j = float(_clipf(
+                    self._ha_loss_hat_j + correction,
+                    -loss_max, loss_max,
+                ))
+            self._ha_prev_apex_energy_j = float(apex_energy)
+            self._ha_prev_apex_confidence = apex_confidence
+        elif self._ha_prev_apex_energy_j is None:
+            # Standing launch: reference energy is zero at full extension.
+            self._ha_apex_energy_j = 0.0
+            self._ha_prev_apex_energy_j = 0.0
+            self._ha_prev_apex_confidence = 1.0
+
+        reception_fraction = float(_clipf(float(getattr(
+            self.cfg, "height_reception_loss_fraction", 1.0
+        )), 0.0, 1.5))
+        reception_loss_ff = (
+            reception_fraction * self._ha_apex_energy_j
+            if valid_apex and not standing_launch else 0.0
+        )
+        self._ha_loss_ff_j = float(reception_loss_ff)
+
+        work_max = float(max(0.0, float(getattr(
+            self.cfg, "height_work_max_j", 10.0
+        ))))
+        apex_kp = (
+            1.0 if standing_launch else float(_clipf(float(getattr(
+                self.cfg, "height_apex_kp", 0.50
+            )), 0.0, 1.0))
+        )
+        standing_stored_energy = (
+            m * float(max(0.0, float(getattr(
+                self.cfg,
+                "height_standing_stored_specific_j_kg",
+                0.925,
+            ))))
+            if standing_launch else 0.0
+        )
+        work_req = float(_clipf(
+            apex_kp * (target_energy - self._ha_apex_energy_j)
+            + reception_loss_ff
+            + (0.0 if standing_launch else self._ha_loss_hat_j),
+            # Standing preload/linkage energy is already available and must
+            # not be commanded a second time.
+            0.0, work_max,
+        ))
+        if standing_launch:
+            work_req = float(_clipf(
+                work_req - standing_stored_energy,
+                0.0, work_max,
+            ))
+
+        f_leg_max = float(max(
+            2.5 * m * g,
+            float(self.cfg.leg_force_budget_g) * m * g,
+        ))
+        # Plan against the MARGINED cap: the leg feedforward (catch a0 and
+        # push excess force alike) never asks for the hardware ceiling, so
+        # the 10 Nm driver clamp is feedback headroom, not steady state.
+        push_margin = float(_clipf(float(getattr(
+            self.cfg, "height_push_force_margin", 0.85
+        )), 0.3, 1.0))
+        f_leg_net = float(max(1.0, push_margin * f_leg_max - m * g_stance))
+        # leg_stroke_max_m is touchdown-relative compression travel. The
+        # subsequent positive-work stroke extends from the measured bottom
+        # all the way to l0, so touchdown preload is usable work distance.
+        stroke = float(max(0.01, float(self.cfg.leg_stroke_max_m)))
+        x_td = float(max(0.0, self._mode1_x_td))
+        extension_max = x_td + stroke
+        efficiency = float(_clipf(float(getattr(
+            self.cfg, "height_leg_work_efficiency", 0.90
+        )), 0.1, 1.0))
+        leg_capacity = efficiency * f_leg_net * extension_max
+
+        prop_base_ratio = rho_stance
+        prop_ratio_max = (
+            float(_clipf(float(getattr(
+                self.cfg, "height_prop_ratio_max", 0.60
+            )), prop_base_ratio, float(self.cfg.thrust_total_ratio_max)))
+            if props else prop_base_ratio
+        )
+        prop_efficiency = float(_clipf(float(getattr(
+            self.cfg, "height_prop_work_efficiency", 0.88
+        )), 0.1, 1.0))
+        prop_capacity = (
+            prop_efficiency
+            * max(0.0, prop_ratio_max - prop_base_ratio)
+            * m * g * extension_max
+        )
+        prop_share = (
+            float(_clipf(float(getattr(
+                self.cfg, "height_prop_work_share", 0.10
+            )), 0.0, 1.0))
+            if props else 0.0
+        )
+        leg_share = float(_clipf(float(getattr(
+            self.cfg, "height_leg_work_share", 0.90
+        )), 0.0, 1.0))
+        if not props:
+            leg_share = 1.0
+
+        # Additive allocation: props no longer replace leg work. Any leg
+        # work clipped by the margined capacity overflows to the props, so
+        # honoring the torque headroom costs planned energy nothing until
+        # BOTH actuators saturate.
+        leg_work = min(leg_capacity, leg_share * work_req)
+        leg_overflow = float(max(0.0, leg_share * work_req - leg_work))
+        prop_work = min(
+            prop_capacity, prop_share * work_req + leg_overflow
+        )
+
+        x_min = float(_clipf(float(getattr(
+            self.cfg, "height_x_min_m", 0.015
+        )), 0.005, stroke))
+        x_margin = float(max(1.0, float(getattr(
+            self.cfg, "height_x_margin", 1.0
+        ))))
+        x_work = float(_clipf(
+            x_margin * leg_work / max(1.0, efficiency * f_leg_net) - x_td,
+            x_min, stroke,
+        ))
+        x_star = x_work
+        # Capture-manifold feedforward: the constant deceleration that
+        # brings the MEASURED touchdown axial speed to rest exactly at x*.
+        # Floored for near-zero landings (finite squat time) and ceilinged
+        # by the margined net force (a0 <= F_net/m), which is the physical
+        # capture limit v_td <= sqrt(2*(F_net/m)*x*).
+        a_min = float(max(0.1, float(getattr(
+            self.cfg, "height_capture_a_min_mps2", 2.0
+        ))))
+        a_max = float(max(a_min, f_leg_net / m))
+        capture_a0 = float(_clipf(
+            v_comp_td * v_comp_td / max(2.0 * x_star, 1e-4),
+            a_min, a_max,
+        ))
+        # Equivalent linear stiffness, telemetry only.
+        compression_k = float(m * capture_a0 / max(x_star, 1e-4))
+
+        prop_ratio = prop_base_ratio
+        extension_plan = x_td + x_star
+        if props and extension_plan > 1e-4:
+            prop_ratio += prop_work / (
+                prop_efficiency * m * g * extension_plan
+            )
+        prop_ratio = float(_clipf(
+            prop_ratio, prop_base_ratio, prop_ratio_max
+        ))
+
+        self._ha_work_req_j = work_req
+        self._ha_work_leg_j = leg_work
+        self._ha_work_prop_j = prop_work
+        self._ha_x_star_m = x_star
+        self._ha_x_bottom_m = 0.0
+        self._ha_x_work_bottom_m = 0.0
+        self._ha_ascent = False
+        self._ha_seen_compression = False
+        self._ha_v_comp_td_mps = v_comp_td
+        self._ha_capture_a0_mps2 = capture_a0
+        self._ha_compression_k_n_m = compression_k
+        self._ha_leg_excess_force_n = 0.0
+        self._ha_brake_force_n = m * g_stance
+        self._ha_prop_push_ratio = prop_ratio
+        self._ha_prev_work_plan_j = leg_work + prop_work
+        self._ha_prev_loss_ff_j = reception_loss_ff
+        self._ha_prev_plan_standing = standing_launch
+        self._mode1_x_c_plan = x_td + x_star
+
     def user_zero_velocity_hold(self, enable: bool) -> None:
         """
         User-requested "HARD STOP" of the internal velocity estimate.
@@ -1830,6 +2465,9 @@ class ModeECore:
         leg_len_des_m: float,
         tau_max_nm: float,
         imu_quat_wxyz: np.ndarray | None = None,
+        kp_z: float | None = None,
+        kd_z: float | None = None,
+        axial_ff_n: float = 0.0,
     ) -> tuple[np.ndarray, float, float]:
         """
         RT/P4 stand torque: same Cartesian swing law as FLIGHT. The target is
@@ -1842,6 +2480,13 @@ class ModeECore:
         Force law (native delta frame, +Z down) matches the FLIGHT block:
           sideForce  = swing_kp/kd_xy * (x_des - x), orthogonal to the leg
           springForce = -swing_kp_z*(||x||-L_des)*u - swing_kd_z*v_axial
+
+        SLIP-style loaded stand (2026-07-24 07:24): with the default flight
+        gains (kp_z 1300 N/m) the ~70 N body weight sags the leg ~5 cm and
+        the leg "does not hold its length".  Pass stiffer axial gains via
+        kp_z/kd_z and the weight the LEG must carry via axial_ff_n (N,
+        pushes the foot outward along the leg axis); the FF cancels gravity
+        so the PD only handles the residual and L_des is truly held.
 
         Returns:
           tau: (3,) motor torques (Nm)
@@ -1896,9 +2541,9 @@ class ModeECore:
         sideForce = (Khp * (x_des - x) - Khd * xdot).astype(float)
         sideForce = (sideForce - float(np.dot(sideForce, unitSpring)) * unitSpring).astype(float)
 
-        k = float(self.cfg.swing_kp_z)
-        b = float(self.cfg.swing_kd_z)
-        force_scalar = -float(k) * float(leg_length - L_des)
+        k = float(self.cfg.swing_kp_z) if kp_z is None else float(kp_z)
+        b = float(self.cfg.swing_kd_z) if kd_z is None else float(kd_z)
+        force_scalar = -float(k) * float(leg_length - L_des) + float(axial_ff_n)
         springForce = (force_scalar * unitSpring - float(b) * springVel).astype(float)
         f_native = (sideForce + springForce).astype(float)
 
@@ -2375,31 +3020,33 @@ class ModeECore:
         if (not bool(self._stance)) and np.isfinite(float(q_shift)):
             lo_t = float(self._lo_t) if self._lo_t is not None else 0.0
             t_in_flight = float(self.sim_time) - lo_t
-            # 2026-07-23 09:44 (user): TIME guards DELETED. The ballistic
-            # kappa*T_return window blocked hop chaining whenever the vz_lo
-            # latch read high (09:28 log: garbage 3.02 m/s -> 0.46 s of
-            # blindness while standing on the ground). Touchdown is now the
-            # plain length threshold + minimal debounce (phase_min_t) +
-            # the DESCEND gate (velocity-based, not time-based); its 0.6 s
-            # fallback opener is kept so a corrupted vz estimate can never
-            # block a real landing forever.
+            # 2026-07-25 (user): ALL time gates deleted from touchdown.
+            # TD is pure physics: the leg is measurably compressed AND the
+            # body is not rising (DESCEND gate, velocity-based). A leg
+            # compressed to 2x the threshold is ground contact regardless
+            # of the velocity estimate -- this POSITION fallback replaces
+            # both the old 0.6 s opener and the 20 ms debounce dwell (the
+            # 2 cm td/lo hysteresis band plus the velocity gates already
+            # exclude impact-ringing chatter without any clock).
             vz_up_now = -float(self._v_hat_w[2])
             descending_ok = (not np.isfinite(vz_up_now)) or (
                 vz_up_now <= float(getattr(
                     self.cfg, "flight_td_descend_vz_mps", 0.05
                 ))
             )
-            if t_in_flight >= 0.6:
+            if float(q_shift) <= -2.0 * td_thr:
                 descending_ok = True
             cond_td = (
                 (float(q_shift) <= -td_thr)
-                and (t_in_flight >= float(phase_min_t))
                 and bool(descending_ok)
             )
 
             if bool(cond_td):
                 touchdown_evt = True
                 self._stance = True
+                self._swing_xdot_lpf = None
+                apex_h_for_plan: float | None = None
+                apex_conf_for_plan = 0.0
                 # First stance ever (no liftoff yet): latch the launch
                 # roll/pitch as the attitude reference (launch_att_hold).
                 if self._lo_t is None and self._launch_rp is None:
@@ -2422,7 +3069,14 @@ class ModeECore:
                 self._fl_v_td_bal = None
                 if self._lo_t is not None:
                     T_fl = float(self.sim_time) - float(self._lo_t)
-                    if 0.12 <= T_fl <= 1.5:
+                    # Every positive flight duration produces an apex estimate.
+                    # Short chatter arcs receive smoothly reduced observer
+                    # confidence; they are never discarded or replaced by a
+                    # stale previous apex.
+                    if 0.0 < T_fl <= 1.5:
+                        apex_conf_for_plan = float(_clipf(
+                            T_fl / 0.12, 0.0, 1.0
+                        )) ** 2
                         tilt_fl = float(_clipf(
                             -float(z_thrust_w[2]), 0.0, 1.0
                         ))
@@ -2492,6 +3146,16 @@ class ModeECore:
                                 -dh_arc + 1e-4, 1e-4,
                             ))
                         self._z_apex_actual = float(h_ap)
+                        apex_h_for_plan = float(h_ap)
+                        # 2026-07-25 05:57: the Eloss apex return map is
+                        # DELETED (user: "你的apex判定有问题 实际是跳的越来
+                        # 越低...不要在乎apex一个闭环").  Bounce chatter
+                        # inflated the measured flight time, the arc apex
+                        # was overestimated (0.20 m while the real robot
+                        # sank), and the map drove the push energy DOWN
+                        # every hop.  The stance law now pumps to the SET
+                        # takeoff energy m*g*(l0+hop_height) with no
+                        # inter-hop feedback; h_ap stays telemetry-only.
                         # Arc-derived speeds (asymmetric gravity):
                         #   takeoff v_lo = sqrt(2*g_up*h_apex)
                         #   landing v_td = sqrt(2*g_dn*(h_apex+dh))
@@ -2512,6 +3176,16 @@ class ModeECore:
                             # RT transition hop: the in-flight leg retraction
                             # corrupts the arc (see _eta_skip_once above).
                             self._eta_skip_once = False
+                        elif bool(getattr(
+                                self, "_td_was_standing", False)):
+                            # STANDING-start hop (11:56): its delivery
+                            # includes the ~1.0 loaded-squat elastic
+                            # return that landing hops never see --
+                            # letting it update the shared bias raised b
+                            # and starved the following landing hops.
+                            # The standing constant is fixed config;
+                            # nothing to learn here.
+                            pass
                         elif (bool(getattr(
                                 self.cfg, "apex_adapt_enable", True))
                                 and bool(self._mode1_lo_pushed)
@@ -2595,10 +3269,14 @@ class ModeECore:
                 # Re-seed the Mode-1 push-spring state for this stance.
                 self._mode1_push_latched = False
                 self._mode1_push_confirm_count = 0
+                self._mode1_kz_state = float(self.cfg.stance_kp_z)
+                self._mode1_xz_max = 0.0
                 self._mode1_f_brake = None
                 self._mode1_x_c_plan = 0.0
                 self._mode1_x_td = 0.0
                 self._mode1_t_bottom = 0.0
+                self._mode1_k_dn = None
+                self._mode1_k_up = None
                 self._mode1_fcomp_lpf = None
                 self._mode1_k_boost = 0.0
                 self._mode1_v_td = 0.0
@@ -2615,20 +3293,44 @@ class ModeECore:
                 # baseline prop thrust REDUCES effective gravity: g_eff = g*(1 - rho).
                 g_eff = float(self.gravity + (float(z_thrust_w[2]) * float(self.mass) * float(self.gravity) * float(self.cfg.prop_base_thrust_ratio)) / max(1e-6, float(self.mass)))
                 g_eff = float(max(1e-3, g_eff))
-                dz_tgt = float(max(0.05, float(self.cfg.hop_height_m)))
+                # Takeoff speed from takeoff_height_m (push energy); apex
+                # feedback still tracks hop_height_m separately.
+                dz_tgt = float(max(0.05, float(getattr(
+                    self.cfg, "takeoff_height_m", self.cfg.hop_height_m
+                ))))
                 g_eff_log = float(g_eff)
                 dz_tgt_log = float(dz_tgt)
                 v_to_nominal = float(np.sqrt(2.0 * g_eff * dz_tgt))
                 # Inter-hop energy regulation: subtract the learned
                 # parasitic-delivery bias b (elastic return etc.) in the
-                # ENERGY domain: v_cmd^2 = 2*g_eff*h* - 2*b.  Additive,
-                # so changing hop_height_m still acts immediately
-                # (single-knob height preserved).
+                # ENERGY domain: v_cmd^2 = 2*g_eff*h_to - 2*b.  Additive.
+                # 2026-07-24 11:56 (115512 log, "跳不起来 一直在地上"):
+                # the elastic return is NOT one machine constant -- it is
+                # regime-dependent.  A STANDING start squats 150 ms at
+                # the force cap, loads the linkage, and returns b ~= 1.0
+                # (measured 0.91 / 1.16); a LANDING hop bounces off the
+                # structure in ~35 ms and returns almost nothing
+                # (hop 2: cmd 0.50, arc 0.64 -> b ~= 0.08).  One shared
+                # b poisoned both: seeded high it starved every landing
+                # hop to v_min (2 cm apex).  Standing hops use the fixed
+                # standing constant; landing hops use the ADAPTIVE
+                # steady-state bias, and only landing hops update it.
+                self._td_was_standing = bool(
+                    self._fl_v_td_bal is None
+                    or float(self._fl_v_td_bal) < 0.3
+                )
                 if bool(getattr(self.cfg, "apex_adapt_enable", True)):
+                    b_eff = (
+                        float(getattr(
+                            self.cfg, "apex_e_bias_standing", 1.0
+                        ))
+                        if self._td_was_standing
+                        else float(self._apex_e_bias)
+                    )
                     v_to_nominal = float(np.sqrt(max(
                         0.01,
                         v_to_nominal * v_to_nominal
-                        - 2.0 * float(self._apex_e_bias),
+                        - 2.0 * b_eff,
                     )))
                 self._v_to_cmd = float(_clipf(v_to_nominal, float(self.cfg.v_to_min), float(self.cfg.v_to_max)))
 
@@ -2752,18 +3454,43 @@ class ModeECore:
                     #     0.5*(F_bot - m*g)*T = 0.5*m*v_td^2
                     #   => F_bot = m*g + m*v_td^2/T  (<= alpha budget)
                     # Peak-at-bottom needs 2x the excess of the constant
-                    # law, so the alpha-budget travel is v^2/((a-1)*g).
-                    x_c_v = 2.0 * v_td_meas * v_td_meas / denom_a
+                    # law.  With the c0 preload (stance_recv_preload_frac)
+                    # the alpha-budget travel generalizes to
+                    #   T = v^2 / (g*(alpha - 2 + c0))
+                    # (c0=1 recovers the old v^2/((alpha-1)*g)).
+                    c0_recv = float(_clipf(float(getattr(
+                        self.cfg, "stance_recv_preload_frac", 1.0
+                    )), 0.0, 1.0))
+                    x_c_v = (
+                        v_td_meas * v_td_meas
+                        / (max(1e-3, g_st_td)
+                           * max(0.2, alpha_b - 2.0 + c0_recv))
+                    )
                     stroke = float(max(
                         0.015, float(self.cfg.leg_stroke_max_m)
                     ))
+                    # TRAVEL FLOOR (2026-07-25 07:32, user: "压缩行程要到7"):
+                    # never plan a shorter travel than this -- a longer
+                    # travel makes the spring proportionally SOFTER
+                    # (F_bot ~ m*v^2/T), which is what lets the body sink
+                    # through impact losses instead of stalling shallow.
+                    trav_min = float(_clipf(float(getattr(
+                        self.cfg, "stance_travel_min_m", 0.0
+                    )), 0.0, stroke))
                     x_b = float(min(
-                        max(x_c_need, x_td0 + x_c_v),
+                        max(x_c_need, x_td0 + x_c_v, x_td0 + trav_min),
                         x_td0 + stroke,
                     ))
                     travel = float(max(0.01, x_b - x_td0))
+                    # Energy balance with the c0 preload: the spring work
+                    # over T must absorb the landing KE PLUS the gravity
+                    # work gained while the early sub-weight phase lets
+                    # the body keep sinking:
+                    #   0.5*(F_bot - c0*m*g)*T + c0*m*g*T - m*g*T
+                    #     = 0.5*m*v_td^2
+                    #   => F_bot = (2 - c0)*m*g_st + m*v_td^2/T
                     f_b = (
-                        m_td * g_st_td
+                        (2.0 - c0_recv) * m_td * g_st_td
                         + m_td * v_td_meas * v_td_meas
                         / travel
                     )
@@ -2782,9 +3509,47 @@ class ModeECore:
                         0.5 * t_ramp_td
                         + 2.0 * travel / max(0.1, v_td_meas)
                     )
+                    # ---- MATLAB k-d plan (stance_matlab_kd) ----
+                    # Descent spring absorbs exactly the landing KE by
+                    # the planned bottom: 0.5*k*travel^2 = 0.5*m*v_td^2.
+                    # STROKE FLOOR (2026-07-24 11:31, "缩短compression行程",
+                    # 112733 log sank 128 mm on a 60 mm stroke): the
+                    # spring must reach the full force budget within the
+                    # stroke cap even when v_td is underestimated (a
+                    # standing start sizes k from ~zero KE), so depth
+                    # beyond leg_stroke_max_m is physically held off.
+                    k_floor = (
+                        (f_max_td - m_td * g_st_td)
+                        / float(max(0.02, float(self.cfg.leg_stroke_max_m)))
+                    )
+                    self._mode1_k_dn = float(max(
+                        m_td * (max(0.2, v_td_meas) / travel) ** 2,
+                        k_floor,
+                    ))
+                    self._mode1_k_up = None
                 except Exception:
                     self._mode1_f_brake = None
                     self._mode1_t_bottom = 0.0
+                    self._mode1_k_dn = None
+                    self._mode1_k_up = None
+
+                # New active path: one apex-domain update and one immutable
+                # work/depth plan for the entire upcoming stance. A chatter
+                # flight has no trustworthy apex, so it reuses the last apex
+                # energy while still recomputing constraints.
+                if bool(getattr(
+                    self.cfg, "height_work_control", False
+                )):
+                    if self._lo_t is None:
+                        apex_h_for_plan = 0.0
+                        apex_conf_for_plan = 1.0
+                    self._plan_height_work(
+                        apex_h_for_plan,
+                        apex_confidence=apex_conf_for_plan,
+                        compression_speed_mps=float(max(
+                            0.0, -float(qd_shift)
+                        )),
+                    )
 
         # ===== Hopper4-style liftoff =====
         if bool(self._stance) and np.isfinite(float(q_shift)):
@@ -2793,13 +3558,29 @@ class ModeECore:
             # (2026-07-10: the no-prop omega liftoff gate and the forced-liftoff
             # escapes (q_shift 3 cm / stance timeout) were DELETED per user --
             # liftoff is the plain leg-extension threshold + min phase time.)
-            cond_lo = (float(q_shift) >= lo_thr) and (
-                t_in_stance >= phase_min_t
+            # 2026-07-24 12:01 BODY-VELOCITY GATE (120025 st1): the leg
+            # crossed the extension threshold while the BODY was still
+            # descending at 0.5 m/s (a mistimed push ran the leg out
+            # under a soft contact).  Cutting the stance force there
+            # dropped the falling body with the leg in flight-swing --
+            # "一直在地上".  You cannot lift off with downward CoM
+            # velocity: require the vertical KF to agree the body is
+            # rising.  At every real takeoff vz_up is decidedly
+            # positive well before the leg reaches the threshold.
+            vz_up_lo = -float(self._vel_kf_z)
+            # 2026-07-25: time dwell deleted -- liftoff is the physical
+            # pair (leg back to length) AND (body rising).
+            cond_lo = (
+                (float(q_shift) >= lo_thr)
+                and (vz_up_lo > 0.0)
             )
             if bool(cond_lo):
                 liftoff_evt = True
                 self._stance = False
                 self._lo_t = float(self.sim_time)
+                # Open the LIFTOFF->APEX collective boost window (see
+                # prop_push_apex_base_pwm_us); it closes at vz_up <= 0.
+                self._prop_ascent_boost = True
                 # Body height at liftoff (foot on ground): consumed by the
                 # LO/TD height-difference arc correction at next touchdown.
                 _h_lo = float((R_wb_hat @ foot_b.reshape(3))[2])
@@ -3081,21 +3862,50 @@ class ModeECore:
         # Downstream: closed-form leg forces + lstsq prop thrust (no WBC-QP).
         #   f_contact_w: GRF in world frame; z_thrust_w = -R_wb[:, 2] for prop thrust direction.
         # Collective idle: stance uses a higher baseline so props assist the
-        # hop; flight ascent keeps the small prop_base_thrust_ratio; flight
-        # DESCENT uses the aerial-brake ratio (TA-SLIP: lower v_td -> softer
-        # landing spring, see hybrid config block).
+        # hop; PUSH and flight ASCENT hold the 1400 us baseline (see
+        # prop_push_apex_base_pwm_us); flight DESCENT uses the aerial-brake
+        # ratio (TA-SLIP: lower v_td -> softer landing spring, see hybrid
+        # config block).
+        boost_pwm = float(getattr(
+            self.cfg, "prop_push_apex_base_pwm_us", 0.0
+        ))
+        d_boost = boost_pwm - float(self.cfg.pwm_min_us)
+        boost_ratio = (
+            3.0 * float(self.prop_k_thrust) * d_boost * d_boost
+            / max(1e-6, float(self.mass) * float(self.gravity))
+        ) if d_boost > 0.0 else 0.0
         if bool(self._stance):
             prop_ratio = float(self.cfg.prop_stance_base_thrust_ratio)
-            # PUSH latch: raise collective toward prop_push_base_thrust_ratio
-            # (PWM ~1500) so props share the takeoff load while the AK60s are
-            # at their peak. COMP keeps the lower stance idle.
+            # Apex-to-apex work allocation: on ascent, command exactly the
+            # planned prop work as a constant collective over x*. The
+            # attitude allocator still differentiates around this collective.
             if bool(self._mode1_push_latched):
-                prop_ratio = float(max(
-                    prop_ratio,
-                    float(getattr(
+                if bool(getattr(
+                    self.cfg, "height_work_control", False
+                )):
+                    prop_ratio = float(max(
+                        prop_ratio,
+                        float(getattr(
+                            self, "_ha_prop_push_ratio", prop_ratio
+                        )),
+                    ))
+                else:
+                    # PUSH collective rides the PUSH-only PWM baseline
+                    # (prop_push_pwm_us, 2026-07-25: 1700 us) in ALL height
+                    # modes (FB-SLIP v3 and MATLAB/GitHub spring alike);
+                    # falls back to the legacy fixed ratio if unset.
+                    d_push = float(getattr(
+                        self.cfg, "prop_push_pwm_us", 0.0
+                    )) - float(self.cfg.pwm_min_us)
+                    push_ratio = (
+                        3.0 * float(self.prop_k_thrust) * d_push * d_push
+                        / max(1e-6, float(self.mass) * float(self.gravity))
+                    ) if d_push > 0.0 else float(getattr(
                         self.cfg, "prop_push_base_thrust_ratio", 0.0
-                    )),
-                ))
+                    ))
+                    prop_ratio = float(max(
+                        prop_ratio, boost_ratio, push_ratio
+                    ))
         elif (
             -float(self._v_hat_w[2])
             < -float(self.cfg.prop_flight_brake_vz_mps)
@@ -3105,7 +3915,43 @@ class ModeECore:
                 float(self.cfg.prop_flight_brake_ratio),
             ))
         else:
-            prop_ratio = float(self.cfg.prop_base_thrust_ratio)
+            # ASCENT boost window: LIFTOFF -> APEX only (2026-07-25 05:38,
+            # user: at startup, standing in FLIGHT phase, the props must
+            # NOT spin up to the 1400 us baseline; past the apex the
+            # baseline must not be raised either).  The window latches at
+            # the liftoff event and closes the first time vz_up <= 0 (the
+            # apex).  The boost is additionally weighted by the ascending
+            # speed so it reaches exactly zero AT the apex -- no step when
+            # the window closes.
+            vz_up_now = -float(self._v_hat_w[2])
+            if vz_up_now <= 0.0:
+                self._prop_ascent_boost = False
+            w_up = float(_clipf(
+                vz_up_now / max(0.05, float(getattr(
+                    self.cfg, "prop_apex_dip_vz_mps", 0.4
+                ))), 0.0, 1.0,
+            ))
+            prop_ratio = float(max(
+                float(self.cfg.prop_base_thrust_ratio),
+                (boost_ratio * w_up)
+                if bool(self._prop_ascent_boost) else 0.0,
+            ))
+        if (not bool(self._stance)) and bool(getattr(
+            self.cfg, "prop_apex_dip_enable", False
+        )):
+            # APEX COLLECTIVE DIP (see config block): |vz|-weighted, so the
+            # collective bottoms out exactly at the ballistic apex and
+            # recovers with the physical fall speed on the way down.
+            dip = float(_clipf(float(getattr(
+                self.cfg, "prop_apex_dip_frac", 0.5
+            )), 0.0, 1.0))
+            vz_ref = float(max(0.05, float(getattr(
+                self.cfg, "prop_apex_dip_vz_mps", 0.4
+            ))))
+            w_vz = float(_clipf(
+                abs(float(self._v_hat_w[2])) / vz_ref, 0.0, 1.0
+            ))
+            prop_ratio *= dip + (1.0 - dip) * w_vz
         thrust_sum_ref = float(self.mass * self.gravity * float(prop_ratio))
         # Global propeller enable gate. 2026-07-09: keyed off the RUNTIME armed
         # state (A switch) instead of the deleted pure_leg_mode -- when the user
@@ -3246,8 +4092,10 @@ class ModeECore:
                     py_now = float(self._p_hat_w[1])
                     pz_now = float(self._p_hat_w[2])
 
-                    # Desired takeoff velocity from hop_height_m (relative height).
-                    h_target = float(max(0.05, float(self.cfg.hop_height_m)))
+                    # Desired takeoff velocity from takeoff_height_m.
+                    h_target = float(max(0.05, float(getattr(
+                        self.cfg, "takeoff_height_m", self.cfg.hop_height_m
+                    ))))
                     v_to_target = float(np.sqrt(2.0 * float(self.gravity) * h_target))
                     T_stance_total = float(max(0.05, float(self.cfg.stance_T)))
                     # Start push early enough for short-contact hops; ratio is configurable.
@@ -3412,17 +4260,34 @@ class ModeECore:
                     if (props_z and bool(self.cfg.stance_use_props))
                     else 0.0
                 )
-                # Once PUSH latches, use the higher push collective for
-                # g_st so the leg force is sized against the real prop
-                # share (otherwise FB-SLIP still asks for full stance
-                # force while props already carry ~26% weight).
+                # Legacy PUSH treats props as weight sharing and lowers the
+                # leg gravity term. The work allocator deliberately keeps
+                # g_st at the stance baseline: its incremental prop collective
+                # must add W_prop instead of being cancelled by less leg force.
                 if (props_z and bool(self.cfg.stance_use_props)
-                        and bool(self._mode1_push_latched)):
+                        and bool(self._mode1_push_latched)
+                        and not bool(getattr(
+                            self.cfg, "height_work_control", False
+                        ))
+                        and not bool(getattr(
+                            self.cfg,
+                            "github_mode1_height_control",
+                            False,
+                        ))):
+                    # Match the actual PUSH collective (prop_push_pwm_us),
+                    # falling back to the legacy fixed ratio if unset.
+                    d_push_z = float(getattr(
+                        self.cfg, "prop_push_pwm_us", 0.0
+                    )) - float(self.cfg.pwm_min_us)
+                    push_ratio_z = (
+                        3.0 * float(self.prop_k_thrust) * d_push_z * d_push_z
+                        / max(1e-6, float(self.mass) * float(self.gravity))
+                    ) if d_push_z > 0.0 else float(getattr(
+                        self.cfg, "prop_push_base_thrust_ratio", 0.0
+                    ))
                     rho_st = float(max(
                         rho_st,
-                        float(_clipf(float(getattr(
-                            self.cfg, "prop_push_base_thrust_ratio", 0.0
-                        )), 0.0, 0.8)),
+                        float(_clipf(push_ratio_z, 0.0, 0.8)),
                     ))
                 rho_up = (
                     float(_clipf(
@@ -3433,6 +4298,9 @@ class ModeECore:
                 )
                 g_st = g * (1.0 - rho_st)
                 g_up = g * (1.0 - rho_up)
+                use_github_height = bool(getattr(
+                    self.cfg, "github_mode1_height_control", False
+                ))
 
                 # The stance laws consume the KF-FUSED CoM vertical
                 # velocity, not the raw leg-rate (04:49 log: under a
@@ -3444,9 +4312,13 @@ class ModeECore:
                 # the CoM state.  A short LPF stays on top for residual
                 # sensor spikes.
                 vz_up_kf = (
-                    -float(self._vel_kf_z)
-                    if np.isfinite(float(self._vel_kf_z))
-                    else float(vz_up)
+                    float(vz_up)
+                    if use_github_height
+                    else (
+                        -float(self._vel_kf_z)
+                        if np.isfinite(float(self._vel_kf_z))
+                        else float(vz_up)
+                    )
                 )
                 tau_vz = float(max(
                     0.0, float(self.cfg.stance_vz_lpf_tau_s)
@@ -3482,17 +4354,379 @@ class ModeECore:
                     else float(self.sim_time)
                 )
                 t_in_st_z = float(self.sim_time) - td_t_z
-                if self._mode1_f_brake is not None:
+                use_ha = bool(getattr(
+                    self.cfg, "height_work_control", False
+                )) and not use_github_height
+                use_es = (
+                    (not use_github_height)
+                    and
+                    (not use_ha)
+                    and bool(getattr(
+                        self.cfg, "stance_energy_shaping", False
+                    ))
+                )
+                use_kd = (
+                    (not use_github_height)
+                    and
+                    (not use_ha)
+                    and (not use_es)
+                    and bool(getattr(self.cfg, "stance_matlab_kd", True))
+                    and (self._mode1_k_dn is not None)
+                )
+                if use_github_height:
+                    # CASE2026 / MATLAB SINGLE-SPRING stance law
+                    # (2026-07-25 06:39: back to one spring -- the dual
+                    # spring + unfiltered energy pump was making Fz jump
+                    # +-80 N/tick; MATLAB uses one k/b for the whole
+                    # stance).  Push latch only switches the prop PUSH
+                    # collective and the phase label.
+                    #   F = k*(l0 - h) - b*vz_f
+                    #   + w(qd)*max(0, Kp*(E* - E_now)) while extending
+                    if not bool(self._mode1_push_latched):
+                        if (
+                            vz_f > float(self.cfg.stance_push_vz_mps)
+                            and t_in_st_z
+                            >= float(self.cfg.stance_push_min_stance_s)
+                        ):
+                            self._mode1_push_confirm_count += 1
+                        else:
+                            self._mode1_push_confirm_count = 0
+                        if (
+                            self._mode1_push_confirm_count
+                            >= int(max(
+                                1,
+                                int(self.cfg.stance_push_confirm_steps),
+                            ))
+                        ):
+                            self._mode1_push_latched = True
+                    kz_old = float(self.cfg.stance_kp_z)
+                    self._mode1_kz_state = kz_old
+                    # Damper on FILTERED vz (MATLAB uses the same axial
+                    # speed for spring and energy; raw vz_up was a major
+                    # Fz chatter source in the 06:36 log).
+                    f_comp = kz_old * (l0 - h_com) - bz * float(vz_f)
+                    if bool(getattr(
+                        self.cfg, "use_energy_compensation", True
+                    )):
+                        qd_ax = (
+                            float(qd_shift)
+                            if np.isfinite(float(qd_shift)) else 0.0
+                        )
+                        w_ext = float(_clipf(
+                            qd_ax / float(max(0.01, float(getattr(
+                                self.cfg,
+                                "energy_comp_qd_ramp_mps",
+                                0.08,
+                            )))),
+                            0.0, 1.0,
+                        ))
+                        if w_ext > 0.0:
+                            g_ref = float(self.gravity)
+                            e_now = (
+                                0.5 * m * float(vz_f) * float(vz_f)
+                                + 0.5 * kz_old
+                                * (l0 - h_com) * (l0 - h_com)
+                                + m * g_ref * h_com
+                            )
+                            e_tgt = m * g_ref * (
+                                l0
+                                + float(max(0.0, self.cfg.hop_height_m))
+                            )
+                            energy_comp_fz = w_ext * float(max(
+                                0.0,
+                                float(getattr(
+                                    self.cfg, "energy_comp_kp", 12.0
+                                )) * (e_tgt - e_now),
+                            ))
+                            f_comp += energy_comp_fz
+                    f_comp = float(max(0.0, f_comp))
+
+                    self._mode1_x_c_plan = 0.0
+                elif use_ha:
+                    # ---- APEX-TO-APEX WORK EXECUTION ----
+                    # Descent tracks the capture manifold; ascent is the
+                    # minimum-peak constant thrust delivering W_leg.
+                    # 2026-07-25: the 5 ms touchdown force ramp (a time
+                    # element) is DELETED.  The manifold needs none: a0 is
+                    # sized from the measured v_td, so at touchdown
+                    # xdot_ref(0) = sqrt(2*a0*x*) = v_td and the tracking
+                    # error is zero by construction -- the commanded force
+                    # starts exactly at the constant feedforward
+                    # m*(g_st + a0), which is what constant-deceleration
+                    # capture physically requires from the first tick.
+                    ramp = 1.0
+                    x_now = float(max(0.0, x_z))
+                    # Compression constraint coordinate: measured leg shift
+                    # relative to touchdown. World vertical x_now is retained
+                    # separately only for work integration.
+                    x_travel = float(max(0.0, depth_now))
+                    x_star = float(_clipf(
+                        float(self._ha_x_star_m),
+                        float(getattr(self.cfg, "height_x_min_m", 0.015)),
+                        float(self.cfg.leg_stroke_max_m),
+                    ))
+                    self._ha_x_bottom_m = float(max(
+                        self._ha_x_bottom_m, x_travel
+                    ))
+                    self._ha_x_work_bottom_m = float(max(
+                        self._ha_x_work_bottom_m, x_now
+                    ))
+                    qd_axial = (
+                        float(qd_shift)
+                        if np.isfinite(float(qd_shift)) else 0.0
+                    )
+                    if qd_axial < 0.0:
+                        self._ha_seen_compression = True
+                    # 2026-07-25: the bottom is a POSITION event only --
+                    # x_travel reached x* with the axial speed captured.
+                    # The old axial_reversal latch treated ANY qd zero
+                    # crossing as the bottom, so a landing that the
+                    # tracking damper braked to a stall at 1.5 cm went
+                    # straight to PUSH and the planned 9 cm was never
+                    # executed (05:23 log, hop 1: comp 0.015/0.090).
+                    # Without it the capture law itself resolves a stall:
+                    # below the manifold the tracking term unloads the leg
+                    # (floored at 0.15*m*g_st), the body sinks back onto
+                    # the braking parabola and rides it into (x*, 0).
+                    target_captured = bool(
+                        self._ha_seen_compression
+                        and x_travel >= 0.99 * x_star
+                        and qd_axial >= -0.05
+                    )
+
+                    if (not self._ha_ascent) and target_captured:
+                        self._ha_ascent = True
+                        self._mode1_push_latched = True
+                        xb_extension = float(max(
+                            0.005,
+                            self._ha_x_work_bottom_m,
+                        ))
+                        leg_eff = float(_clipf(float(getattr(
+                            self.cfg,
+                            "height_leg_work_efficiency",
+                            0.72,
+                        )), 0.1, 1.0))
+                        self._ha_leg_excess_force_n = float(
+                            self._ha_work_leg_j
+                            / (leg_eff * xb_extension)
+                        )
+                        # Recompute prop collective over the actual extension
+                        # so its planned work is invariant to bottom error.
+                        if (bool(self._props_armed_rt)
+                                and xb_extension > 1e-4):
+                            rho_base = float(_clipf(
+                                float(
+                                    self.cfg.prop_stance_base_thrust_ratio
+                                ), 0.0, 0.8,
+                            ))
+                            rho_max = float(_clipf(float(getattr(
+                                self.cfg, "height_prop_ratio_max", 0.60
+                            )), rho_base, float(
+                                self.cfg.thrust_total_ratio_max
+                            )))
+                            prop_eff = float(_clipf(float(getattr(
+                                self.cfg,
+                                "height_prop_work_efficiency",
+                                0.88,
+                            )), 0.1, 1.0))
+                            self._ha_prop_push_ratio = float(_clipf(
+                                rho_base
+                                + self._ha_work_prop_j
+                                / (
+                                    prop_eff * m * g * xb_extension
+                                ),
+                                rho_base, rho_max,
+                            ))
+
+                    push_margin = float(_clipf(float(getattr(
+                        self.cfg, "height_push_force_margin", 0.85
+                    )), 0.3, 1.0))
+                    if not self._ha_ascent:
+                        # ---- FINITE-TIME CAPTURE MANIFOLD ----
+                        # Track the constant-deceleration braking parabola
+                        #   xdot_ref(x) = sqrt(2*a0*(x* - x))
+                        # with F = m*(g_st + a0) + c*(xdot - xdot_ref).
+                        # On the manifold F is the constant minimum-peak
+                        # feedforward m*(g_st+a0) and the trajectory ends
+                        # at (x*, 0) in finite time for ANY entry speed;
+                        # off-manifold error contracts as de/dt=-(c/m)e.
+                        # A slow/zero-speed landing starts BELOW the
+                        # manifold (xdot < xdot_ref), the tracking term
+                        # unloads the leg toward the floor, and the body
+                        # sinks to depth on the same law -- no separate
+                        # sink mode, no per-speed stiffness retuning.
+                        a0 = float(max(0.0, self._ha_capture_a0_mps2))
+                        xdot_dn = float(max(0.0, -qd_axial))
+                        xdot_ref = float(np.sqrt(
+                            2.0 * a0 * max(0.0, x_star - x_travel)
+                        ))
+                        c_track = float(
+                            2.0 * np.pi
+                            * float(max(0.5, float(getattr(
+                                self.cfg,
+                                "height_capture_pole_hz",
+                                4.0,
+                            ))))
+                            * m
+                        )
+                        f_comp = ramp * (
+                            m * (g_st + a0)
+                            + c_track * (xdot_dn - xdot_ref)
+                        )
+                        # Do not turn the leg off while receiving impact.
+                        f_comp = float(max(
+                            f_comp, ramp * 0.15 * m * g_st
+                        ))
+                        self._ha_brake_force_n = float(f_comp)
+                    else:
+                        d_up = float(max(0.0, float(getattr(
+                            self.cfg, "height_ascent_d_n_s_m", 8.0
+                        ))))
+                        f_comp = (
+                            m * g_st
+                            + float(self._ha_leg_excess_force_n)
+                            - d_up * float(vz_f)
+                        )
+                        # PUSH stays strictly below the hardware cap: the
+                        # margined plan already sized W_leg for this, the
+                        # clip only covers a shallower-than-planned bottom.
+                        f_comp = float(min(
+                            f_comp, push_margin * fz_cap
+                        ))
+
+                    stroke_ha = float(max(
+                        0.01, float(self.cfg.leg_stroke_max_m)
+                    ))
+                    if x_travel > stroke_ha:
+                        f_comp += float(getattr(
+                            self.cfg,
+                            "stance_es_stroke_wall_n_m",
+                            20000.0,
+                        )) * (x_travel - stroke_ha)
+                    self._mode1_x_c_plan = (
+                        float(self._mode1_x_td) + x_star
+                    )
+                    self._mode1_k_boost = float(min(f_comp, fz_cap))
+                elif use_es:
+                    # ---- ENERGY SHAPING + height→compression (x*) ----
+                    #   F = m*g_st + k*(x - x*) - d*vz + c*(E*-E)*vz
+                    # x* = margin * E* / (Fmax - mg) couples hop_height
+                    # directly to the required squat (see config block).
+                    t_ramp = float(max(
+                        1e-3, float(self.cfg.stance_brake_ramp_s)
+                    ))
+                    ramp = float(_clipf(t_in_st_z / t_ramp, 0.0, 1.0))
+                    k_es = float(max(0.0, float(getattr(
+                        self.cfg, "stance_es_k_n_m", 1500.0
+                    ))))
+                    d_es = float(max(0.0, float(getattr(
+                        self.cfg, "stance_es_d_n_s_m", 20.0
+                    ))))
+                    c_es = float(max(0.0, float(getattr(
+                        self.cfg, "stance_es_pump_gain", 150.0
+                    ))))
+                    g_raw_es = float(self.gravity)
+                    rho_fl = float(_clipf(float(
+                        self.cfg.prop_base_thrust_ratio
+                    ), 0.0, 0.8))
+                    h_tgt_es = float(max(
+                        0.05, float(self.cfg.hop_height_m)
+                    ))
+                    e_star = m * (g_raw_es * (1.0 - rho_fl)) * h_tgt_es
+                    e_now = (
+                        0.5 * m * float(vz_f) * float(vz_f)
+                        + m * g_raw_es * (float(h_com) - float(l0))
+                    )
+                    f_net_max = float(max(1.0, fz_cap - m * g_st))
+                    stroke_es = float(max(
+                        0.02, float(self.cfg.leg_stroke_max_m)
+                    ))
+                    x_margin = float(max(1.0, float(getattr(
+                        self.cfg, "stance_es_x_star_margin", 1.3
+                    ))))
+                    x_star = float(_clipf(
+                        x_margin * e_star / f_net_max,
+                        0.02,
+                        stroke_es,
+                    ))
+                    pump = c_es * (e_star - e_now) * float(vz_f)
+                    dn_fr = float(_clipf(float(getattr(
+                        self.cfg, "stance_es_pump_dn_frac", 0.5
+                    )), 0.0, 1.0))
+                    pump = float(max(pump, -dn_fr * m * g_st))
+                    x_now = float(max(0.0, x_z))
+                    f_comp = ramp * (
+                        m * g_st
+                        + k_es * (x_now - x_star)
+                        - d_es * float(vz_f)
+                        + pump
+                    )
+                    # Soft-catch floor: (x - x*) can go strongly negative
+                    # early in the squat; never drop below the same
+                    # weight-share floor used by the pump.
+                    f_floor = float((1.0 - dn_fr) * m * g_st)
+                    f_comp = float(max(f_comp, f_floor * ramp))
+                    # HARD STROKE WALL (2026-07-24 13:03, "压缩为什么
+                    # 没有被限制住", 124117 log): leg_stroke_max_m only
+                    # clipped x* (plan 59 mm) -- the body still sank to
+                    # 76 mm because k*(x-x*) is a soft spring, not a
+                    # stop.  Past the stroke, add a stiff unilateral
+                    # wall so compression cannot run through the limit.
+                    k_wall = float(max(0.0, float(getattr(
+                        self.cfg, "stance_es_stroke_wall_n_m", 20000.0
+                    ))))
+                    if x_now > stroke_es and k_wall > 0.0:
+                        f_comp = float(
+                            f_comp + k_wall * (x_now - stroke_es)
+                        )
+                    self._mode1_k_boost = float(min(f_comp, fz_cap))
+                    self._mode1_x_c_plan = float(x_star)
+                elif use_kd:
+                    # ---- MATLAB k-d + energy (see config block) ----
+                    # Position stiffness holds the linkage (no free
+                    # ringing around m*g); damping bleeds the impact
+                    # oscillation.  Descent spring until the bottom
+                    # latch, then the energy-sized ascent spring (k_up
+                    # sizing happens at latch_evt below).
+                    t_ramp = float(max(
+                        1e-3, float(self.cfg.stance_brake_ramp_s)
+                    ))
+                    ramp = float(_clipf(t_in_st_z / t_ramp, 0.0, 1.0))
+                    d_kd = float(max(0.0, float(getattr(
+                        self.cfg, "stance_matlab_d_n_s_m", 40.0
+                    ))))
+                    if (not bool(self._mode1_push_latched)) or (
+                        self._mode1_k_up is None
+                    ):
+                        s_tr = float(max(
+                            0.0, float(x_z) - float(self._mode1_x_td)
+                        ))
+                        f_comp = ramp * (
+                            m * g_st
+                            + float(self._mode1_k_dn) * s_tr
+                            - d_kd * float(vz_f)
+                        )
+                    else:
+                        # Ascent: pure energy spring, no damping (the
+                        # sized PE release IS the takeoff energy).
+                        f_comp = (
+                            m * g_st
+                            + float(self._mode1_k_up)
+                            * float(max(0.0, x_z))
+                        )
+                    self._mode1_k_boost = float(min(f_comp, fz_cap))
+                elif self._mode1_f_brake is not None:
                     t_ramp = float(max(
                         1e-3, float(self.cfg.stance_brake_ramp_s)
                     ))
                     ramp = float(_clipf(t_in_st_z / t_ramp, 0.0, 1.0))
                     # SPRING-shaped reception (sized at TD, see there):
-                    # force rises linearly with travel from m*g at touch
-                    # to the planned peak at the planned bottom, and
-                    # holds the peak beyond it (hard-stop territory).
-                    # Soft at impact by construction -- the body sinks
-                    # instead of bouncing off a front-loaded brake.
+                    # force rises linearly with travel from the c0*m*g
+                    # preload at touch (stance_recv_preload_frac; the old
+                    # 1.0*m*g start supported the full weight at zero
+                    # depth and the body bounced at 3 cm of the planned
+                    # 9 cm) to the planned peak at the planned bottom,
+                    # and holds the peak beyond it (hard-stop territory).
                     s_tr = float(max(
                         0.0, float(x_z) - float(self._mode1_x_td)
                     ))
@@ -3501,14 +4735,60 @@ class ModeECore:
                         float(self._mode1_x_c_plan)
                         - float(self._mode1_x_td),
                     ))
-                    f_bot = float(min(
-                        float(self._mode1_f_brake), f_max_z
-                    ))
-                    f_brk = (
-                        m * g_st
-                        + float(_clipf(s_tr / trav_pl, 0.0, 1.0))
-                        * max(0.0, f_bot - m * g_st)
+                    # ---- POSITIONAL reception (2026-07-25 07:35, "第二跳
+                    # 没达到压缩量", 073401 log) ----
+                    # Energy-sized springs stall shallow: the ballistic
+                    # v_td is the PRE-impact speed (hop1 sized 230 N and
+                    # stalled at 2.8 cm of the 11.3 cm plan) and the
+                    # linkage impact + friction eat the KE the sizing
+                    # counted on; hop0 (v_td=0, 111 N spring) sank 6 cm.
+                    # Depth is therefore guaranteed POSITIONALLY, with no
+                    # velocity estimate in the loop:
+                    #   s <= s_tgt: F from c0*m*g to w_tgt*m*g (< m*g) --
+                    #     net force stays DOWNWARD, gravity itself sinks
+                    #     the body to s_tgt through the friction;
+                    #   s >  s_tgt: F rises to the full leg budget at the
+                    #     planned bottom and holds it beyond (the catch).
+                    f_bot = float(f_max_z)
+                    f0_recv = (
+                        float(_clipf(float(getattr(
+                            self.cfg, "stance_recv_preload_frac", 1.0
+                        )), 0.0, 1.0)) * m * g_st
                     )
+                    w_tgt = float(_clipf(float(getattr(
+                        self.cfg, "stance_recv_tgt_weight_frac", 0.95
+                    )), 0.5, 1.0))
+                    f_mid = float(max(f0_recv, w_tgt * m * g_st))
+                    s_tgt = float(_clipf(
+                        float(getattr(
+                            self.cfg, "stance_travel_min_m", 0.0
+                        )),
+                        0.01, 0.9 * trav_pl,
+                    ))
+                    if s_tr <= s_tgt:
+                        f_brk = (
+                            f0_recv
+                            + (s_tr / s_tgt) * (f_mid - f0_recv)
+                        )
+                    else:
+                        # CATCH over a FIXED short span past the target
+                        # (2026-07-25 09:30, "compression 太深了", 092903
+                        # log: hop1 sank 5.4 cm past the 4.5 target
+                        # because the catch used the energy-planned
+                        # bottom, 11-12 cm away, as its full-force point
+                        # -- too gentle a slope for the landing KE).
+                        # Full leg budget is now reached within
+                        # stance_recv_catch_span_m of the target.
+                        catch_span = float(_clipf(float(getattr(
+                            self.cfg, "stance_recv_catch_span_m", 0.015
+                        )), 0.005, max(0.005, trav_pl - s_tgt)))
+                        f_brk = (
+                            f_mid
+                            + float(_clipf(
+                                (s_tr - s_tgt) / catch_span,
+                                0.0, 1.0,
+                            )) * max(0.0, f_bot - f_mid)
+                        )
                     f_comp = ramp * f_brk
                 else:
                     # Fallback fixed impedance (only if the controller was
@@ -3516,7 +4796,14 @@ class ModeECore:
                     kz = float(self.cfg.stance_kp_z)
                     h_des = l0 + float(self.cfg.hop_height_m)
                     f_comp = kz * (h_des - h_com) - bz * vz_up
-                f_comp = float(min(float(f_comp), f_max_z))
+                f_comp = float(min(
+                    float(f_comp),
+                    (
+                        float(self.cfg.stance_fz_max)
+                        if use_github_height
+                        else f_max_z
+                    ),
+                ))
 
                 # ---- BOTTOM: the single phase event ----
                 # The closed-loop brake above guarantees the descent can
@@ -3532,7 +4819,30 @@ class ModeECore:
                 # equilibrium), so waiting is dynamically free.
                 t_push_gate = float(self.cfg.stance_push_min_stance_s)
                 latch_evt = False
-                if not bool(self._mode1_push_latched):
+                if use_github_height:
+                    # The restored controller already latched the bottom with
+                    # its original filtered-vz/debounce gate above.
+                    pass
+                elif use_ha:
+                    # The one physical velocity-reversal event is handled
+                    # directly in the work-execution law above.
+                    pass
+                elif use_es and not bool(self._mode1_push_latched):
+                    # Energy shaping needs NO bottom event for the force
+                    # (the same equation covers descent and ascent); the
+                    # flag only feeds the prop PUSH collective and the
+                    # telemetry.  The ascent begins when vz crosses up --
+                    # a plain sign, no confirmation machinery.
+                    if t_in_st_z >= t_push_gate and float(vz_f) > 0.0:
+                        self._mode1_push_latched = True
+                        latch_evt = True
+                elif not bool(self._mode1_push_latched):
+                    # Track the deepest point reached this stance for the
+                    # position-rebound detector.
+                    self._mode1_xz_max = float(max(
+                        float(getattr(self, "_mode1_xz_max", 0.0)),
+                        float(x_z),
+                    ))
                     v_settle = float(max(1e-3, float(getattr(
                         self.cfg, "stance_bottom_settle_mps", 0.05
                     ))))
@@ -3549,28 +4859,76 @@ class ModeECore:
                             self.cfg, "stance_bottom_confirm_s", 0.016
                         )) / float(max(1e-4, self.dt))
                     ))))
-                    if self._mode1_push_confirm_count >= n_confirm:
+                    # Position-rebound latch (2026-07-24 11:51, "假跳"):
+                    # the body measurably RISING off its deepest point is
+                    # past the bottom by definition -- latch immediately,
+                    # skipping the confirmation window.  The passive
+                    # linkage rebound that outraced the vz-settle path
+                    # (115015: bottom ~35 ms, latch 78-93 ms or never)
+                    # trips this within 2-3 ticks.
+                    # 2026-07-24 12:01 VELOCITY-CONSISTENCY GATE (120025
+                    # st1): x_z also falls when the brake ramp EXTENDS
+                    # the leg against a soft/slipping contact while the
+                    # body is still descending -- the detector latched
+                    # PUSH at 34 ms with the body still falling at
+                    # 0.9 m/s, the push ran the leg past l0, and a false
+                    # liftoff cut the stance force mid-descent.  A
+                    # position rebound only counts as the bottom when the
+                    # body velocity agrees it is no longer descending
+                    # (same -v_settle bound as the vz path, instantaneous
+                    # -- the position drop replaces the confirm window,
+                    # not the physics).
+                    reb_m = float(max(1e-4, float(getattr(
+                        self.cfg, "stance_bottom_rebound_m", 0.004
+                    ))))
+                    rebound_now = (
+                        t_in_st_z >= t_push_gate
+                        and float(self._mode1_xz_max) - float(x_z) >= reb_m
+                        and float(vz_f) >= -v_settle
+                    )
+                    if (self._mode1_push_confirm_count >= n_confirm
+                            or rebound_now):
                         self._mode1_push_latched = True
                         latch_evt = True
 
-                # Smooth ALL compression-phase force transitions with a
-                # first-order blend (07:00 log: sink entry/exit stepped
-                # 90->35->111 N and rang the leg at ~15 Hz -> "腿抖").
-                tau_fz = float(max(0.0, float(getattr(
-                    self.cfg, "stance_fz_blend_tau_s", 0.012
-                ))))
-                if self._mode1_fcomp_lpf is None:
-                    self._mode1_fcomp_lpf = 0.0
-                a_fz = (
-                    1.0 if tau_fz <= 1e-12
-                    else float(self.dt / (tau_fz + self.dt))
-                )
-                self._mode1_fcomp_lpf += a_fz * (
-                    float(f_comp) - float(self._mode1_fcomp_lpf)
-                )
-                f_comp = float(self._mode1_fcomp_lpf)
+                if True:
+                    # Force LPF for ALL stance laws including MATLAB/github
+                    # (2026-07-25 06:39): github previously skipped this and
+                    # Fz jumped +-80 N/tick with the energy pump. MATLAB
+                    # spring is already smooth; the LPF only kills sensor
+                    # noise without changing the law.
+                    tau_fz = float(max(0.0, float(getattr(
+                        self.cfg, "stance_fz_blend_tau_s", 0.012
+                    ))))
+                    if self._mode1_fcomp_lpf is None:
+                        self._mode1_fcomp_lpf = 0.0
+                    a_fz = (
+                        1.0 if tau_fz <= 1e-12
+                        else float(self.dt / (tau_fz + self.dt))
+                    )
+                    self._mode1_fcomp_lpf += a_fz * (
+                        float(f_comp) - float(self._mode1_fcomp_lpf)
+                    )
+                    f_comp = float(self._mode1_fcomp_lpf)
 
-                if latch_evt:
+                if latch_evt and use_kd:
+                    # Size the ascent spring ONCE from the MEASURED
+                    # bottom: its PE release equals the takeoff energy
+                    #   0.5*k_up*x_b^2 = 0.5*m*v_to^2 + m*g_st*x_b
+                    x_bot_kd = float(max(0.015, x_z))
+                    v_to_kd = float(self._v_to_cmd)
+                    self._mode1_k_up = float(
+                        m * (v_to_kd * v_to_kd + 2.0 * g_st * x_bot_kd)
+                        / (x_bot_kd * x_bot_kd)
+                    )
+                    self._mode1_x0 = x_bot_kd
+                if (
+                    latch_evt
+                    and not use_github_height
+                    and not use_kd
+                    and not use_es
+                    and not use_ha
+                ):
                     # CONSTANT push force (FB-SLIP v2): the work over the
                     # remaining stroke x0 (current height deficit to l0)
                     # delivers the takeoff energy:
@@ -3592,38 +4950,60 @@ class ModeECore:
                     self._mode1_k_boost = float(min(f_push, fz_cap))
                     self._mode1_x0 = x0
                     # Blend starts from the compression force for
-                    # continuity.
-                    self._mode1_boost_f_state = float(max(0.0, f_comp))
+                    # continuity -- but NEVER from above the push target
+                    # (2026-07-25 09:35, "跳的太高", 093419 log): the
+                    # positional catch ends the descent at ~200-230 N, and
+                    # letting the blend DECAY from there fed an extra
+                    # ~80 N x 30 ms impulse (~+0.36 m/s) into every push
+                    # (vz_lo 1.47 vs cmd 1.10, apex 0.22 on 0.10 target,
+                    # tau pinned at 9 Nm).  Stepping DOWN to the latched
+                    # constant just unloads the leg; only upward steps
+                    # need the smoothing.
+                    self._mode1_boost_f_state = float(min(
+                        max(0.0, f_comp),
+                        float(self._mode1_k_boost),
+                    ))
 
                 compress_active = not bool(self._mode1_push_latched)
-                energy_gate = bool(self._mode1_push_latched) and bool(
-                    getattr(self.cfg, "use_energy_compensation", True)
+                energy_gate = (
+                    bool(self._mode1_push_latched)
+                    and bool(getattr(
+                        self.cfg, "use_energy_compensation", True
+                    ))
+                    and (
+                        use_github_height
+                        or (
+                            not use_kd
+                            and not use_es
+                            and not use_ha
+                        )
+                    )
                 )
-                if energy_gate:
-                    # PUSH (FB-SLIP v3): the same continuous re-planning
-                    # as the brake, mirrored upward.  Delivering the
-                    # remaining kinetic-energy deficit over the remaining
-                    # stroke needs
-                    #   F = m*g_st + m*(v_to^2 - vz_up^2) / (2*x_z)
-                    # On the ideal trajectory numerator and denominator
-                    # shrink together and F is the constant sized at the
-                    # latch; if the leg lags, F rises smoothly toward the
-                    # cap; if it runs ahead, F fades toward m*g.  This
-                    # replaces both the constant force AND the old
-                    # kp_v*(v_to - vz) catch-up (whose 100 N/(m/s) jump
-                    # at the latch made the 140 N spike, 04:05 log).
-                    v_to_now = float(self._v_to_cmd)
-                    vz_up_now = float(max(0.0, vz_f))
-                    dv2 = float(max(
-                        0.0, v_to_now * v_to_now - vz_up_now * vz_up_now
+                if use_github_height:
+                    springForce_scalar = float(f_comp)
+                elif use_kd or use_es or use_ha:
+                    # k-d / energy-shaping / work law: blended f_comp IS the
+                    # whole stance force; the bottom/ascent flag above
+                    # only feeds the prop PUSH ratio and the telemetry.
+                    springForce_scalar = float(f_comp)
+                    energy_comp_fz = float(max(
+                        0.0, float(f_comp) - m * g_st
                     ))
-                    x_rem = float(max(0.01, x_z))
+                elif energy_gate:
+                    # PUSH: LATCHED constant force (2026-07-25 07:46, user:
+                    # "push阶段 腿一直抖动 ... 要不要改成锁存的").  The v3
+                    # per-tick re-plan F = m*g + m*(v_to^2 - vz^2)/(2*x_z)
+                    # fed the measured vz/x back into the force; with the
+                    # ~14 Hz linkage mode ringing vz by +-1.5 m/s (074452
+                    # log) the force wiggled +-20 N in phase and SUSTAINED
+                    # the oscillation, wasting push work.  The constant
+                    # force sized once at the bottom latch (FB-SLIP v2,
+                    # see above: F = m*g_st + m*v_to^2/(2*x0)) is held
+                    # open-loop for the whole PUSH -- no measured state in
+                    # the loop, nothing to ring.
                     f_push_tgt = float(min(
-                        m * g_st + m * dv2 / (2.0 * x_rem),
-                        fz_cap,
+                        float(self._mode1_k_boost), fz_cap
                     ))
-                    # Live value for the log / telemetry.
-                    self._mode1_k_boost = f_push_tgt
                     tau_blend = float(max(
                         0.0, float(self.cfg.stance_push_blend_tau_s)
                     ))
@@ -3846,14 +5226,13 @@ class ModeECore:
             #   foot_des_b  = R_wb^T @ target_w   (quaternion body<-world)
             l0 = float(self.cfg.leg_l0_m)
             step_lim = float(abs(float(self.cfg.flight_stepper_lim_m)))
-            # Placement velocity input: KF-fused estimate, NOT the frozen
-            # liftoff latch (2026-07-23 21:52). 21:45 log: a 46 ms chatter
-            # bounce rang the kinematic latch to (-3.07, -1.02) m/s while
-            # the fused estimate read (-0.18, +0.41) -> the raw latch threw
-            # the foot target 24.5 cm out. The KF coasts on the IMU in
-            # flight, so impact ringing never reaches the placement.
+            # Placement velocity: MATLAB-style LIFTOFF LATCH (2026-07-25
+            # 06:39).  Same as CASE2026 -- flight Raibert uses the
+            # last-N stance mean frozen at liftoff (_v_hat_w XY holds
+            # _flight_vel).  The KF path was removed from placement: it
+            # keeps updating mid-flight and made the foot target wander.
             v_xy_w = np.array([
-                float(self._vel_kf_xy[0]), float(self._vel_kf_xy[1]),
+                float(self._v_hat_w[0]), float(self._v_hat_w[1]),
             ], dtype=float)
             vdes_xy_w = np.array([float(desired_v_xy_w[0]), float(desired_v_xy_w[1])], dtype=float)
             if bool(getattr(self.cfg, "use_hfbslip_placement", True)):
@@ -3886,9 +5265,13 @@ class ModeECore:
                 g_st_pl = g_pl * (1.0 - rho_st_pl)
                 g_up_pl = g_pl * (1.0 - rho_up_pl)
                 g_dn_pl = g_pl * (1.0 - rho_dn_pl)
-                h_pl = float(max(0.02, float(self.cfg.hop_height_m)))
+                h_pl = float(max(0.02, float(getattr(
+                    self.cfg, "takeoff_height_m", self.cfg.hop_height_m
+                ))))
                 v_to_pl = float(np.sqrt(2.0 * g_up_pl * h_pl))
-                v_td_pl = float(np.sqrt(2.0 * g_dn_pl * h_pl))
+                v_td_pl = float(np.sqrt(2.0 * g_dn_pl * float(max(
+                    0.02, float(self.cfg.hop_height_m)
+                ))))
                 # Compression plan (same law as the TD sizing).
                 alpha_pl = float(max(
                     1.2, float(self.cfg.stance_brake_force_g)
@@ -4025,6 +5408,23 @@ class ModeECore:
             x = np.asarray(foot_vicon, dtype=float).reshape(3)
             targetFootPos = np.asarray(foot_des_native, dtype=float).reshape(3)
             xdot = np.asarray(xdot_for_pd, dtype=float).reshape(3)
+            # Swing-chatter fix (see swing_vel_lpf_tau_s): the PD damping
+            # acts on a LOW-PASSED foot velocity, not the raw J*qd sample.
+            tau_sw_v = float(max(0.0, float(getattr(
+                self.cfg, "swing_vel_lpf_tau_s", 0.0
+            ))))
+            if tau_sw_v > 1e-12 and np.all(np.isfinite(xdot)):
+                if self._swing_xdot_lpf is None:
+                    self._swing_xdot_lpf = xdot.copy()
+                else:
+                    a_sw = float(self.dt / (tau_sw_v + self.dt))
+                    self._swing_xdot_lpf = (
+                        self._swing_xdot_lpf
+                        + a_sw * (xdot - self._swing_xdot_lpf)
+                    )
+                xdot = np.asarray(
+                    self._swing_xdot_lpf, dtype=float
+                ).reshape(3).copy()
 
             leg_length = float(np.linalg.norm(x))
             if leg_length < 1e-6:
@@ -4566,6 +5966,35 @@ class ModeECore:
             "apex_eta": float(self._apex_eta),
             # Learned parasitic-delivery bias (specific energy, m^2/s^2).
             "apex_e_bias": float(getattr(self, "_apex_e_bias", 0.0)),
+            # Apex-to-apex hybrid work controller telemetry (J, m, N).
+            "height_work_active": int(bool(getattr(
+                self.cfg, "height_work_control", False
+            ))),
+            "height_apex_energy_j": float(self._ha_apex_energy_j),
+            "height_loss_hat_j": float(self._ha_loss_hat_j),
+            "height_loss_meas_j": float(self._ha_loss_meas_j),
+            "height_loss_ff_j": float(self._ha_loss_ff_j),
+            "height_apex_confidence": float(self._ha_apex_confidence),
+            "height_work_req_j": float(self._ha_work_req_j),
+            "height_work_leg_j": float(self._ha_work_leg_j),
+            "height_work_prop_j": float(self._ha_work_prop_j),
+            "height_x_star_m": float(self._ha_x_star_m),
+            "height_x_bottom_m": float(self._ha_x_bottom_m),
+            "height_work_extension_m": float(
+                self._ha_x_work_bottom_m
+            ),
+            "height_v_comp_td_mps": float(self._ha_v_comp_td_mps),
+            "height_compression_k_n_m": float(
+                self._ha_compression_k_n_m
+            ),
+            "height_ascent": int(bool(self._ha_ascent)),
+            "height_leg_excess_force_n": float(
+                self._ha_leg_excess_force_n
+            ),
+            "height_brake_force_n": float(self._ha_brake_force_n),
+            "height_prop_push_ratio": float(
+                self._ha_prop_push_ratio
+            ),
             # Hybrid velocity damper: applied horizontal prop force (world)
             # and the KF-fused velocity it acts on.
             "vel_kf_x": float(self._vel_kf_xy[0]),

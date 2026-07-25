@@ -104,8 +104,9 @@ class ModeELCMConfig:
     #     then drives +11.5 -> 0. Prop floor hop_prop_base_pwm_us opens at
     #     the hopping handoff (covers push + flight) and is released only
     #     when RM reaches 0 (2026-07-23 21:15, continuous coverage).
-    # 2026-07-23 09:23 user: 0.428 -> 0.46; 2026-07-24 06:47: 0.46 -> 0.47.
-    switch_rb_leg_len_m: float = 0.47      # RT/P4 / LT stand target leg length (m)
+    # 2026-07-23 09:23 user: 0.428 -> 0.46; 2026-07-24 06:47: 0.46 -> 0.47;
+    # 2026-07-24 07:15: 0.47 -> 0.475.
+    switch_rb_leg_len_m: float = 0.475     # RT/P4 / LT stand target leg length (m)
     switch_rb_tau_max_nm: float = 1.0       # RT leg torque cap (Nm)
     switch_rb_pushdelay_s: float = 1.0      # stand this long, then enter hopping (push)
     # First hop out of RT: temporarily override leg_l0_m so the spring push
@@ -159,6 +160,20 @@ class ModeELCMConfig:
     # 10 Nm = the AK60 driver's own clamp, i.e. effectively uncapped.
     switch_rt_stand_tau_max_nm: float = 10.0
     switch_rt_stand_timeout_s: float = 4.0
+    # While RM unfolds in RT-STAND, force EVERY mapped prop motor to this
+    # PWM (2026-07-24 07:15: 1500; 07:21: 1600 each).  P4 place still uses
+    # switch_rb_prop_base_pwm_us (1200).
+    switch_rt_stand_prop_pwm_us: float = 1600.0
+    # SLIP-style loaded stand (2026-07-24 07:24 user: "PD加大 一定要像slip
+    # 那样撑起来").  Log 071232 showed the leg sagging ~2 cm during the RM
+    # unfold: the stand reused the FLIGHT swing gains (kp_z 1300 N/m, no
+    # gravity FF), which sag mg/kp ~ 5 cm under load.  RT-STAND now uses
+    # these stiffer axial gains PLUS a weight feedforward = m*g minus the
+    # estimated collective prop lift at the stand PWM, so the PD only
+    # corrects the residual and the leg truly holds L_des.
+    switch_rt_stand_kp_z_n_m: float = 4000.0
+    switch_rt_stand_kd_z_n_s_m: float = 60.0
+    switch_rt_stand_weight_ff: bool = True
     # Propeller SOFT-START: rate-limit how fast prop PWM may RISE (us per second). A hard
     # 1000->1200 jump spins up all props at once -> big ESC inrush current -> battery sag ->
     # brownout / CAN bus-off. Ramping the rise cuts the peak current. Falling PWM (spin-down/
@@ -196,10 +211,10 @@ class ModeELCMConfig:
     # - Setting this > 0 helps reduce flight-phase jitter/oscillation, because it dissipates energy using
     #   the motor's own high-rate velocity estimate (not the Python/Lcm qd).
     # - Applied per-phase (FLIGHT vs STANCE) so you can add a small amount in stance too.
-    ak60_flight_damp_kd: float = 0
+    ak60_flight_damp_kd: float = 0.1
     # 2026-07-19 stance anti-jitter: small motor-side damping using the
     # driver's own high-rate velocity (much cleaner than the ~230 Hz LCM qd).
-    ak60_stance_damp_kd: float = 0
+    ak60_stance_damp_kd: float = 0.1
 
     # ===== Command shaping / demo mode =====
     # To keep the hop process smooth, we rate-limit the commanded desired velocity.
@@ -232,7 +247,10 @@ class ModeELCMConfig:
     # the SLOWEST motor by more than this many rad. Set >0 to re-enable.
     # kp*lead = 2.0*1.5 = 3 A on the slowest arm (cap is 5 A).
     # 2026-07-24 07:05 user: sync ON -- fast arms wait for the slowest.
-    rm_sync_lead_rad: float = 1.0        # 0 = independent PD (sync off)
+    # 2026-07-24 07:20: 1.0 -> 3.0 so the SLOWEST arm can saturate
+    # rm_iq_max_a (iq ≈ kp*lead = 2*3 = 6 -> clip 5 A).  With lead=1
+    # the slowest was stuck at ~2 A and could not clear mid-travel load.
+    rm_sync_lead_rad: float = 3.0        # 0 = independent PD (sync off)
     rm_hold_s: float = 1.0               # hold at endpoint before idling (s)
     # Station-keeping at the HOPPING endpoint (2026-07-23 user request):
     # while gait==hopping AND legs are PD/PWMPD (and no fold transition is
@@ -1302,6 +1320,25 @@ class ModeELCMController:
                 "fbslip_sink",
                 "apex_eta",
                 "apex_e_bias",
+                # Apex-to-apex hybrid work controller
+                "height_work_active",
+                "height_apex_energy_j",
+                "height_loss_hat_j",
+                "height_loss_meas_j",
+                "height_loss_ff_j",
+                "height_apex_confidence",
+                "height_work_req_j",
+                "height_work_leg_j",
+                "height_work_prop_j",
+                "height_x_star_m",
+                "height_x_bottom_m",
+                "height_work_extension_m",
+                "height_v_comp_td_mps",
+                "height_compression_k_n_m",
+                "height_ascent",
+                "height_leg_excess_force_n",
+                "height_brake_force_n",
+                "height_prop_push_ratio",
                 "vel_kf_x",
                 "vel_kf_y",
                 "vel_kf_z",
@@ -1819,6 +1856,32 @@ class ModeELCMController:
                 float(info.get("fbslip_sink", 0)),
                 float(info.get("apex_eta", 1.0)),
                 float(info.get("apex_e_bias", 0.0)),
+                int(info.get("height_work_active", 0)),
+                float(info.get("height_apex_energy_j", float("nan"))),
+                float(info.get("height_loss_hat_j", float("nan"))),
+                float(info.get("height_loss_meas_j", float("nan"))),
+                float(info.get("height_loss_ff_j", float("nan"))),
+                float(info.get("height_apex_confidence", float("nan"))),
+                float(info.get("height_work_req_j", float("nan"))),
+                float(info.get("height_work_leg_j", float("nan"))),
+                float(info.get("height_work_prop_j", float("nan"))),
+                float(info.get("height_x_star_m", float("nan"))),
+                float(info.get("height_x_bottom_m", float("nan"))),
+                float(info.get(
+                    "height_work_extension_m", float("nan")
+                )),
+                float(info.get("height_v_comp_td_mps", float("nan"))),
+                float(info.get(
+                    "height_compression_k_n_m", float("nan")
+                )),
+                int(info.get("height_ascent", 0)),
+                float(info.get(
+                    "height_leg_excess_force_n", float("nan")
+                )),
+                float(info.get("height_brake_force_n", float("nan"))),
+                float(info.get(
+                    "height_prop_push_ratio", float("nan")
+                )),
                 float(info.get("vel_kf_x", float("nan"))),
                 float(info.get("vel_kf_y", float("nan"))),
                 float(info.get("vel_kf_z", float("nan"))),
@@ -2152,16 +2215,46 @@ class ModeELCMController:
                     # RT stand-and-unfold (2026-07-24 07:05): leg holds the
                     # P4 length UNCAPPED (inverted pendulum, leg carries
                     # the robot) while RM unfolds +11.5 -> 0 synchronized;
-                    # props stay on the P4 baseline.  When RM reaches 0
+                    # props: EVERY mapped motor forced to
+                    # switch_rt_stand_prop_pwm_us (1500).  When RM reaches 0
                     # (or timeout) -> plain normal hopping, FLIGHT first.
                     q_arr = np.asarray(q, dtype=float).reshape(3)
                     qd_arr = np.asarray(qd, dtype=float).reshape(3)
+                    # Weight the LEG must carry = m*g - collective prop lift
+                    # at the stand PWM (sqrt law: thrust = k*(pwm-1000)^2),
+                    # divided by the linkage force efficiency.
+                    # Calibrated from sample1/sample3 false-hop holds
+                    # (2026-07-25): the leg held the body statically at a
+                    # COMMANDED ~77 N while weight minus prop lift was only
+                    # ~54 N -- delivered/commanded = 0.69-0.72, the same
+                    # linkage efficiency as the push-work calibration. A
+                    # weight-only FF therefore sags and the PD has to make
+                    # up ~35% of the load.
+                    leg_eff = float(min(1.0, max(0.1, float(getattr(
+                        self.modee_cfg, "height_leg_work_efficiency", 0.72
+                    )))))
+                    ff_n = 0.0
+                    if bool(self.lcm_cfg.switch_rt_stand_weight_ff) \
+                            and not bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
+                        d_pwm = max(
+                            0.0,
+                            float(self.lcm_cfg.switch_rt_stand_prop_pwm_us) - 1000.0,
+                        )
+                        lift_n = 3.0 * float(self.modee_cfg.prop_k_thrust) * d_pwm * d_pwm
+                        ff_n = max(
+                            0.0, float(self.modee_cfg.mass_kg) * 9.81 - lift_n
+                        ) / leg_eff
+                    elif bool(self.lcm_cfg.switch_rt_stand_weight_ff):
+                        ff_n = float(self.modee_cfg.mass_kg) * 9.81 / leg_eff
                     tau_send, _err_m, _spd = self.core.compute_stand_swing_tau(
                         joint_pos=q_arr,
                         joint_vel=qd_arr,
                         leg_len_des_m=float(self.lcm_cfg.switch_rb_leg_len_m),
                         tau_max_nm=float(self.lcm_cfg.switch_rt_stand_tau_max_nm),
                         imu_quat_wxyz=imu_quat,
+                        kp_z=float(self.lcm_cfg.switch_rt_stand_kp_z_n_m),
+                        kd_z=float(self.lcm_cfg.switch_rt_stand_kd_z_n_s_m),
+                        axial_ff_n=ff_n,
                     )
                     tau_out_scale_applied = 1.0
                     pwm_min = float(self.modee_cfg.pwm_min_us)
@@ -2169,7 +2262,7 @@ class ModeELCMController:
                     if bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
                         props_active = False
                     else:
-                        prop_pwm_up = float(self.lcm_cfg.switch_rb_prop_base_pwm_us)
+                        prop_pwm_up = float(self.lcm_cfg.switch_rt_stand_prop_pwm_us)
                         for grp in self.modee_cfg.prop_pwm_idx_per_arm:
                             for idx in grp:
                                 ii = int(idx)
@@ -2210,10 +2303,11 @@ class ModeELCMController:
                             )
                         print(
                             "[gait] RT STAND: leg holds %.3f m UNCAPPED "
-                            "(%.0f Nm), RM +11.5 -> %.1f rad; HOPPING when "
-                            "RM reaches it"
+                            "(%.0f Nm), props %.0fus each, RM +11.5 -> %.1f "
+                            "rad; HOPPING when RM reaches it"
                             % (float(self.lcm_cfg.switch_rb_leg_len_m),
                                float(self.lcm_cfg.switch_rt_stand_tau_max_nm),
+                               float(self.lcm_cfg.switch_rt_stand_prop_pwm_us),
                                float(self.lcm_cfg.rm_hopping_rad))
                         )
                     tau_send, _err_m, _spd = self.core.compute_stand_swing_tau(
