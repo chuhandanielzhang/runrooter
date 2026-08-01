@@ -538,7 +538,10 @@ class ModeEConfig:
     #   prop_height_kh          -> flight apex-error gain (0 = leg only)
     #   prop_energy_apex_fade_vz-> ascent force rolls to 0 at apex
     stance_energy_law: str = "nrc"       # "nrc" | "mode1" (legacy latch)
-    nrc_k_n_m: float = 1800.0            # virtual spring stiffness [N/m]
+    # 2026-08-02: 1400 -> 2200, log 070306 compressed too deep (~9 cm at
+    # 1.4 m/s TD).  depth ~ v_td*sqrt(m/k): 2200 gives ~7.7 cm at the same
+    # v_td and shortens stance pi*sqrt(m/k) 0.217 -> 0.173 s.
+    nrc_k_n_m: float = 2200.0            # virtual spring stiffness [N/m]
     nrc_kR: float = 400.0                # norm-regulation gain [1/(m*s)]
     nrc_bz: float = 8.0                  # virtual damping [N*s/m]
     # Split point between the leg and the props for the stance energy
@@ -558,7 +561,13 @@ class ModeEConfig:
     # Pure feedback on the CURRENT arc: zero when the arc already reaches
     # the target, fades to zero at apex.  kh = 1 means a 100% relative
     # apex shortfall asks for one extra m*g of collective (then capped).
-    prop_height_kh: float = 1.0
+    # 2026-08-02: 1.0 -> 0.4.  Log 070306 apexes hit 13.5/18.1 cm vs the
+    # 7 cm target with 5-19 N of flight collective riding this feedback:
+    # its absolute-height reference (-p_hat_w2 vs l0+hop) carries a few cm
+    # of drift, and at kh=1 that bias turns into the same overshoot.  At
+    # 0.4 the props only rescue large shortfalls instead of inflating the
+    # arc.  Set 0 for pure-leg apex control.
+    prop_height_kh: float = 0.4
 
     # RB gamepad "big jump": the NEXT stance solves the push spring for
     # big_jump_height_gain * hop_height_m, one hop only.
