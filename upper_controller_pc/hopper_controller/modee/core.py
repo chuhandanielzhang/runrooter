@@ -439,13 +439,14 @@ class ModeEConfig:
     flight_kR: float = 40.0
     flight_kW: float = 6.0
     flight_tau_rp_max: float = 100
-    # Flight collective baseline (ratio of m*g).  With the DECOUPLED
-    # allocator (2026-08-01) attitude authority scales with the collective
-    # operating point, |tau_max| ~ (T/3 - t_min)*|r_arm|: the old 0.01
-    # baseline left the differential ~0.2 N of headroom -- no flight
-    # attitude control at all.  0.14 buys ~1.7 Nm per axis and costs
-    # nothing in stance (stance uses prop_stance_base_thrust_ratio).
-    prop_base_thrust_ratio: float = 0.14
+    # Collective baseline = PWM 1100 us idle (2026-08-01, user: "base 是
+    # 1100, propeller 在 energy 能量补充的时候才加 Fz").  Per motor
+    # t = k*(1100-1000)^2 = 0.225 N -> 0.675 N total = 0.0103 * m*g.
+    # The props carry NO planned lift outside the PUSH energy supplement;
+    # attitude authority comes from the DIFFERENTIAL channel spooling
+    # individual arms above the idle base (bounded, see
+    # prop_att_thrust_max_each_n), tri-rotor style.
+    prop_base_thrust_ratio: float = 0.0103
 
     # ===== PogoX / tri-rotor FLIGHT VELOCITY CONVERGENCE (2026-08-01) =====
     # Outer velocity loop closed on the LIVE flight velocity every tick
@@ -493,10 +494,10 @@ class ModeEConfig:
     rt_first_hop_spring_active: bool = False
     rt_first_hop_spring_k_n_m: float = 1800.0
     rt_first_hop_spring_d_n_s_m: float = 6.0
-    # Stance-phase propeller idle (collective). Higher than flight so props
-    # unload the leg / raise effective hop energy during push. Flight still
-    # uses prop_base_thrust_ratio. Typical bring-up: 0.08–0.15.
-    prop_stance_base_thrust_ratio: float = 0.12
+    # Stance-phase propeller idle (collective).  Same PWM-1100 idle as
+    # flight (2026-08-01): the props add planned Fz ONLY through the PUSH
+    # energy supplement (prop_energy_*); no standing stance lift share.
+    prop_stance_base_thrust_ratio: float = 0.0103
     stance_use_props: bool = True
     # ===== Hybrid leg-prop Z (TA-SLIP, 2026-07-19) =====
     # Props shape EFFECTIVE GRAVITY (continuous, low authority); the leg
@@ -515,7 +516,9 @@ class ModeEConfig:
     # stays unbiased when brake != ascent ratio. All couplings vanish when
     # props are disarmed (ratios treated as 0).
     # Extra collective while DESCENDING in flight (ratio of m*g).
-    prop_flight_brake_ratio: float = 0.10
+    # 2026-08-01 OFF: Fz is only planned for the PUSH energy supplement;
+    # descent keeps the same PWM-1100 idle base as the rest of the cycle.
+    prop_flight_brake_ratio: float = 0.0
     # Descent detection threshold on world vz (m/s, up-positive).
     prop_flight_brake_vz_mps: float = 0.10
     # 2026-07-19 (per user): 3D / bidirectional thrust DISABLED everywhere.
@@ -635,6 +638,16 @@ class ModeEConfig:
 
     # Minimum forward thrust per arm keeps the propellers responsive.
     wbc_thrust_min_each_n: float = 0.1
+    # ===== Attitude differential spool-up cap (2026-08-01) =====
+    # At the PWM-1100 idle base a ZERO-SUM differential has only
+    # (base - t_min) ~ 0.1 N of down-headroom -- no torque.  Tri-rotor
+    # practice at a low idle: the low arm floors at t_min while the arms
+    # that need torque spool UP above the base (direction-preserving,
+    # minimal collective lift).  This cap bounds how far ANY arm may rise
+    # above the collective base for the ATTITUDE channel, so a large
+    # attitude demand can never stack the PWM sky-high ("不能叠加很多
+    # pwm"): 3 N above the 0.225 N base = PWM ~1380 ceiling per arm.
+    prop_att_thrust_max_each_n: float = 3.0
 
     # ===== Contact friction (controller-side) =====
     # Must match the ground/contact physics as closely as possible (e.g. MuJoCo friction).
@@ -1360,43 +1373,36 @@ class ModeECore:
         reverse_policy: str = "bidir",
     ) -> np.ndarray:
         """
-        Tri-rotor thrust allocation with STRICT Fz / torque DECOUPLING
-        (2026-08-01 rewrite, user: "把 fz 和 fxfy(srb torque) 解耦开来,
-        不要叠加 pwm").
+        Tri-rotor thrust allocation: idle-base DIFFERENTIAL attitude with a
+        bounded spool-up (2026-08-01, user: "propeller 在 energy 能量补充的
+        时候才加 Fz, 其他时候就像 3rotor 文章一样差值控制姿态, base 是
+        1100, 不能叠加很多 pwm").
 
-        Two ORTHOGONAL channels compose every arm command
-            t_i = T/3 + s * Delta_i :
+        Two channels compose every arm command
+            t_i = T/3 + c + s * Delta_i :
 
           [Fz]  COLLECTIVE  T = clip(thrust_sum_ref, thrust_sum_max).
-                Owned exclusively by the height/energy plan (rho).  It is
-                the ONLY term that changes the total thrust, so the
-                ballistic models (g_up, g_dn, v_td) see exactly the rho
-                they commanded -- never an attitude side effect.
+                T is the PWM-1100 idle base for the whole hop cycle; the
+                ONLY planned addition is the PUSH energy supplement
+                (prop_energy_fz).  No attitude-driven Fz plan anywhere.
 
           [tau] DIFFERENTIAL Delta = min-norm solution of
-                M[:2] Delta = tau_xy, then projected onto the zero-sum
-                subspace (sum Delta_i == 0 EXACTLY; for the symmetric
-                Y-frame sum(r_i) = 0 puts (1,1,1) in null(M), so the
-                projection is a numerical no-op that guarantees the
-                contract).  A zero-sum differential is a PURE moment:
-                sum(t_i) == T for ANY scale s.
+                M[:2] Delta = tau_xy, projected zero-sum (a pure moment
+                for the symmetric Y-frame).  At the idle base the down-
+                headroom (base - t_min) is ~0.1 N, so realizing torque
+                REQUIRES the minimal collective lift c(s) that keeps the
+                floored arm at t_min while the demanding arms rise above
+                the base -- standard low-idle tri-rotor mixing.  The lift
+                is the SMALLEST that makes s*Delta feasible, and every
+                arm is HARD-CAPPED at
+                    t_ceil = base + prop_att_thrust_max_each_n
+                so a large attitude demand can never stack the PWM
+                ("不能叠加很多 pwm"; 3 N cap = PWM ~1380 per arm).
 
-        Saturation = LEXICOGRAPHIC priority, height > attitude (framework
-        order: 1. jump height, 2. stability, 3. velocity): the torque is
-        realized as s*tau_des with the LARGEST s in [0,1] such that
-        t_min <= T/3 + s*Delta_i <= t_max on every arm -- one scalar on
-        the whole differential, so the moment DIRECTION is exact
-        (prioritized mixing, cf. Faessler et al. RA-L 2017; Johansen &
-        Fossen, Automatica 2013).
-
-        The old "collective lift" term (raise ALL arms when the floored
-        arm blocks the differential) is REMOVED: it let the attitude
-        channel inflate the total thrust far beyond the plan.  Attitude
-        authority now scales with the collective operating point,
-            |tau_max| ~ (T/3 - t_min) * |r_arm|  per axis,
-        so if flight attitude needs more torque, raise the Fz-channel
-        baseline (prop_base_thrust_ratio) -- do not expect the allocator
-        to conjure headroom.
+        Saturation: torque realized as s*tau_des with the LARGEST s in
+        [0,1] under floor/ceiling/sum caps -- one scalar on the whole
+        differential, moment DIRECTION exact (prioritized mixing, cf.
+        Faessler et al. RA-L 2017; Johansen & Fossen, Automatica 2013).
 
         reverse_policy (floor selection only, solver identical):
           "fwd"   forward-only floor (never cross the 1000 us stop).
@@ -1414,8 +1420,8 @@ class ModeECore:
             _cross3(prop_r_w[i].reshape(3), z_thrust_w.reshape(3)) for i in range(3)
         ]).astype(float)
         thrusts_att = _lstsq_minnorm(M_prop[:2, :], tau_des_w[:2]).astype(float)
-        # Zero-sum projection: the differential must carry NO collective
-        # component so the [Fz] channel alone sets the total thrust.
+        # Zero-sum projection: the differential itself is a pure moment;
+        # only the explicit lift c below may move the total thrust.
         thrusts_att = (thrusts_att - float(np.mean(thrusts_att))).astype(float)
         t_max = float(self.cfg.thrust_max_each_n)
         tsum_cap = float(max(0.0, float(thrust_sum_max)))
@@ -1423,23 +1429,42 @@ class ModeECore:
         if tsum_cap > 1e-9:
             T_col = min(T_col, tsum_cap)
         base_each = min(T_col / 3.0, t_max)
+        # Per-arm ceiling for the attitude channel: base + spool-up cap.
+        att_cap = float(max(0.0, float(getattr(
+            self.cfg, "prop_att_thrust_max_each_n", 3.0
+        ))))
+        t_ceil = min(t_max, base_each + att_cap)
 
         a = [float(thrusts_att[i]) for i in range(3)]
+        a_min = min(a)
+        a_max = max(a)
 
         def _solve(t_min: float) -> tuple[np.ndarray, float]:
-            # Largest s in [0,1] with t_min <= base + s*a_i <= t_max for all
-            # arms.  base < t_min (collective plan below the floor) yields
-            # s = 0: NO torque rather than unplanned lift.
+            # Largest s in [0,1] such that t_i = base + c(s) + s*a_i is
+            # feasible, where c(s) = max(0, t_min - (base + s*a_min)) is
+            # the MINIMAL collective lift keeping the floored arm at
+            # t_min.  Ceiling and sum caps bound the spool-up.
             s = 1.0
-            for d in a:
+            if a_max > 1e-9:
+                s = min(s, max(0.0, t_ceil - base_each) / a_max)
+            if (base_each + s * a_min) < t_min - 1e-12:
+                # Lift engaged: base+c+s*a_min == t_min exactly.
+                # Ceiling: t_min + s*(a_max - a_min) <= t_ceil.
+                # Sum (zero-sum a): 3*t_min - 3*s*a_min <= tsum_cap.
+                s = 1.0
+                d = a_max - a_min
                 if d > 1e-9:
-                    s = min(s, (t_max - base_each) / d)
-                elif d < -1e-9:
-                    s = min(s, (base_each - t_min) / (-d))
-            s = max(0.0, min(1.0, s))
+                    s = min(s, max(0.0, t_ceil - t_min) / d)
+                if tsum_cap > 1e-9 and a_min < -1e-9:
+                    s = min(s, max(0.0, tsum_cap - 3.0 * t_min)
+                            / (-3.0 * a_min))
+                s = max(0.0, min(1.0, s))
+            c = max(0.0, t_min - (base_each + s * a_min))
             return (
                 np.array(
-                    [base_each + s * a[0], base_each + s * a[1], base_each + s * a[2]],
+                    [base_each + c + s * a[0],
+                     base_each + c + s * a[1],
+                     base_each + c + s * a[2]],
                     dtype=float,
                 ),
                 float(s),
@@ -2540,20 +2565,12 @@ class ModeECore:
                 f_n = 0.0
             if f_n > 1e-6 and np.all(np.isfinite(f_xy_w)):
                 f_mag = float(math.hypot(f_n, f_z_up))
-                # Physical budget: scale the WHOLE vector (direction
-                # preserved) if the magnitude outruns the thrust cap.
-                t_cap_v = float(self.mass) * float(self.gravity) * float(
-                    self.cfg.thrust_total_ratio_max
-                )
-                if f_mag > t_cap_v:
-                    sc_v = t_cap_v / f_mag
-                    f_xy_w = f_xy_w * sc_v
-                    f_n = f_n * sc_v
-                    f_z_up = f_z_up * sc_v
-                    f_mag = t_cap_v
-                # Collective magnitude follows the vector (1/cos boost) so
-                # the WORLD-vertical share stays the plan's rho*m*g.
-                thrust_sum_ref = float(f_mag)
+                # NOTE (2026-08-01, user: "energy 补充的时候才加 Fz"):
+                # the collective is NOT raised to follow the tilt vector.
+                # thrust_sum_ref stays at the PWM-1100 idle base; the tilt
+                # only shapes R_des and the braking moment is delivered by
+                # the DIFFERENTIAL channel (3rotor style).  The delivered
+                # lateral force is whatever the tilted total thrust gives.
                 # Thrust points along -z_b (FRD): the desired body z-axis
                 # is the negative of the desired thrust direction.  Yaw is
                 # kept via the geometric-controller triad (Lee et al.).
