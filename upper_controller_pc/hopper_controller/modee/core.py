@@ -416,9 +416,10 @@ class ModeEConfig:
     hopper4_phase_min_steps: int = 10
 
     # Stance attitude PD (one gain for roll and pitch).
-    stance_kpp: float = 70.0
-    stance_kpd: float = 1.5
-    stance_tau_rp_max: float = 15.0
+    # 2026-08-02: bumped ~1.4x for stronger balance authority.
+    stance_kpp: float = 100.0
+    stance_kpd: float = 2.5
+    stance_tau_rp_max: float = 20.0
     stance_mu: float = 0.0
     stance_fxy_max: float = 0.0
 
@@ -436,8 +437,9 @@ class ModeEConfig:
     swing_kd_z: float = 20.0
 
     # Propeller/HFA. Flight attitude PD uses one gain for roll and pitch.
-    flight_kR: float = 40.0
-    flight_kW: float = 6.0
+    # 2026-08-02: bumped ~1.5x for stronger flight balance.
+    flight_kR: float = 60.0
+    flight_kW: float = 9.0
     flight_tau_rp_max: float = 100
     # Collective baseline = PWM 1100 us idle (2026-08-01, user: "base 是
     # 1100, propeller 在 energy 能量补充的时候才加 Fz").  Per motor
@@ -728,7 +730,10 @@ class ModeEConfig:
     # above the collective base for the ATTITUDE channel, so a large
     # attitude demand can never stack the PWM sky-high ("不能叠加很多
     # pwm"): 3 N above the 0.225 N base = PWM ~1380 ceiling per arm.
-    prop_att_thrust_max_each_n: float = 3.0
+    # Per-arm attitude differential above idle (N). 2026-08-02: 3 -> 5 so
+    # the stronger flight_kR/kW has room to act (still well below the
+    # 20.3 N / 1950 us per-arm ceiling).
+    prop_att_thrust_max_each_n: float = 5.0
 
     # ===== Contact friction (controller-side) =====
     # Must match the ground/contact physics as closely as possible (e.g. MuJoCo friction).
