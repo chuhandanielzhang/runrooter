@@ -417,8 +417,8 @@ class ModeEConfig:
 
     # Stance attitude PD (one gain for roll and pitch).
     # 2026-08-02: bumped ~1.4x for stronger balance authority.
-    stance_kpp: float = 100.0
-    stance_kpd: float = 2.5
+    stance_kpp: float = 70.0
+    stance_kpd: float = 1.5
     stance_tau_rp_max: float = 20.0
     stance_mu: float = 0.0
     stance_fxy_max: float = 0.0
@@ -464,10 +464,13 @@ class ModeEConfig:
     # which shrinks to zero exactly at the slew rate -> body is level
     # `settle` seconds before ballistic touchdown, with no discontinuity.
     flight_vel_ctrl_enable: bool = True
-    flight_vel_kv: float = 4.0            # damper bandwidth [1/s]
-    flight_vel_tilt_max_deg: float = 12.0  # lean cap (every deg must be repaid)
-    flight_vel_tilt_slew_dps: float = 120.0  # lean ramp rate (rise AND re-level)
-    flight_level_settle_s: float = 0.14    # level margin before touchdown
+    # 2026-08-02: stronger PogoX flight velocity convergence (log 065243
+    # one hop killed |vxy| 0.71->0.03, the others drifted -- raise kv,
+    # tilt budget, and slew so short flights still get authority).
+    flight_vel_kv: float = 7.0            # damper bandwidth [1/s]
+    flight_vel_tilt_max_deg: float = 18.0  # lean cap (every deg must be repaid)
+    flight_vel_tilt_slew_dps: float = 180.0  # lean ramp rate (rise AND re-level)
+    flight_level_settle_s: float = 0.12    # level margin before touchdown
 
     # ===== PROPELLER ENERGY SUPPLEMENT (2026-08-01, decoupled) =====
     # Mode1's push spring is capped by the leg force budget
