@@ -31,14 +31,15 @@ for p in (CTRL, _LCM_TYPES_DIR):
 from python.motor_pwm_lcmt import motor_pwm_lcmt  # noqa: E402
 
 # pwm_values index -> 120° Y arm (body FRD: +X fwd, +Y right).
-# 2026-07-18 confirmed physical mapping (M1 moved MAIN1 -> MAIN8):
-# M1->MAIN8 at +30deg, M2->MAIN2 at -90deg, M3->MAIN3 at +150deg.
+# 2026-08-01 spin-test re-alignment (user observed, one motor at a time):
+# pwm[1] spins the LEFT-front arm (+150deg, -x,+y), pwm[2] the RIGHT-front
+# arm (+30deg, +x,+y), pwm[3] the BACK arm (-90deg, 0,-L).
 # Bridge map: pwm[1]->set1, pwm[2]->set2, pwm[3]->set3 (sets, not pins).
 # --motors here still takes the PWM INDICES 1,2,3 (unchanged).
 MOTOR_LABELS = {
-    1: "M1 pwm[1]->MAIN8 @ +30deg (+x,+y), bridge direction inverted",
-    2: "M2 pwm[2]->MAIN2 @ -90deg (0,-L), bridge direction inverted",
-    3: "M3 pwm[3]->MAIN3 @ +150deg (-x,+y)",
+    1: "M1 pwm[1] @ +150deg LEFT-front (-x,+y)",
+    2: "M2 pwm[2] @ +30deg RIGHT-front (+x,+y)",
+    3: "M3 pwm[3] @ -90deg BACK (0,-L)",
 }
 
 
