@@ -3,6 +3,8 @@
 > 对应代码：`upper_controller_pc/hopper_controller/modee/core.py`
 > 基座：2026-07-20 `2aa050e` 的 Mode1 控制器（虚拟弹簧腿 + hip-torque SRB 姿态 + Raibert 落点），
 > 2026-08-01 重建，加入：解耦三旋翼分配器、桨能量补充（PUSH→apex）、PogoX 式飞行速度收敛。
+> 2026-08-01 (v2)：stance 能量律默认切换为 **NRC 连续律**（§2b，Lo/Chu/Au ACC 2020），
+> Mode1 两段弹簧保留为 `stance_energy_law = "mode1"` 可选回退。
 
 ---
 
@@ -46,7 +48,51 @@ TD (q_shift ≤ -2cm) ──► COMPRESSION ──► PUSH latch (vz_f 过零去
   （Koditschek–Buehler 离散能量调节，1-D 收缩）。这是腿/桨双能量源的耦合闭环。
 - RB 手柄大跳：下一次 PUSH 用 \(h_{tgt} \times\) `big_jump_height_gain`，一跳后自动恢复。
 
-## 3. 桨：能量补充（PUSH → apex，解耦的 Fz 通道）
+## 2b. NRC 连续能量律（新默认，`stance_energy_law = "nrc"`）
+
+> 来源：Lo, Chu, Au, *A Norm-Regulation-Based Limit Cycle Control of Vertical Hoppers*, ACC 2020。
+> 动机：Mode1 的 PUSH latch + 一次性重解弹簧在 latch 时刻产生 \(f_z\) 跳变（log 里 10 ms 内
+> 130→430 N），是 tau 抽搐的主因之一。NRC 用**一条连续力律覆盖整个 stance**，能量误差在
+> **stance 内部**单调收敛，不需要 latch、不需要 blend、不需要逐跳的 \(E_{loss}\) 映射。
+
+**归一化相平面**（世界系竖直、向上为正）：
+\[ \omega = \sqrt{k/m}, \qquad x_1 = (h_{com} - l_0) + \frac{m g_{st}}{k}, \qquad x_2 = \frac{v_z}{\omega} \]
+
+极限环是相平面上的圆 \(\|x\| = r^\*\)。**高度耦合**就在目标半径里：
+\[ v_{to} = \sqrt{2 g_{up} h_{hop}}, \qquad r^\* = \Big\| \big( \tfrac{m g_{st}}{k},\; \tfrac{v_{to}}{\omega} \big) \Big\| \]
+（\(g_{st}, g_{up}\) 是桨怠速 collective 折算后的有效重力——桨的存在直接改写能量目标。）
+
+**控制律**（论文 NRC-2 平滑版）：
+\[ F_{pump} = -2 m k_R \omega\, x_2 (\|x\| - r^\*), \qquad f_z = \mathrm{clip}\big(k(l_0-h_{com}) - b_z v_z + F_{pump},\; 0,\; f_{z,cap}\big) \]
+
+- \(\tfrac{d}{dt}\|x\| = -2 k_R x_2^2 (1 - r^\*/\|x\|)\)：半径误差在 stance 内单调衰减 →
+  **一个 stance 内收敛**（1D 仿真：静止零能量起步，第一跳即 6.84 cm / 目标 7 cm，之后死平）。
+- \(x_2=0\)（底部）时 \(F_{pump}=0\)：**底部无力尖峰**，能量摊在整个行程注入 → 无 chatter。
+- 收敛后 \(F_{pump} \to 0\)，剩纯弹簧——极限环上控制器"消失"。
+- TD 时刻若上一跳能量正确则 \(\|x\| \approx r^\*\) → 力从 0 连续起步，TD 也无跳变。
+- **桨融合（stance）**：每 tick 腿被 \(f_{z,cap}\) 削掉的需求残差实时进桨 collective：
+  \(F_{prop} = \mathrm{clip}(f_{des} - f_{z,cap},\, 0,\, \rho_{max} m g)\)。连续量、纯 Fz 通道。
+- **桨融合（flight 上升段）**：对**当前弹道**的 apex 预测误差做纯反馈：
+  \[ h_{pred} = h + \frac{v_z^2}{2g}, \qquad F = \mathrm{clip}\Big(k_h\, m g\, \frac{(l_0 + h_{hop}) - h_{pred}}{h_{hop}},\, 0,\, \rho_{max} m g\Big) \cdot \mathrm{clip}\big(\tfrac{v_z}{v_{fade}}, 0, 1\big) \]
+  弧线已够高 → 力为 0；不够 → 连续泵，apex 处淡出归零。自限幅，无锁存。
+- 大跳：TD 时消费 RB 请求，整个 stance 以 \(h_{hop} \times\) gain 为目标，LO 恢复。
+
+**调参表（就这几个）**：
+
+| 参数 | 默认 | 物理含义 | 怎么调 |
+|---|---|---|---|
+| `hop_height_m` | 0.07 | apex 目标（唯一高度源头） | 想跳多高改这个 |
+| `nrc_k_n_m` | 1400 | 虚拟弹簧刚度 | 触底太深/stance 太长 → 调大；落地太硬 → 调小（深度≈\(v_{td}\sqrt{m/k}\)，时长≈\(\pi\sqrt{m/k}\)≈0.22 s） |
+| `nrc_kR` | 400 | 能量泵增益 | 高度收敛慢/跳不到 → 调大；中段力峰太大 → 调小 |
+| `nrc_bz` | 8 | 小阻尼（防振动） | 腿振铃 → 调大一点；它耗的能 kR 会自动补回 |
+| `prop_energy_max_ratio` | 0.35 | 桨补能上限（×mg） | 桨介入太猛 → 调小 |
+| `prop_height_kh` | 1.0 | 飞行段 apex 误差增益 | 0 = 纯腿；跳不够高且腿已饱和 → 调大 |
+| `prop_energy_apex_fade_vz` | 0.30 | apex 前淡出窗口 (m/s) | 一般不动 |
+
+日志新列：`nrc_r` / `nrc_r_star`（相平面半径 vs 目标，二者贴合 = 能量在环上）、`prop_energy_fz`
+（stance = 腿残差进桨的力；flight = apex 误差反馈力）。
+
+## 3. 桨：能量补充（PUSH → apex，解耦的 Fz 通道）—— Mode1 回退路径
 
 腿被力预算封顶时的能量缺口：
 \[ E_{def} = \max\!\big(0,\; E_{need} - \tfrac12 k_{boost} x_0^2\big) \]

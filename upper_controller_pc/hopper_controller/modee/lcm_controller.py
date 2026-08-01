@@ -214,7 +214,7 @@ class ModeELCMConfig:
     ak60_flight_damp_kd: float = 0.1
     # 2026-07-19 stance anti-jitter: small motor-side damping using the
     # driver's own high-rate velocity (much cleaner than the ~230 Hz LCM qd).
-    ak60_stance_damp_kd: float = 0.1
+    ak60_stance_damp_kd: float = 0
 
     # ===== Command shaping / demo mode =====
     # To keep the hop process smooth, we rate-limit the commanded desired velocity.
@@ -1291,6 +1291,10 @@ class ModeELCMController:
                 "energy_comp_fz",
                 "vz_up",
                 "energy_gate",
+                # NRC stance law + prop energy supplement
+                "nrc_r",
+                "nrc_r_star",
+                "prop_energy_fz",
                 "thrust_sum_ref",
                 "thrust_sum",
                 "F_total_w0",
@@ -1665,6 +1669,9 @@ class ModeELCMController:
                 -v_hat_w[2] if np.isfinite(float(v_hat_w[2])) else float("nan"),
             ))
             energy_gate = int(info.get("energy_gate", 0))
+            nrc_r = float(info.get("nrc_r", float("nan")))
+            nrc_r_star = float(info.get("nrc_r_star", float("nan")))
+            prop_energy_fz = float(info.get("prop_energy_fz", float("nan")))
             thrust_sum_ref = float(info.get("thrust_sum_ref", float("nan")))
             thrust_sum = float(info.get("thrust_sum", float("nan")))
             F_total_w = np.asarray(info.get("F_total_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
@@ -1830,6 +1837,9 @@ class ModeELCMController:
                 float(energy_comp_fz),
                 float(vz_up),
                 int(energy_gate),
+                float(nrc_r),
+                float(nrc_r_star),
+                float(prop_energy_fz),
                 float(thrust_sum_ref),
                 float(thrust_sum),
                 float(F_total_w[0]),

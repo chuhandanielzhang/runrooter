@@ -489,6 +489,60 @@ class ModeEConfig:
     # ~vz_fade of upward speed ramps the force linearly to zero at apex.
     prop_energy_apex_fade_vz: float = 0.30
 
+    # ===== NRC stance energy law (Lo/Chu/Au, ACC 2020) ============
+    # "A Norm-Regulation-Based Limit Cycle Control of Vertical Hoppers":
+    # ONE continuous force law for the WHOLE stance -- replaces Mode1's
+    # COMP spring + PUSH latch + k re-solve (no latch, no blend, no
+    # per-hop E_loss map needed: convergence happens INSIDE the stance).
+    #
+    # Normalized phase state (up-positive, world-Z):
+    #   omega = sqrt(k/m)
+    #   x1 = (h_com - l0) + m*g_st/k     (spring coord, gravity-shifted)
+    #   x2 = vz_up / omega               (velocity, same units as x1)
+    # On the limit cycle the stance orbit is a circle ||x|| = r*.  The
+    # TARGET radius is built from the HEIGHT TARGET (this is the
+    # height <-> energy coupling):
+    #   v_to = sqrt(2*g_up*hop_height_m)          (prop-assisted ascent)
+    #   r*   = hypot(m*g_st/k, v_to/omega)
+    # Control law (paper's NRC-2 smooth variant, F = m*f):
+    #   F_pump = -2*m*kR*omega * x2 * (||x|| - r*)
+    #   F_leg  = clip(k*(l0-h_com) - bz*vz + F_pump, 0, stance_fz_max)
+    # d/dt||x|| = -2*kR*x2^2*(1 - r*/||x||): the radius error decays
+    # monotonically DURING the stance -- disturbance rejection within
+    # one hop, and F_pump -> 0 on the limit cycle (pure spring remains).
+    # F_pump = 0 exactly at the bottom (x2 = 0): no bottom force spike,
+    # energy is pumped over the whole stroke -> no tau chatter.
+    #
+    # PROPELLER FUSION (continuous, decoupled): every tick, whatever the
+    # leg force budget clips off the NRC demand rides the prop
+    # COLLECTIVE (Fz channel only):
+    #   F_prop = clip(F_des - stance_fz_max, 0, prop_energy_max_ratio*m*g)
+    # In FLIGHT the props regulate the SAME height target through the
+    # ballistic apex prediction (see prop_height_kh below).
+    #
+    # ---- the tuning set (in order of importance) ----
+    #   hop_height_m            -> apex target: the ONE height knob
+    #   nrc_k_n_m               -> stance stiffness: bottom depth + stance time
+    #                              (depth ~ v_td*sqrt(m/k), T_st ~ pi*sqrt(m/k))
+    #   nrc_kR                  -> energy pump gain: bigger = converge in one
+    #                              stance but higher mid-stroke force
+    #   nrc_bz                  -> small damping (anti-vibration only; the
+    #                              energy it eats is repumped by kR)
+    #   prop_energy_max_ratio   -> prop collective ceiling (x m*g)
+    #   prop_height_kh          -> flight apex-error gain (0 = leg only)
+    #   prop_energy_apex_fade_vz-> ascent force rolls to 0 at apex
+    stance_energy_law: str = "nrc"       # "nrc" | "mode1" (legacy latch)
+    nrc_k_n_m: float = 1400.0            # virtual spring stiffness [N/m]
+    nrc_kR: float = 400.0                # norm-regulation gain [1/(m*s)]
+    nrc_bz: float = 8.0                  # virtual damping [N*s/m]
+    # FLIGHT height regulation via props: while ascending, predict the
+    # ballistic apex h_pred = h + vz^2/(2g) and command
+    #   F = clip(kh*m*g*(h_apex_tgt - h_pred)/hop_height, 0, cap) * fade(vz)
+    # Pure feedback on the CURRENT arc: zero when the arc already reaches
+    # the target, fades to zero at apex.  kh = 1 means a 100% relative
+    # apex shortfall asks for one extra m*g of collective (then capped).
+    prop_height_kh: float = 1.0
+
     # RB gamepad "big jump": the NEXT stance solves the push spring for
     # big_jump_height_gain * hop_height_m, one hop only.
     big_jump_height_gain: float = 1.8
@@ -914,6 +968,11 @@ class ModeECore:
         self._prop_energy_fz: float = 0.0
         # RB gamepad big-jump request (armed until consumed at a PUSH latch).
         self._big_jump_pending: bool = False
+        # NRC stance energy law state/telemetry (see nrc_* config):
+        # one-hop height gain (big jump) + last norm radius vs target.
+        self._nrc_big_gain: float = 1.0
+        self._nrc_r: float = 0.0
+        self._nrc_r_star: float = 0.0
         # Runtime compat: lcm_controller sets this after the RT transition so
         # the first-flight apex/eta estimate skips one corrupted arc.
         self._eta_skip_once: bool = False
@@ -1127,6 +1186,9 @@ class ModeECore:
         self._fl_zb_des_xy[:] = 0.0
         self._prop_energy_fz = 0.0
         self._big_jump_pending = False
+        self._nrc_big_gain = 1.0
+        self._nrc_r = 0.0
+        self._nrc_r_star = 0.0
         self._eta_skip_once = False
         self._kw_obs_w[:] = 0.0
         self._kw_obs_tau_prev[:] = 0.0
@@ -2186,6 +2248,15 @@ class ModeECore:
                 # The prop energy supplement served last hop's PUSH + ascent;
                 # a fresh stance re-solves it at its own PUSH latch.
                 self._prop_energy_fz = 0.0
+                # NRC law: consume the big-jump request at TOUCHDOWN (the whole
+                # continuous stance targets the taller apex; Mode1's one-shot
+                # consume-at-latch does not exist here).
+                if (str(getattr(self.cfg, "stance_energy_law", "mode1"))
+                        .lower() == "nrc") and bool(self._big_jump_pending):
+                    self._nrc_big_gain = float(max(1.0, float(
+                        self.cfg.big_jump_height_gain
+                    )))
+                    self._big_jump_pending = False
                 # touchdown z estimate from kinematics (assume foot at ground z=0).
                 # World +Z DOWN: the body above the ground has NEGATIVE z (p_z = -height).
                 z_td_est = -float((R_wb_hat @ foot_b.reshape(3))[2])
@@ -2248,6 +2319,7 @@ class ModeECore:
                 # (see the flight collective block) and is re-seeded at the
                 # next PUSH latch.
                 # Liftoff state for apex detection / logs (up-positive vz).
+                self._nrc_big_gain = 1.0  # big jump served one stance only
                 self._z_lo = float(self._p_hat_w[2])
                 self._vz_lo = float(-self._v_hat_w[2])
                 self._prev_vz = None
@@ -2456,9 +2528,50 @@ class ModeECore:
         else:
             prop_ratio = float(self.cfg.prop_base_thrust_ratio)
         thrust_sum_ref = float(self.mass * self.gravity * float(prop_ratio))
-        # Prop energy supplement, FLIGHT-ASCENT continuation (the stance
-        # PUSH share is added in the stance allocation branch).
-        if (not bool(self._stance)) and bool(self._props_armed_rt) \
+        # Prop energy supplement in FLIGHT.
+        #   NRC law:  pure height feedback on the CURRENT ballistic arc --
+        #     h_pred = h + vz_up^2/(2g) is where THIS arc tops out; if it
+        #     undershoots (l0 + hop_height) the collective pumps the
+        #     difference, scaled by prop_height_kh and faded to zero at
+        #     apex.  Zero when the arc already reaches the target ->
+        #     self-limiting, no latch, strictly height-coupled.
+        #   Mode1: legacy PUSH-latched share with the same vz fade.
+        _nrc_flight = (
+            str(getattr(self.cfg, "stance_energy_law", "mode1"))
+            .lower() == "nrc"
+        )
+        if ((not bool(self._stance)) and bool(self._props_armed_rt)
+                and _nrc_flight
+                and bool(self.cfg.prop_energy_supplement_enable)):
+            vz_up_e = -float(self._v_hat_w[2])
+            f_pr_fl = 0.0
+            if vz_up_e > 0.0:
+                g0 = float(self.gravity)
+                m0 = float(self.mass)
+                h_now = -float(self._p_hat_w[2])  # +Z-down world
+                h_pred = h_now + (vz_up_e * vz_up_e) / (2.0 * g0)
+                h_hop = float(max(0.02, float(self.cfg.hop_height_m)))
+                h_apex_tgt = float(self.cfg.leg_l0_m) + h_hop
+                f_cap_pr = (
+                    float(_clipf(float(
+                        self.cfg.prop_energy_max_ratio
+                    ), 0.0, 0.8)) * m0 * g0
+                )
+                vz_fade = float(max(1e-3, float(getattr(
+                    self.cfg, "prop_energy_apex_fade_vz", 0.30
+                ))))
+                fade = float(_clipf(vz_up_e / vz_fade, 0.0, 1.0))
+                f_pr_fl = float(_clipf(
+                    float(self.cfg.prop_height_kh) * m0 * g0
+                    * (h_apex_tgt - h_pred) / h_hop,
+                    0.0, f_cap_pr,
+                )) * fade
+            self._prop_energy_fz = float(f_pr_fl)  # telemetry
+            thrust_sum_ref += float(f_pr_fl)
+            prop_ratio = float(thrust_sum_ref) / max(
+                1e-6, float(self.mass) * float(self.gravity)
+            )
+        elif (not bool(self._stance)) and bool(self._props_armed_rt) \
                 and float(self._prop_energy_fz) > 0.0:
             vz_up_e = -float(self._v_hat_w[2])
             vz_fade = float(max(1e-3, float(getattr(
@@ -2917,6 +3030,69 @@ class ModeECore:
                 h_des = l0 + float(self.cfg.hop_height_m)
                 f_comp = kz * (h_des - h_com) - bz * vz_up
 
+                # ===== NRC continuous stance energy law (ACC 2020) =====
+                # See the nrc_* config block for the full derivation.  ONE
+                # smooth force law for the whole stance: spring + norm-
+                # regulation pump.  No latch, no k re-solve, no blend --
+                # this is the anti-chatter replacement for the Mode1
+                # machinery below (which stays selectable via
+                # stance_energy_law = "mode1").
+                nrc_on = (
+                    str(getattr(self.cfg, "stance_energy_law", "mode1"))
+                    .lower() == "nrc"
+                )
+                f_nrc_leg = 0.0
+                if nrc_on:
+                    k_nrc = float(max(1.0, float(self.cfg.nrc_k_n_m)))
+                    om_n = float(np.sqrt(k_nrc / m))
+                    # Height target -> norm target (the height coupling):
+                    # take off at v_to and the prop-assisted ballistic arc
+                    # tops out at hop_height_m (x big-jump gain, one hop).
+                    h_tgt_n = (
+                        float(max(0.0, float(self.cfg.hop_height_m)))
+                        * float(max(1.0, float(self._nrc_big_gain)))
+                    )
+                    v_to_n = float(np.sqrt(2.0 * g_up * h_tgt_n))
+                    x1_n = (float(h_com) - l0) + (m * g_st / k_nrc)
+                    x2_n = float(vz_f) / om_n
+                    r_n = float(np.hypot(x1_n, x2_n))
+                    r_star_n = float(np.hypot(
+                        m * g_st / k_nrc, v_to_n / om_n
+                    ))
+                    # NRC-2 pump: zero at the bottom (x2 = 0), pumps over
+                    # the whole stroke, vanishes on the limit cycle.
+                    f_pump_n = (
+                        -2.0 * m * float(self.cfg.nrc_kR) * om_n
+                        * x2_n * (r_n - r_star_n)
+                    )
+                    f_des_n = (
+                        k_nrc * (l0 - float(h_com))
+                        - float(max(0.0, float(self.cfg.nrc_bz)))
+                        * float(vz_f)
+                        + f_pump_n
+                    )
+                    # Leg takes what its force budget allows ...
+                    f_nrc_leg = float(_clipf(f_des_n, 0.0, fz_cap))
+                    # ... and the residual rides the prop COLLECTIVE,
+                    # CONTINUOUSLY re-evaluated every tick (Fz channel
+                    # only -- attitude differential never sees it).
+                    self._prop_energy_fz = 0.0
+                    if (bool(self.cfg.prop_energy_supplement_enable)
+                            and bool(self._props_armed_rt)):
+                        f_cap_pr = (
+                            float(_clipf(float(
+                                self.cfg.prop_energy_max_ratio
+                            ), 0.0, 0.8)) * m * g
+                        )
+                        self._prop_energy_fz = float(_clipf(
+                            f_des_n - fz_cap, 0.0, f_cap_pr
+                        ))
+                    # Telemetry + phase labels (COMP/PUSH = sign of vz).
+                    energy_comp_fz = float(f_pump_n)
+                    self._nrc_r = r_n
+                    self._nrc_r_star = r_star_n
+                    self._mode1_push_latched = bool(vz_f > 0.0)
+
                 # PUSH latch on the FILTERED world-Z velocity: the body
                 # has passed the bottom when vz turns positive.
                 # Debounced, blocked for the first
@@ -2930,7 +3106,7 @@ class ModeECore:
                 )
                 t_in_st_z = float(self.sim_time) - td_t_z
                 latch_evt = False
-                if not bool(self._mode1_push_latched):
+                if (not nrc_on) and (not bool(self._mode1_push_latched)):
                     if (
                         vz_f > float(self.cfg.stance_push_vz_mps)
                         and t_in_st_z >= float(
@@ -3023,10 +3199,14 @@ class ModeECore:
                     self._mode1_boost_f_state = float(max(0.0, f_comp))
 
                 compress_active = not bool(self._mode1_push_latched)
-                energy_gate = bool(self._mode1_push_latched) and bool(
+                energy_gate = (not nrc_on) and bool(
+                    self._mode1_push_latched
+                ) and bool(
                     getattr(self.cfg, "use_energy_compensation", True)
                 )
-                if energy_gate:
+                if nrc_on:
+                    springForce_scalar = float(f_nrc_leg)
+                elif energy_gate:
                     # Pure spring during push (no damping), on the
                     # WORLD-Z height deficit: force reaches zero exactly
                     # when the body height reaches l0, moving at v_to.
@@ -3383,11 +3563,19 @@ class ModeECore:
                         f_dn = 0.0
             if f_dn > 0.0:
                 thrust_sum_ref = -f_dn
-            # PROPELLER ENERGY SUPPLEMENT (see the PUSH-latch block): the
-            # energy the capped leg spring cannot store rides the prop
-            # COLLECTIVE for the rest of the push.  Pure Fz channel of the
-            # decoupled allocator -- attitude differential is unaffected.
-            if (bool(self._mode1_push_latched)
+            # PROPELLER ENERGY SUPPLEMENT: the NRC/PUSH demand the capped
+            # leg cannot deliver rides the prop COLLECTIVE.  Pure Fz
+            # channel of the decoupled allocator -- attitude differential
+            # is unaffected.  Under the NRC law the residual is a per-tick
+            # continuous quantity valid for the WHOLE stance; under Mode1
+            # it is latched at PUSH, so gate it on the latch there.
+            _pe_gate = (
+                bool(self._mode1_push_latched)
+                or str(getattr(
+                    self.cfg, "stance_energy_law", "mode1"
+                )).lower() == "nrc"
+            )
+            if (_pe_gate
                     and props_on
                     and f_dn <= 0.0
                     and float(self._prop_energy_fz) > 0.0):
@@ -3761,6 +3949,9 @@ class ModeECore:
             "energy_comp_fz": float(energy_comp_fz),
             # Prop PUSH energy supplement actually riding the collective (N).
             "prop_energy_fz": float(self._prop_energy_fz),
+            # NRC norm state: r converging to r_star = energy on target.
+            "nrc_r": float(self._nrc_r),
+            "nrc_r_star": float(self._nrc_r_star),
             # Decoupled allocator: fraction of demanded attitude torque
             # delivered (1.0 = unclipped; < 1 = raise the collective baseline).
             "prop_att_scale": float(self._prop_att_scale),
