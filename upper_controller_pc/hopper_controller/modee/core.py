@@ -471,17 +471,23 @@ class ModeEConfig:
     # Mode1's push spring is capped by the leg force budget
     # (k_push <= stance_fz_max/x0), so at shallow bottoms the leg
     # physically cannot store the full E_need and the hop falls short.
-    # The unmet share is routed to the propeller COLLECTIVE during PUSH:
+    # The unmet share is routed to the propeller COLLECTIVE, acting over
+    # the PUSH stroke AND the flight ascent (props have no stroke limit):
     #     E_leg  = 0.5*k_boost*x0^2          (what the capped spring stores)
     #     E_def  = max(0, E_need - E_leg)    (deficit)
-    #     F_prop = min(E_def/x0, prop_energy_max_ratio*m*g)
-    # F_prop*x0 replaces the missing work over the push stroke.  It enters
-    # ONLY the Fz channel of the decoupled allocator (a pure collective),
-    # so attitude torque is untouched -- leg and prop energy paths stay
-    # decoupled.  Latched once per stance at the PUSH latch, cleared at
-    # liftoff.
+    #     F_prop = min(E_def/(x0 + h_tgt), prop_energy_max_ratio*m*g)
+    # Latched once per stance at the PUSH latch; in flight it fades
+    # CONTINUOUSLY with the remaining ascent,
+    #     F(t) = F_prop * clip(vz_up/prop_energy_apex_fade_vz, 0, 1),
+    # reaching zero exactly at apex (vz_up = 0) -- physical rolloff, no
+    # switch.  Enters ONLY the Fz channel of the allocator, so attitude
+    # torque is untouched; apex overshoot from the ascent share is
+    # absorbed by the apex return map (E_loss) hop-to-hop.
     prop_energy_supplement_enable: bool = True
-    prop_energy_max_ratio: float = 0.35   # extra PUSH collective cap (x m*g)
+    prop_energy_max_ratio: float = 0.35   # supplement collective cap (x m*g)
+    # vz below which the ascent supplement rolls off (m/s): the last
+    # ~vz_fade of upward speed ramps the force linearly to zero at apex.
+    prop_energy_apex_fade_vz: float = 0.30
 
     # RB gamepad "big jump": the NEXT stance solves the push spring for
     # big_jump_height_gain * hop_height_m, one hop only.
@@ -2177,6 +2183,9 @@ class ModeECore:
                 self._mode1_x0 = 0.0
                 self._mode1_boost_f_state = 0.0
                 self._mode1_vz_lpf = None
+                # The prop energy supplement served last hop's PUSH + ascent;
+                # a fresh stance re-solves it at its own PUSH latch.
+                self._prop_energy_fz = 0.0
                 # touchdown z estimate from kinematics (assume foot at ground z=0).
                 # World +Z DOWN: the body above the ground has NEGATIVE z (p_z = -height).
                 z_td_est = -float((R_wb_hat @ foot_b.reshape(3))[2])
@@ -2232,8 +2241,12 @@ class ModeECore:
                     v_latch = self._v_hat_w.reshape(3)
                 self._flight_vel = np.asarray(v_latch, dtype=float).reshape(3).copy()
                 self._flight_vel[2] = 0.0
-                # Push energy supplement expires with the stance it served.
-                self._prop_energy_fz = 0.0
+                # NOTE (2026-08-01): the prop energy supplement is NOT cleared
+                # here.  Unlike the leg (whose stroke ends at liftoff) the
+                # props keep doing work through the ASCENT; the supplement
+                # rides the collective until apex with a continuous vz fade
+                # (see the flight collective block) and is re-seeded at the
+                # next PUSH latch.
                 # Liftoff state for apex detection / logs (up-positive vz).
                 self._z_lo = float(self._p_hat_w[2])
                 self._vz_lo = float(-self._v_hat_w[2])
@@ -2422,10 +2435,14 @@ class ModeECore:
         # Upstream: desired net wrench (F_des from f_ref, Tau from SO(3) PD).
         # Downstream: closed-form leg forces + lstsq prop thrust (no WBC-QP).
         #   f_contact_w: GRF in world frame; z_thrust_w = -R_wb[:, 2] for prop thrust direction.
-        # Collective idle: stance uses a higher baseline so props assist the
-        # hop; flight ascent keeps the small prop_base_thrust_ratio; flight
-        # DESCENT uses the aerial-brake ratio (TA-SLIP: lower v_td -> softer
-        # landing spring, see hybrid config block).
+        # Collective plan (2026-08-01): PWM-1100 idle base for the WHOLE hop
+        # cycle.  The ONLY planned addition is the PUSH energy supplement,
+        # which -- unlike the leg -- persists through the flight ASCENT
+        # (props have no stroke limit) and fades out CONTINUOUSLY at apex:
+        #     F(t) = F_prop * clip(vz_up / vz_fade, 0, 1)
+        # vz_up is the physical fade variable: it reaches zero exactly AT
+        # apex, so the force rolls off with the remaining ascent -- no
+        # switch, no timer ("不要硬 cut").  Descent adds nothing.
         if bool(self._stance):
             prop_ratio = float(self.cfg.prop_stance_base_thrust_ratio)
         elif (
@@ -2439,6 +2456,21 @@ class ModeECore:
         else:
             prop_ratio = float(self.cfg.prop_base_thrust_ratio)
         thrust_sum_ref = float(self.mass * self.gravity * float(prop_ratio))
+        # Prop energy supplement, FLIGHT-ASCENT continuation (the stance
+        # PUSH share is added in the stance allocation branch).
+        if (not bool(self._stance)) and bool(self._props_armed_rt) \
+                and float(self._prop_energy_fz) > 0.0:
+            vz_up_e = -float(self._v_hat_w[2])
+            vz_fade = float(max(1e-3, float(getattr(
+                self.cfg, "prop_energy_apex_fade_vz", 0.30
+            ))))
+            fade = float(_clipf(vz_up_e / vz_fade, 0.0, 1.0))
+            thrust_sum_ref += float(self._prop_energy_fz) * fade
+            # Downstream consumers (PogoX f_z_up, time-to-TD budget) see
+            # the TRUE collective through prop_ratio.
+            prop_ratio = float(thrust_sum_ref) / max(
+                1e-6, float(self.mass) * float(self.gravity)
+            )
         # Global propeller enable gate. 2026-07-09: keyed off the RUNTIME armed
         # state (A switch) instead of the deleted pure_leg_mode -- when the user
         # never presses A, the controller must not assume prop assist anywhere
@@ -2955,12 +2987,23 @@ class ModeECore:
                     # The leg force budget caps the spring at
                     # k_boost <= fz_cap/x0, so it can store at most
                     # E_leg = 0.5*k_boost*x0^2 of the required E_need.
-                    # Route the unmet share to the prop COLLECTIVE over
-                    # the push stroke:  F_prop = E_def/x0, capped.  This
-                    # enters ONLY the Fz channel of the decoupled
-                    # allocator (a pure collective adds zero moment), so
-                    # the attitude channel never sees it -- leg and prop
-                    # energy paths stay decoupled by construction.
+                    # The unmet share rides the prop COLLECTIVE.  Unlike
+                    # the leg, the props are not stroke-limited: the force
+                    # acts over the PUSH stroke x0 AND the ascent h_tgt
+                    # (it fades continuously to zero at apex, see the
+                    # flight collective block), so the work budget is
+                    #     F_prop * (x0 + h_tgt) = E_def
+                    #     F_prop = min(E_def/(x0 + h_tgt),
+                    #                  prop_energy_max_ratio * m*g).
+                    # This enters ONLY the Fz channel of the allocator (a
+                    # pure collective adds zero moment): the attitude
+                    # channel never sees it -- leg and prop energy paths
+                    # stay decoupled by construction.  Any apex overshoot
+                    # from the ascent continuation is absorbed by the
+                    # discrete apex return map (E_loss adapts down), so
+                    # the two energy sources stay COUPLED hop-to-hop
+                    # through one physical measurement, not through an
+                    # algebraic loop inside the tick.
                     self._prop_energy_fz = 0.0
                     if (bool(self.cfg.prop_energy_supplement_enable)
                             and bool(self._props_armed_rt)):
@@ -2971,8 +3014,9 @@ class ModeECore:
                                 self.cfg.prop_energy_max_ratio
                             ), 0.0, 0.8)) * m * g
                         )
+                        stroke = float(max(1e-2, x0 + h_tgt))
                         self._prop_energy_fz = float(min(
-                            E_def / x0, f_cap_pr
+                            E_def / stroke, f_cap_pr
                         ))
                     # Blend starts from the compression force for
                     # continuity.
