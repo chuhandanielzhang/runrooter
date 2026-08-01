@@ -70,8 +70,14 @@ TD (q_shift ≤ -2cm) ──► COMPRESSION ──► PUSH latch (vz_f 过零去
 - \(x_2=0\)（底部）时 \(F_{pump}=0\)：**底部无力尖峰**，能量摊在整个行程注入 → 无 chatter。
 - 收敛后 \(F_{pump} \to 0\)，剩纯弹簧——极限环上控制器"消失"。
 - TD 时刻若上一跳能量正确则 \(\|x\| \approx r^\*\) → 力从 0 连续起步，TD 也无跳变。
-- **桨融合（stance）**：每 tick 腿被 \(f_{z,cap}\) 削掉的需求残差实时进桨 collective：
-  \(F_{prop} = \mathrm{clip}(f_{des} - f_{z,cap},\, 0,\, \rho_{max} m g)\)。连续量、纯 Fz 通道。
+- **桨融合（stance）**：每 tick 按**腿的真实能力** `nrc_leg_fz_max` 切分，残差进桨 collective：
+  \[ f_{leg} = \mathrm{clip}(f_{des},\,0,\,F_{leg}^{max}), \qquad F_{prop} = \mathrm{clip}(f_{des} - F_{leg}^{max},\, 0,\, \rho_{max} m g) \]
+  两者相加恰好复现 NRC 需求（直到双双饱和），连续量、纯 Fz 通道，桨不解除时腿被要求全额。
+  > 2026-08-02 修正：这里原先对着 `stance_fz_max`（500 N 硬件钳位）取残差，而 NRC 需求
+  > p95 只有 259 N，导致 **stance 内桨永远不介入**（063655 log：桨补能 41 tick 全在空中）。
+  > 分割点必须是**髋力矩能真正给出的轴向力**（此几何下约 15 N/N·m，10 N·m 上限 → 约 150 N），
+  > 否则腿在命令 430 N、限幅器把它缩到 1/3、桨还在怠速——就是"腿无力"。改 `tau_out_max`
+  > 时要同步改这个值。
 - **桨融合（flight 上升段）**：对**当前弹道**的 apex 预测误差做纯反馈：
   \[ h_{pred} = h + \frac{v_z^2}{2g}, \qquad F = \mathrm{clip}\Big(k_h\, m g\, \frac{(l_0 + h_{hop}) - h_{pred}}{h_{hop}},\, 0,\, \rho_{max} m g\Big) \cdot \mathrm{clip}\big(\tfrac{v_z}{v_{fade}}, 0, 1\big) \]
   弧线已够高 → 力为 0；不够 → 连续泵，apex 处淡出归零。自限幅，无锁存。
@@ -85,12 +91,14 @@ TD (q_shift ≤ -2cm) ──► COMPRESSION ──► PUSH latch (vz_f 过零去
 | `nrc_k_n_m` | 1400 | 虚拟弹簧刚度 | 触底太深/stance 太长 → 调大；落地太硬 → 调小（深度≈\(v_{td}\sqrt{m/k}\)，时长≈\(\pi\sqrt{m/k}\)≈0.22 s） |
 | `nrc_kR` | 400 | 能量泵增益 | 高度收敛慢/跳不到 → 调大；中段力峰太大 → 调小 |
 | `nrc_bz` | 8 | 小阻尼（防振动） | 腿振铃 → 调大一点；它耗的能 kR 会自动补回 |
+| `nrc_leg_fz_max` | 160 | 腿/桨分界（腿的真实轴向力能力，N） | 约等于 `tau_out_max` × 15；调小 = 更早让桨接手 |
 | `prop_energy_max_ratio` | 0.35 | 桨补能上限（×mg） | 桨介入太猛 → 调小 |
 | `prop_height_kh` | 1.0 | 飞行段 apex 误差增益 | 0 = 纯腿；跳不够高且腿已饱和 → 调大 |
 | `prop_energy_apex_fade_vz` | 0.30 | apex 前淡出窗口 (m/s) | 一般不动 |
 
-日志新列：`nrc_r` / `nrc_r_star`（相平面半径 vs 目标，二者贴合 = 能量在环上）、`prop_energy_fz`
-（stance = 腿残差进桨的力；flight = apex 误差反馈力）。
+日志新列：`nrc_r` / `nrc_r_star`（相平面半径 vs 目标，二者贴合 = 能量在环上）、`nrc_f_des`
+（分割前的总需求）、`prop_energy_fz`（stance = 腿残差进桨的力；flight = apex 误差反馈力）。
+检查分割是否正常：stance 内应有 `f_ref_w2 + prop_energy_fz ≈ nrc_f_des`。
 
 ## 3. 桨：能量补充（PUSH → apex，解耦的 Fz 通道）—— Mode1 回退路径
 

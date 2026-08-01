@@ -528,13 +528,25 @@ class ModeEConfig:
     #                              stance but higher mid-stroke force
     #   nrc_bz                  -> small damping (anti-vibration only; the
     #                              energy it eats is repumped by kR)
+    #   nrc_leg_fz_max          -> where the leg stops and the props start
     #   prop_energy_max_ratio   -> prop collective ceiling (x m*g)
     #   prop_height_kh          -> flight apex-error gain (0 = leg only)
     #   prop_energy_apex_fade_vz-> ascent force rolls to 0 at apex
     stance_energy_law: str = "nrc"       # "nrc" | "mode1" (legacy latch)
-    nrc_k_n_m: float = 1400.0            # virtual spring stiffness [N/m]
+    nrc_k_n_m: float = 1800.0            # virtual spring stiffness [N/m]
     nrc_kR: float = 400.0                # norm-regulation gain [1/(m*s)]
     nrc_bz: float = 8.0                  # virtual damping [N*s/m]
+    # Split point between the leg and the props for the stance energy
+    # demand [N].  This is the LEG'S REAL AUTHORITY, not the stance_fz_max
+    # safety clamp: the AK60 hip-torque limit is what actually bounds the
+    # axial force (~15 N per Nm of tau_out_max in this geometry, so the
+    # 10 Nm bring-up cap => ~150 N).  Demand above this rides the prop
+    # collective instead of being commanded to a leg that cannot deliver
+    # it (the 2026-08-02 063655 log commanded 430 N, the torque limiter
+    # scaled it to ~1/3, and the props stayed idle because the residual
+    # was measured against 500 N).  Raise it together with tau_out_max.
+    # Ignored when the props are disarmed (leg is then asked for all).
+    nrc_leg_fz_max: float = 160.0
     # FLIGHT height regulation via props: while ascending, predict the
     # ballistic apex h_pred = h + vz^2/(2g) and command
     #   F = clip(kh*m*g*(h_apex_tgt - h_pred)/hop_height, 0, cap) * fade(vz)
@@ -973,6 +985,7 @@ class ModeECore:
         self._nrc_big_gain: float = 1.0
         self._nrc_r: float = 0.0
         self._nrc_r_star: float = 0.0
+        self._nrc_f_des: float = 0.0
         # Runtime compat: lcm_controller sets this after the RT transition so
         # the first-flight apex/eta estimate skips one corrupted arc.
         self._eta_skip_once: bool = False
@@ -1189,6 +1202,7 @@ class ModeECore:
         self._nrc_big_gain = 1.0
         self._nrc_r = 0.0
         self._nrc_r_star = 0.0
+        self._nrc_f_des = 0.0
         self._eta_skip_once = False
         self._kw_obs_w[:] = 0.0
         self._kw_obs_tau_prev[:] = 0.0
@@ -3071,26 +3085,48 @@ class ModeECore:
                         * float(vz_f)
                         + f_pump_n
                     )
-                    # Leg takes what its force budget allows ...
-                    f_nrc_leg = float(_clipf(f_des_n, 0.0, fz_cap))
-                    # ... and the residual rides the prop COLLECTIVE,
-                    # CONTINUOUSLY re-evaluated every tick (Fz channel
-                    # only -- attitude differential never sees it).
+                    # ---- split the demand: leg first, props take the rest ----
+                    # The split point is the LEG's real authority
+                    # (nrc_leg_fz_max ~ what the hip torque can actually
+                    # deliver), NOT the stance_fz_max safety clamp: keying
+                    # off the 500 N clamp made the residual identically
+                    # zero (2026-08-02 log 063655: NRC demand p95 259 N,
+                    # peak 430 N -> props never fired in stance while the
+                    # leg command was being scaled to ~1/3 by the 10 Nm
+                    # torque limit -- "腿无力" with idle props).
+                    # With no props to hand the residual to, the leg is
+                    # asked for everything (old behavior).
                     self._prop_energy_fz = 0.0
-                    if (bool(self.cfg.prop_energy_supplement_enable)
-                            and bool(self._props_armed_rt)):
+                    props_supp = (
+                        bool(self.cfg.prop_energy_supplement_enable)
+                        and bool(self._props_armed_rt)
+                    )
+                    leg_ceiling = fz_cap
+                    if props_supp:
+                        leg_ceiling = float(_clipf(
+                            float(self.cfg.nrc_leg_fz_max), 10.0, fz_cap
+                        ))
+                    f_nrc_leg = float(_clipf(f_des_n, 0.0, leg_ceiling))
+                    # Residual rides the prop COLLECTIVE, re-evaluated
+                    # every tick (pure Fz channel -- the attitude
+                    # differential never sees it).  leg + prop reproduce
+                    # the NRC demand exactly until both saturate.
+                    if props_supp:
                         f_cap_pr = (
                             float(_clipf(float(
                                 self.cfg.prop_energy_max_ratio
                             ), 0.0, 0.8)) * m * g
                         )
                         self._prop_energy_fz = float(_clipf(
-                            f_des_n - fz_cap, 0.0, f_cap_pr
+                            f_des_n - leg_ceiling, 0.0, f_cap_pr
                         ))
                     # Telemetry + phase labels (COMP/PUSH = sign of vz).
                     energy_comp_fz = float(f_pump_n)
                     self._nrc_r = r_n
                     self._nrc_r_star = r_star_n
+                    # Total stance demand before the leg/prop split: compare
+                    # against f_ref_w2 + prop_energy_fz to see the split.
+                    self._nrc_f_des = float(f_des_n)
                     self._mode1_push_latched = bool(vz_f > 0.0)
 
                 # PUSH latch on the FILTERED world-Z velocity: the body
@@ -3952,6 +3988,7 @@ class ModeECore:
             # NRC norm state: r converging to r_star = energy on target.
             "nrc_r": float(self._nrc_r),
             "nrc_r_star": float(self._nrc_r_star),
+            "nrc_f_des": float(self._nrc_f_des),
             # Decoupled allocator: fraction of demanded attitude torque
             # delivered (1.0 = unclipped; < 1 = raise the collective baseline).
             "prop_att_scale": float(self._prop_att_scale),
