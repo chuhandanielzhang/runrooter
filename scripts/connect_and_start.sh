@@ -65,11 +65,13 @@ rsync -a --exclude '__pycache__' \
   && ok "bridges synced -> /home/nvidia/Hopper_srbRL/pixhawk" || bad "bridge rsync failed"
 SVC_SRC="/home/abc/Hopper/robot_runtime/services"
 rsync -a "${SVC_SRC}/px4-bridge.service" "${SVC_SRC}/px4-dds-bridge.service" \
-  "${SVC_SRC}/canable.service" "${SVC_SRC}/canable-watchdog.service" \
+  "${SVC_SRC}/canable.service" "${SVC_SRC}/canable2.service" \
+  "${SVC_SRC}/canable-watchdog.service" \
   "${SVC_SRC}/canable_watchdog.sh" "${SVC_SRC}/99-canable.rules" \
-  "${SVC_SRC}/jetson-power.service" \
+  "${SVC_SRC}/jetson-power.service" "${SVC_SRC}/hopper-driver.service" \
   nvidia@${JETSON_IP}:/tmp/hopper_svc/ \
-  && $SSH 'sudo install -m644 /tmp/hopper_svc/*.service /etc/systemd/system/ && sudo systemctl daemon-reload' \
+  && $SSH 'sudo install -m644 /tmp/hopper_svc/*.service /etc/systemd/system/ && sudo systemctl daemon-reload \
+    && sudo systemctl reenable canable2.service >/dev/null 2>&1; true' \
   && ok "service units installed + daemon-reload" || bad "service unit install failed"
 # Self-healing CAN bridge: udev rule gives the CANable a stable /dev/canable +
 # dev-canable.device; canable.service is BindsTo that device (zombie slcand is

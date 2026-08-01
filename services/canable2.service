@@ -17,5 +17,11 @@ ExecStartPost=/sbin/ip link set can1 txqueuelen 65536
 Restart=on-failure
 RestartSec=2
 
+# 2026-08-02: multi-user.target REMOVED from WantedBy. The wheel adapter is
+# optional hardware; pulling this unit at boot while it is unplugged parks a
+# dev-canable2.device job forever (BindsTo) and deadlocks hopper-driver's
+# After= ordering. WantedBy=dev-canable2.device alone = pure hot-plug: udev
+# tags the device (SYSTEMD_ALIAS in 99-canable.rules), the device unit
+# appears, and only then is this service started.
 [Install]
-WantedBy=dev-canable2.device multi-user.target
+WantedBy=dev-canable2.device

@@ -4,8 +4,13 @@ After=canable.service
 Requires=canable.service
 # Wheel bus (can1) is OPTIONAL: order after it so DmWheelController::init sees
 # can1 when the adapter is present, but never block hop-only operation on it.
+# 2026-08-02: Wants= REMOVED -- it queued a canable2 start job even with the
+# adapter unplugged, and canable2's BindsTo=dev-canable2.device made that job
+# wait for a device that never appears, deadlocking every hopper-driver
+# (re)start behind the After= ordering (connect_and_start hung at step 2.5/3).
+# canable2 is now pulled by its device unit alone (hot-plug); After= still
+# orders us behind it whenever the adapter IS present.
 After=canable2.service
-Wants=canable2.service
 
 [Service]
 Type=simple
