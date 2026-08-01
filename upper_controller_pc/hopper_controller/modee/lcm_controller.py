@@ -149,14 +149,18 @@ class ModeELCMConfig:
     switch_lt_tau_max_nm: float = 6.0
     # Fail-safe: if RM never reports "reached", release to MOBILE anyway.
     switch_lt_timeout_s: float = 4.0
-    # ---- RT (MOBILE -> HOPPING) stand-and-unfold (2026-07-24 07:05) ----
-    # Old RT: P4 place -> first-hop spring push -> RM unfolds at the first
-    # liftoff (prop window bridging the gap).  New RT, per user: P4 places
-    # the leg exactly as before; after switch_rb_pushdelay_s the leg HOLDS
-    # its length UNCAPPED (inverted-pendulum stand, leg carries the robot)
-    # while the RM arms unfold +11.5 -> 0 SYNCHRONIZED; when they reach 0
-    # the controller enters plain normal hopping (FLIGHT phase first --
-    # no first-hop spring, no l0 override).
+    # ---- RT (MOBILE -> HOPPING), 2026-08-01 simplification ----
+    # P4 places the leg (1 s, capped, props 1200); after
+    # switch_rb_pushdelay_s the controller enters NORMAL HOPPING directly:
+    #   - first hop = normal cycle law with ONLY a special leg length
+    #     (l0 = switch_rb_first_hop_l0_m, restored at the first liftoff);
+    #   - props = normal ModeE allocator from tick one (no forced 1600
+    #     PWM, no base window);
+    #   - RM unfolds +11.5 -> 0 IN PARALLEL with the hopping (synced
+    #     drive, non-blocking).
+    # The 2026-07-24 RT-STAND phase (uncapped stand + prop 1600 + wait
+    # for RM) is retired; its switch_rt_stand_* params below are unused
+    # but kept for rollback.
     # 10 Nm = the AK60 driver's own clamp, i.e. effectively uncapped.
     switch_rt_stand_tau_max_nm: float = 10.0
     switch_rt_stand_timeout_s: float = 4.0
@@ -2303,23 +2307,40 @@ class ModeELCMController:
                     now_t = time.time()
                     if (self._rb_p4_t0 is not None) and \
                        (now_t - float(self._rb_p4_t0)) >= float(self.lcm_cfg.switch_rb_pushdelay_s):
-                        # Leg placed -> uncapped stand; RM unfold starts NOW
-                        # (synchronized drive, fast arms wait for the slow).
+                        # 2026-08-01 (user): NO RT-STAND special phase.  Enter
+                        # normal HOPPING directly: the FIRST hop only differs
+                        # by leg length (l0 = switch_rb_first_hop_l0_m, longer
+                        # stroke from the stand; restored at the first
+                        # liftoff) -- the stance law itself is the NORMAL
+                        # cycle (NRC pumps the standing launch from zero
+                        # energy like any other energy deficit).  Props run
+                        # the normal ModeE allocator from tick one (1100 idle
+                        # + attitude differential + energy supplement -- no
+                        # forced 1600, no base window).  RM unfolds +11.5 -> 0
+                        # AT THE SAME TIME, non-blocking.
                         self._switch_loop = False
                         self._rb_p4_t0 = None
-                        self._rt_stand_t0 = time.time()
+                        self._gait_mode = "hopping"
+                        if self._rt_l0_restore is None:
+                            self._rt_l0_restore = float(self.core.cfg.leg_l0_m)
+                        self.core.cfg.leg_l0_m = float(
+                            self.lcm_cfg.switch_rb_first_hop_l0_m
+                        )
+                        # The in-flight retraction (first-hop l0 -> normal l0)
+                        # stretches this arc; skip its eta/apex measurement.
+                        self.core._eta_skip_once = True
                         if not bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
+                            self._prop_enable = True
                             self._rm_start(
                                 float(self.lcm_cfg.rm_hopping_rad),
-                                "RT stand (unfold RM, synced)",
+                                "RT: unfold RM alongside hopping",
                             )
                         print(
-                            "[gait] RT STAND: leg holds %.3f m UNCAPPED "
-                            "(%.0f Nm), props %.0fus each, RM +11.5 -> %.1f "
-                            "rad; HOPPING when RM reaches it"
-                            % (float(self.lcm_cfg.switch_rb_leg_len_m),
-                               float(self.lcm_cfg.switch_rt_stand_tau_max_nm),
-                               float(self.lcm_cfg.switch_rt_stand_prop_pwm_us),
+                            "[gait] RT -> HOPPING now: first hop l0=%.3f m "
+                            "(normal cycle law, restored at liftoff 1), "
+                            "props = normal ModeE, RM +11.5 -> %.1f rad "
+                            "in parallel"
+                            % (float(self.lcm_cfg.switch_rb_first_hop_l0_m),
                                float(self.lcm_cfg.rm_hopping_rad))
                         )
                     tau_send, _err_m, _spd = self.core.compute_stand_swing_tau(
