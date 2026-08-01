@@ -560,8 +560,36 @@ class ModeEConfig:
     # nrc_leg_fz_max now fires through compression with the 1/cos(theta)
     # world-Z de-projection, see PROPELLER FUSION above).
     nrc_k_n_m: float = 1800.0            # virtual spring stiffness [N/m]
-    nrc_kR: float = 400.0                # norm-regulation gain [1/(m*s)]
+    # 2026-08-02: 400 -> 150.  The pump coefficient 2*m*kR*omega ~ 88000
+    # at kR=400: with the stance vz estimate lagging ~25-50 ms
+    # (kinematics + 15 ms LPF), the pump keeps firing 100+ N after the
+    # true energy already crossed the target -- log 073212 delivered a
+    # ~0.15 m hop against the 0.07 m target with r STILL below r* at
+    # liftoff.  Sim with a lagged estimator reproduces 0.125-0.155 m at
+    # kR=400 vs 0.078-0.100 m at kR=150.  The remaining bias is closed
+    # by the per-hop apex trim (nrc_apex_trim_gain).
+    nrc_kR: float = 150.0                # norm-regulation gain [1/(m*s)]
     nrc_bz: float = 8.0                  # virtual damping [N*s/m]
+    # Pump extension fade [m]: F_pump *= clip((l0 - h_com)/fade, 0, 1).
+    # Energy injection belongs to the mid-stroke; the last few cm before
+    # liftoff are exactly where estimator lag turns residual pumping into
+    # apex overshoot, so the pump ramps SMOOTHLY to zero as the leg
+    # approaches full extension (continuous -- no hard cut).  0 disables.
+    nrc_pump_ext_fade_m: float = 0.04
+    # ---- per-hop apex return map (Koditschek-Buehler layer for NRC) ----
+    # The in-stance NRC loop regulates the ESTIMATED energy; any
+    # systematic vz-estimate bias/lag lands at a biased apex no matter
+    # the gains.  Close the loop on the MEASURED apex instead: at each
+    # touchdown the flight-time apex (z_apex_actual, drift-free) updates
+    # a slow multiplicative trim on the height target,
+    #   trim <- clip(trim - gain*(h_apex - h_tgt)/h_tgt, min, max)
+    # so h_tgt_eff = hop_height * trim.  Error dynamics are the same 1-D
+    # contraction as the Mode1 E_loss map: e+ = (1-gain)*e, deadbeat at
+    # gain=1.  Sim: converges to 7.0 cm in 3-4 hops under 25-70 ms lag
+    # or a 20% velocity-estimate bias.  gain=0 disables.
+    nrc_apex_trim_gain: float = 0.5
+    nrc_apex_trim_min: float = 0.4
+    nrc_apex_trim_max: float = 1.6
     # Split point between the leg and the props for the stance energy
     # demand [N].  This is the LEG'S REAL AUTHORITY, not the stance_fz_max
     # safety clamp: the AK60 hip-torque limit is what actually bounds the
@@ -1034,6 +1062,9 @@ class ModeECore:
         self._nrc_r: float = 0.0
         self._nrc_r_star: float = 0.0
         self._nrc_f_des: float = 0.0
+        # Per-hop apex return-map trim on the NRC height target
+        # (see nrc_apex_trim_gain): h_tgt_eff = hop_height * trim.
+        self._nrc_h_trim: float = 1.0
         # Runtime compat: lcm_controller sets this after the RT transition so
         # the first-flight apex/eta estimate skips one corrupted arc.
         self._eta_skip_once: bool = False
@@ -1251,6 +1282,7 @@ class ModeECore:
         self._nrc_r = 0.0
         self._nrc_r_star = 0.0
         self._nrc_f_des = 0.0
+        self._nrc_h_trim = 1.0
         self._eta_skip_once = False
         self._kw_obs_w[:] = 0.0
         self._kw_obs_tau_prev[:] = 0.0
@@ -2281,6 +2313,32 @@ class ModeECore:
                         self._mode1_Eloss = float(_clipf(
                             self._mode1_Eloss, -2.0, 8.0
                         ))
+                        # NRC per-hop apex return map (see nrc_apex_trim_*):
+                        # same 1-D contraction, but folded into a
+                        # multiplicative trim on the NRC height target
+                        # instead of Mode1's E_loss.  Uses the drift-free
+                        # flight-time apex just computed above.  Closes the
+                        # loop the in-stance NRC cannot: a lagged/biased vz
+                        # estimate lands at a biased apex every hop; this
+                        # removes the bias hop-over-hop.
+                        if (str(getattr(
+                                self.cfg, "stance_energy_law", "mode1"
+                                )).lower() == "nrc"
+                                and np.isfinite(self._z_apex_actual)):
+                            h_ref = float(max(0.02, float(
+                                self.cfg.hop_height_m
+                            )))
+                            e_apex = (
+                                float(self._z_apex_actual) - h_ref
+                            ) / h_ref
+                            self._nrc_h_trim = float(_clipf(
+                                float(self._nrc_h_trim)
+                                - float(_clipf(float(
+                                    self.cfg.nrc_apex_trim_gain
+                                ), 0.0, 1.0)) * e_apex,
+                                float(self.cfg.nrc_apex_trim_min),
+                                float(self.cfg.nrc_apex_trim_max),
+                            ))
                 self._apex_reached = False
                 # Trigger MPC solve on the very first stance step.
                 self._mpc_counter = max(1, int(self.cfg.mpc_decimation)) - 1
@@ -2613,7 +2671,13 @@ class ModeECore:
                 h_now = -float(self._p_hat_w[2])  # +Z-down world
                 h_pred = h_now + (vz_up_e * vz_up_e) / (2.0 * g0)
                 h_hop = float(max(0.02, float(self.cfg.hop_height_m)))
-                h_apex_tgt = float(self.cfg.leg_l0_m) + h_hop
+                # Same per-hop apex trim as the stance target: the flight
+                # feedback must not pump the arc back up to a target the
+                # return map has already trimmed down.
+                h_apex_tgt = (
+                    float(self.cfg.leg_l0_m)
+                    + h_hop * float(self._nrc_h_trim)
+                )
                 f_cap_pr = (
                     float(_clipf(float(
                         self.cfg.prop_energy_max_ratio
@@ -3113,6 +3177,7 @@ class ModeECore:
                     h_tgt_n = (
                         float(max(0.0, float(self.cfg.hop_height_m)))
                         * float(max(1.0, float(self._nrc_big_gain)))
+                        * float(self._nrc_h_trim)
                     )
                     v_to_n = float(np.sqrt(2.0 * g_up * h_tgt_n))
                     x1_n = (float(h_com) - l0) + (m * g_st / k_nrc)
@@ -3127,6 +3192,17 @@ class ModeECore:
                         -2.0 * m * float(self.cfg.nrc_kR) * om_n
                         * x2_n * (r_n - r_star_n)
                     )
+                    # Extension fade (see nrc_pump_ext_fade_m): the pump
+                    # rolls smoothly to zero over the last few cm before
+                    # full extension -- the window where estimator lag
+                    # would otherwise keep 100+ N firing past the target.
+                    x_fade = float(getattr(
+                        self.cfg, "nrc_pump_ext_fade_m", 0.0
+                    ))
+                    if x_fade > 1e-6:
+                        f_pump_n *= float(_clipf(
+                            (l0 - float(h_com)) / x_fade, 0.0, 1.0
+                        ))
                     f_des_n = (
                         k_nrc * (l0 - float(h_com))
                         - float(max(0.0, float(self.cfg.nrc_bz)))
@@ -4045,6 +4121,8 @@ class ModeECore:
             "nrc_r": float(self._nrc_r),
             "nrc_r_star": float(self._nrc_r_star),
             "nrc_f_des": float(self._nrc_f_des),
+            # Per-hop apex return-map trim: h_tgt_eff = hop_height * trim.
+            "nrc_h_trim": float(self._nrc_h_trim),
             # Decoupled allocator: fraction of demanded attitude torque
             # delivered (1.0 = unclipped; < 1 = raise the collective baseline).
             "prop_att_scale": float(self._prop_att_scale),
