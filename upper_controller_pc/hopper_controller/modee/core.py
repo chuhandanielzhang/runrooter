@@ -518,12 +518,23 @@ class ModeEConfig:
     # F_pump = 0 exactly at the bottom (x2 = 0): no bottom force spike,
     # energy is pumped over the whole stroke -> no tau chatter.
     #
-    # PROPELLER FUSION (continuous, decoupled): every tick, whatever the
-    # leg force budget clips off the NRC demand rides the prop
-    # COLLECTIVE (Fz channel only):
-    #   F_prop = clip(F_des - stance_fz_max, 0, prop_energy_max_ratio*m*g)
-    # In FLIGHT the props regulate the SAME height target through the
-    # ballistic apex prediction (see prop_height_kh below).
+    # PROPELLER FUSION (continuous, decoupled): the stance plant is
+    #   m*hddot = -m*g + F_leg + T_sum*cos(theta)        (world-Z, up+)
+    # where T_sum is the prop collective along body -Z and
+    # cos(theta) = R_wb[2,2] projects it onto the world vertical.  The
+    # NRC law computes ONE total world-Z demand
+    #   F_des = k*(l0 - h_com) - bz*vz + F_pump
+    # and it is split lexicographically, leg first, every tick of the
+    # WHOLE stance (compression included -- no phase gate):
+    #   F_leg  = clip(F_des, 0, nrc_leg_fz_max)
+    #   T_sum  = clip(F_des - nrc_leg_fz_max, 0,
+    #                 prop_energy_max_ratio*m*g) / max(cos(theta), 0.5)
+    # The 1/cos(theta) de-projection makes the DELIVERED world-Z equal
+    # the NRC residual regardless of body tilt, so leg + prop reproduce
+    # F_des exactly until both saturate.  The residual rides the pure
+    # Fz channel of the allocator; the attitude differential never sees
+    # it.  In FLIGHT the props regulate the SAME height target through
+    # the ballistic apex prediction (see prop_height_kh below).
     #
     # ---- the tuning set (in order of importance) ----
     #   hop_height_m            -> apex target: the ONE height knob
@@ -538,10 +549,12 @@ class ModeEConfig:
     #   prop_height_kh          -> flight apex-error gain (0 = leg only)
     #   prop_energy_apex_fade_vz-> ascent force rolls to 0 at apex
     stance_energy_law: str = "nrc"       # "nrc" | "mode1" (legacy latch)
-    # 2026-08-02: 1400 -> 2200, log 070306 compressed too deep (~9 cm at
-    # 1.4 m/s TD).  depth ~ v_td*sqrt(m/k): 2200 gives ~7.7 cm at the same
-    # v_td and shortens stance pi*sqrt(m/k) 0.217 -> 0.173 s.
-    nrc_k_n_m: float = 2200.0            # virtual spring stiffness [N/m]
+    # 2026-08-02 (2): 2200 -> 1800 per user -- moderate the leg force
+    # again; the compression deceleration the softer spring gives up is
+    # picked up by the prop collective (the NRC residual above
+    # nrc_leg_fz_max now fires through compression with the 1/cos(theta)
+    # world-Z de-projection, see PROPELLER FUSION above).
+    nrc_k_n_m: float = 1800.0            # virtual spring stiffness [N/m]
     nrc_kR: float = 400.0                # norm-regulation gain [1/(m*s)]
     nrc_bz: float = 8.0                  # virtual damping [N*s/m]
     # Split point between the leg and the props for the stance energy
@@ -3629,8 +3642,9 @@ class ModeECore:
             # leg cannot deliver rides the prop COLLECTIVE.  Pure Fz
             # channel of the decoupled allocator -- attitude differential
             # is unaffected.  Under the NRC law the residual is a per-tick
-            # continuous quantity valid for the WHOLE stance; under Mode1
-            # it is latched at PUSH, so gate it on the latch there.
+            # continuous quantity valid for the WHOLE stance (compression
+            # included); under Mode1 it is latched at PUSH, so gate it on
+            # the latch there.
             _pe_gate = (
                 bool(self._mode1_push_latched)
                 or str(getattr(
@@ -3641,9 +3655,16 @@ class ModeECore:
                     and props_on
                     and f_dn <= 0.0
                     and float(self._prop_energy_fz) > 0.0):
+                # World-Z de-projection (paper plant: m*hddot = -m*g +
+                # F_leg + T_sum*cos(theta)).  _prop_energy_fz is a WORLD-Z
+                # force; the collective acts along body -Z, so divide by
+                # cos(theta) = -z_thrust_w[2] to deliver the residual on
+                # the world vertical under body tilt.  Floor 0.5 (60 deg)
+                # bounds the blow-up; upright it is exactly 1.
+                cos_th = float(_clipf(-float(z_thrust_w[2]), 0.5, 1.0))
                 thrust_sum_ref = float(thrust_sum_ref) + float(
                     self._prop_energy_fz
-                )
+                ) / cos_th
             fz_cmd = float(max(0.0, float(f_ref[2]))) + f_dn
 
             tau_leg_des_w = np.asarray(Tau_des, dtype=float).reshape(3).copy()
