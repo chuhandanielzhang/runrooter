@@ -489,7 +489,12 @@ class ModeEConfig:
     # torque is untouched; apex overshoot from the ascent share is
     # absorbed by the apex return map (E_loss) hop-to-hop.
     prop_energy_supplement_enable: bool = True
-    prop_energy_max_ratio: float = 0.35   # supplement collective cap (x m*g)
+    # 2026-08-02: 0.35 -> 0.60 (23 -> 39 N, 13.1 N/arm ~ PWM 1764).  Log
+    # 072707: the stance residual pinned at the 23 N cap in 3 of 4
+    # compressions -- the cap, not the demand, was what kept the props
+    # "small".  13.1 N collective + 5 N attitude differential still
+    # clears the 20.3 N per-arm ceiling.
+    prop_energy_max_ratio: float = 0.60   # supplement collective cap (x m*g)
     # vz below which the ascent supplement rolls off (m/s): the last
     # ~vz_fade of upward speed ramps the force linearly to zero at apex.
     prop_energy_apex_fade_vz: float = 0.30
@@ -567,7 +572,11 @@ class ModeEConfig:
     # scaled it to ~1/3, and the props stayed idle because the residual
     # was measured against 500 N).  Raise it together with tau_out_max.
     # Ignored when the props are disarmed (leg is then asked for all).
-    nrc_leg_fz_max: float = 160.0
+    # 2026-08-02: 160 -> 130 per user (moderate the leg, more prop in
+    # compression).  Props now engage once the demand passes 130 N --
+    # 54% of the stance in sim vs 41% before -- instead of only at the
+    # very bottom.  Leg peak force drops by the same 30 N.
+    nrc_leg_fz_max: float = 130.0
     # FLIGHT height regulation via props: while ascending, predict the
     # ballistic apex h_pred = h + vz^2/(2g) and command
     #   F = clip(kh*m*g*(h_apex_tgt - h_pred)/hop_height, 0, cap) * fade(vz)
