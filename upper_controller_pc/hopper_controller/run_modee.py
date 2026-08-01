@@ -50,7 +50,7 @@ Examples:
         "--pwm-max",
         type=float,
         default=None,
-        help="Max PWM pulse width (us). Default: 2000 (bidir full-forward).",
+        help="Max PWM pulse width (us). Default: 1950 (ESC/prop hardware max).",
     )
     ap.add_argument(
         "--pwm-min",

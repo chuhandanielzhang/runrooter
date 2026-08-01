@@ -600,12 +600,21 @@ class ModeEConfig:
     # bidir off, so flight is forward-only too.
     prop_flight_reverse: str = "auto"
     prop_bidir: bool = False
-    # Total Z budget ~0.6*m*g ≈ 33 N (m=5.61). Per-arm 10 N ≈ pwm 1900 with
-    # calibrated k=1.24e-5 (was capped at 4.5 N / 1600 us).
+    # Total Z budget = thrust_total_ratio_max * m*g (0.60 -> 39.4 N at
+    # m=6.7): this is the real design limit on the collective.
     thrust_total_ratio_max: float = 0.60
-    thrust_max_each_n: float = 10.0
+    # Per-arm ceiling, kept CONSISTENT with the PWM ceiling below:
+    #   thrust(pwm) = k*(pwm-1000)^2 -> 2.25e-5 * 950^2 = 20.3 N at 1950 us.
+    # 2026-08-02: was 10.0 N, a number derived back when k = 1.24e-5 (where
+    # 10 N did sit near 1900 us).  After the thrust-stand recalibration to
+    # k = 2.25e-5 the same 10 N is only 1667 us, so this cap -- not the PWM
+    # ceiling -- was silently binding: the 0801/0802 logs show all three
+    # arms pinned at exactly 1667 us.  Now the hardware PWM max is the
+    # binding limit and the total budget above governs the collective.
+    thrust_max_each_n: float = 20.3
     pwm_min_us: float = 1000.0
-    pwm_max_us: float = 2000.0
+    # 2026-08-02 (user): ESC/prop hardware maximum is 1950 us, not 2000.
+    pwm_max_us: float = 1950.0
     # 2026-07-2x bench recalibration (thrust-stand): k = 2.25e-5 N/us^2.
     prop_k_thrust: float = 2.25e-5
 
