@@ -1300,6 +1300,8 @@ class ModeELCMController:
                 "nrc_r_star",
                 "nrc_f_des",
                 "nrc_h_trim",
+                "fl_ev_xy",
+                "fl_lat_force_n",
                 "prop_energy_fz",
                 "thrust_sum_ref",
                 "thrust_sum",
@@ -1679,6 +1681,8 @@ class ModeELCMController:
             nrc_r_star = float(info.get("nrc_r_star", float("nan")))
             nrc_f_des = float(info.get("nrc_f_des", float("nan")))
             nrc_h_trim = float(info.get("nrc_h_trim", float("nan")))
+            fl_ev_xy = float(info.get("fl_ev_xy", float("nan")))
+            fl_lat_force_n = float(info.get("fl_lat_force_n", float("nan")))
             prop_energy_fz = float(info.get("prop_energy_fz", float("nan")))
             thrust_sum_ref = float(info.get("thrust_sum_ref", float("nan")))
             thrust_sum = float(info.get("thrust_sum", float("nan")))
@@ -1849,6 +1853,8 @@ class ModeELCMController:
                 float(nrc_r_star),
                 float(nrc_f_des),
                 float(nrc_h_trim),
+                float(fl_ev_xy),
+                float(fl_lat_force_n),
                 float(prop_energy_fz),
                 float(thrust_sum_ref),
                 float(thrust_sum),

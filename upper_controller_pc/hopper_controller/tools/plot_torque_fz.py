@@ -41,8 +41,8 @@ def main() -> None:
     t0 = float(x["t_s"].iloc[0])
     t = x["t_s"].to_numpy() - t0
 
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(
-        4, 1, figsize=(14, 14), sharex=True, constrained_layout=True
+    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(
+        5, 1, figsize=(14, 17), sharex=True, constrained_layout=True
     )
     colors = ["tab:blue", "tab:orange", "tab:green"]
     for i, c in enumerate(colors):
@@ -92,11 +92,24 @@ def main() -> None:
     ax4b.set_ylim(bottom=0)
     ax4.set_ylabel("Leg length (cm)", color="tab:blue")
     ax4.tick_params(axis="y", labelcolor="tab:blue")
-    ax4.set_xlabel(f"Time since {t0:.3f} s (s)")
     ax4.grid(True, alpha=0.25)
     h4, l4 = ax4.get_legend_handles_labels()
     h4b, l4b = ax4b.get_legend_handles_labels()
     ax4.legend(h4 + h4b, l4 + l4b, ncol=3, fontsize=8, loc="upper right")
+
+    # XY velocity estimate used by Raibert + flight tilt (world FRD).
+    ax5.plot(t, x["v_hat_w0"], color="tab:blue", lw=1.2, label="vx_hat (world)")
+    ax5.plot(t, x["v_hat_w1"], color="tab:orange", lw=1.2, label="vy_hat (world)")
+    if "desired_vx_w" in x.columns and "desired_vy_w" in x.columns:
+        ax5.plot(t, x["desired_vx_w"], color="tab:blue", lw=1.0, ls="--",
+                 alpha=0.7, label="vx_des")
+        ax5.plot(t, x["desired_vy_w"], color="tab:orange", lw=1.0, ls="--",
+                 alpha=0.7, label="vy_des")
+    ax5.axhline(0.0, color="gray", ls=":", lw=1.0)
+    ax5.set_ylabel("XY velocity (m/s)")
+    ax5.set_xlabel(f"Time since {t0:.3f} s (s)")
+    ax5.grid(True, alpha=0.25)
+    ax5.legend(ncol=4, fontsize=8, loc="upper right")
 
     phase = x["phase"].astype(str).to_numpy()
     for label, face, alpha in [
@@ -112,6 +125,7 @@ def main() -> None:
                         label=label if a == starts[0] else None)
             ax3.axvspan(t[a], t[b], color=face, alpha=alpha, lw=0)
             ax4.axvspan(t[a], t[b], color=face, alpha=alpha, lw=0)
+            ax5.axvspan(t[a], t[b], color=face, alpha=alpha, lw=0)
 
     handles, labels = ax2.get_legend_handles_labels()
     seen, H, L = set(), [], []

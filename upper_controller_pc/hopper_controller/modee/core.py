@@ -432,8 +432,23 @@ class ModeEConfig:
     # lambda is the weight of the previous estimate; 0 leaves raw CAN qd.
     qd_ema_lambda: float = 0.4
 
-    # Flight placement (classic Raibert) / swing PD.
-    flight_kv: float = 0.17
+    # Flight placement (Raibert return map) / swing PD.
+    # 2026-08-02 restructure: the placement law is now the textbook
+    # two-term Raibert law
+    #     p_f = (T_st/2) * v_hat + flight_kv * (v_hat - v_des)
+    # where the NEUTRAL POINT coefficient T_st/2 = (pi/2)*sqrt(m/k) is
+    # computed LIVE from the stance spring nrc_k_n_m -- retune the
+    # height channel and the placement law re-times itself (before this
+    # the neutral share was buried inside one hand-tuned gain).
+    # flight_kv is now the PURE feedback gain [m per m/s of velocity
+    # error]: the deadbeat value of the linearized return map is
+    # ~T_st/2, so useful range is 0.03 (gentle) .. 0.10 (near-deadbeat).
+    # Old flight_kv=0.17 folded both terms (T_st/2 ~ 0.096 at k=1800);
+    # 0.08 keeps the same total braking at v_des = 0.
+    flight_kv: float = 0.08
+    # DEPRECATED (2026-08-02): the desired-velocity feedforward is now
+    # the -flight_kv*v_des term of the return-map law above (correct
+    # Raibert sign: command forward -> foot lands BEHIND neutral).
     flight_kr: float = 0.09
     flight_stepper_lim_m: float = 0.13
     swing_kp_xy: float = 60.0
@@ -664,6 +679,24 @@ class ModeEConfig:
     prop_flight_brake_ratio: float = 0.0
     # Descent detection threshold on world vz (m/s, up-positive).
     prop_flight_brake_vz_mps: float = 0.10
+    # ===== Descent VELOCITY-BRAKE collective (2026-08-02) =====
+    # The tilt loop's lateral force is f_z*tan(theta): during ASCENT f_z
+    # carries the height channel's energy supplement (10-40 N) and the
+    # tilt brakes for real, but during DESCENT the collective is the
+    # 0.68 N idle -- an 18 deg lean delivers 0.2 N (~0.03 m/s^2),
+    # nothing.  This grants the descent a BOUNDED collective purely so
+    # the tilt has something to vector:
+    #   ratio = prop_descent_brake_ratio
+    #           * clip(|e_v|/prop_descent_brake_ev_mps, 0, 1)   (error gate)
+    #           * clip((t_td - settle)/settle, 0, 1)            (TD fade)
+    # Proportional to the horizontal velocity error (zero when
+    # converged), fading to zero on the same time-to-touchdown clock as
+    # the tilt budget (level AND idle before landing).  It is a
+    # VELOCITY-channel force by intent but a pure Fz by allocation; the
+    # per-hop apex trim absorbs its (small) vertical energy over hops.
+    # 0.10 * m*g = 6.6 N -> 2.1 N lateral at 18 deg.  0 disables.
+    prop_descent_brake_ratio: float = 0.10
+    prop_descent_brake_ev_mps: float = 0.40
     # 2026-07-19 (per user): 3D / bidirectional thrust DISABLED everywhere.
     # prop_bidir=False makes negative thrust idle at pwm_min in the PWM map,
     # forces forward-only floors in the stance overlays / daisy chain, and
@@ -697,11 +730,7 @@ class ModeEConfig:
     att_accel_weight: float = -0.01
     att_stance_bound_lo: int = 90
     att_stance_bound_hi: int = 130
-    # Stance XY velocity buffer length (samples).  Sized to cover a full
-    # stance (~0.4 s at 500 Hz); the estimate is the per-axis MEDIAN of
-    # the samples collected this stance (robust to leg chatter / omega
-    # spikes).  Flight XY is seeded from that same median at liftoff.
-    vel_push_tail_n: int = 250
+    vel_push_tail_n: int = 20
 
     # Motor command limits.
     tau_cmd_max_nm: tuple[float, float, float] = (40.0, 40.0, 40.0)
@@ -1033,11 +1062,10 @@ class ModeECore:
         # MATLAB-style EMA on CAN-reported qd (qd_ema_lambda).
         self._qd_ema = np.zeros(3, dtype=float)
         self._qd_ema_init: bool = False
-        # Flight-phase XY velocity seeded at liftoff from stance median.
+        # Flight-phase XY velocity latched at liftoff (push tail mean).
         self._flight_vel = np.zeros(3, dtype=float)
-        # Per-stance ring of leg-kinematics velocity samples; the running
-        # per-axis MEDIAN is the stance XY estimate (see vel_push_tail_n).
-        _tail_n = int(max(1, int(getattr(self.cfg, "vel_push_tail_n", 250))))
+        # Per-stance push-phase ring buffer (last N samples for XY velocity).
+        _tail_n = int(max(1, int(getattr(self.cfg, "vel_push_tail_n", 10))))
         self._vel_push_tail_n = _tail_n
         self._push_vel_ring = np.zeros((_tail_n, 3), dtype=float)
         self._push_vel_ring_i: int = 0
@@ -1064,6 +1092,10 @@ class ModeECore:
         self._fl_tilt_vec = np.zeros(2, dtype=float)
         self._fl_tilt_cmd_deg: float = 0.0
         self._fl_zb_des_xy = np.zeros(2, dtype=float)
+        # Horizontal-convergence telemetry: flight velocity error norm
+        # and the DELIVERED lateral force f_z*tan(tilt) [N].
+        self._fl_ev_xy: float = 0.0
+        self._fl_lat_force_n: float = 0.0
         # Propeller PUSH energy supplement latched for the current stance (N).
         self._prop_energy_fz: float = 0.0
         # RB gamepad big-jump request (armed until consumed at a PUSH latch).
@@ -1288,6 +1320,8 @@ class ModeECore:
         self._fl_tilt_vec[:] = 0.0
         self._fl_tilt_cmd_deg = 0.0
         self._fl_zb_des_xy[:] = 0.0
+        self._fl_ev_xy = 0.0
+        self._fl_lat_force_n = 0.0
         self._prop_energy_fz = 0.0
         self._big_jump_pending = False
         self._nrc_big_gain = 1.0
@@ -1912,21 +1946,16 @@ class ModeECore:
         x = float(_clipf(float(x), 0.0, 1.0))
         return float(x * x * (3.0 - 2.0 * x))
 
-    def _stance_vel_median(self) -> np.ndarray | None:
-        """Per-axis median of stance-phase leg-kinematics velocity samples.
-
-        Covers the samples collected since the last touchdown (up to
-        vel_push_tail_n).  Used as the stance XY estimate and as the
-        flight XY seed at liftoff -- median rejects the +- spikes from
-        leg vibration / omega x r that polluted the old rolling mean.
-        """
+    def _push_vel_tail_mean(self) -> np.ndarray | None:
+        """Mean of the last vel_push_tail_n stance leg-kinematics samples
+        (MATLAB avg_foot_vel/pos rolling window; used only for flight_vel)."""
         n = int(self._push_vel_ring_cnt)
         if n <= 0:
             return None
         cap = int(self._vel_push_tail_n)
         if n < cap:
-            return np.median(self._push_vel_ring[:n, :], axis=0)
-        return np.median(self._push_vel_ring, axis=0)
+            return np.mean(self._push_vel_ring[:n, :], axis=0)
+        return np.mean(self._push_vel_ring, axis=0)
 
     def _init_unified_stance_profile(
         self,
@@ -2236,14 +2265,12 @@ class ModeECore:
         z_thrust_w = (-z_w).astype(float).reshape(3)
 
         # --- Base velocity from leg kinematics (foot assumed stationary in WORLD) ---
-        # v_base_w = R_wb @ ( -foot_vdot_b - omega_b x foot_b )
-        # Full-coefficient omega×r restored (2026-07-19): with the foot pinned,
-        # body rotation moves the leg relative to the body; without this term
-        # that rotation is misread as horizontal CoM velocity (false Raibert
-        # swing when hopping in place). MATLAB's 0.1 factor undercompensated.
+        # v_base_w = R_wb @ ( -foot_vdot_b - 0.1*(omega_b x foot_b) )
+        # MATLAB-style 0.1 omega×r (2026-08-02, per user): matches the
+        # original Raibert MATLAB pipeline.
         v_base_from_foot_w = (R_wb_hat @ (
             -foot_vrel_b.reshape(3)
-            - _cross3(imu_gyro_b.reshape(3), foot_b.reshape(3))
+            - 0.1 * _cross3(imu_gyro_b.reshape(3), foot_b.reshape(3))
         )).reshape(3)
 
         if not bool(self._v_hat_inited):
@@ -2368,7 +2395,7 @@ class ModeECore:
 
                 # latch TD shift for compression measurement
                 self._q_shift_td = float(q_shift)
-                # Re-seed stance velocity ring (whole-stance median).
+                # Re-seed push-phase velocity ring (COMP samples excluded).
                 self._push_vel_ring[:] = 0.0
                 self._push_vel_ring_i = 0
                 self._push_vel_ring_cnt = 0
@@ -2438,11 +2465,11 @@ class ModeECore:
                 liftoff_evt = True
                 self._stance = False
                 self._lo_t = float(self.sim_time)
-                # Latch flight XY from the WHOLE-stance median (same
-                # estimator used during stance). Instantaneous LO fallback.
-                v_st_med = self._stance_vel_median()
-                if v_st_med is not None:
-                    v_latch = np.asarray(v_st_med, dtype=float).reshape(3)
+                # Latch flight XY.
+                # MATLAB-style last-N stance mean; instantaneous LO fallback.
+                v_push_tail = self._push_vel_tail_mean()
+                if v_push_tail is not None:
+                    v_latch = np.asarray(v_push_tail, dtype=float).reshape(3)
                 elif np.all(np.isfinite(v_base_from_foot_w)):
                     v_latch = v_base_from_foot_w.reshape(3).astype(float)
                 else:
@@ -2463,10 +2490,8 @@ class ModeECore:
                 self._apex_reached = False
 
         # ===== Body velocity =====
-        # XY stance: per-axis MEDIAN of this stance's planted-foot odometry
-        # (whole stance, not instantaneous / not last-N mean).  Latched as
-        # the flight seed at liftoff.  Z: instantaneous stance odometry /
-        # flight IMU integration (NRC needs a responsive vz).
+        # XY: planted-foot odometry in stance, last-N mean latched at liftoff.
+        # Z: stance leg odometry, flight IMU integration.
         g_w = np.array([0.0, 0.0, float(self.gravity)], dtype=float)  # +Z DOWN
         if np.all(np.isfinite(imu_acc_b)):
             a_w = (R_wb_hat @ imu_acc_b.reshape(3) + g_w.reshape(3)).reshape(3)
@@ -2478,27 +2503,21 @@ class ModeECore:
             self._v_hat_w[:] = 0.0
         elif bool(self._stance):
             if np.all(np.isfinite(v_base_from_foot_w)):
+                self._v_hat_w[0] = float(v_base_from_foot_w[0])
+                self._v_hat_w[1] = float(v_base_from_foot_w[1])
+                self._v_hat_w[2] = float(v_base_from_foot_w[2])
                 i = int(self._push_vel_ring_i)
                 self._push_vel_ring[i, :] = v_base_from_foot_w.reshape(3).astype(float)
                 self._push_vel_ring_i = (i + 1) % int(self._vel_push_tail_n)
                 self._push_vel_ring_cnt = min(
                     int(self._push_vel_ring_cnt) + 1, int(self._vel_push_tail_n)
                 )
-                v_med = self._stance_vel_median()
-                if v_med is not None:
-                    self._v_hat_w[0] = float(v_med[0])
-                    self._v_hat_w[1] = float(v_med[1])
-                else:
-                    self._v_hat_w[0] = float(v_base_from_foot_w[0])
-                    self._v_hat_w[1] = float(v_base_from_foot_w[1])
-                # Z stays instantaneous -- median would lag the NRC pump.
-                self._v_hat_w[2] = float(v_base_from_foot_w[2])
             else:
                 self._v_hat_w[2] = float(vz_pred)
         else:
             # FLIGHT XY: IMU dead-reckoning from the liftoff latch (2026-08-01,
             # user: "空中的速度不能锁存...不然空中只会保持一种姿态").  The
-            # latched stance MEDIAN is the INITIAL CONDITION only; each
+            # latched last-N stance mean is the INITIAL CONDITION only; each
             # flight tick propagates with the world specific force
             #     v_xy += (R*a_b + g)_xy * dt,
             # so prop braking (the PogoX tilt below) actually shows up in the
@@ -2670,6 +2689,47 @@ class ModeECore:
                 float(self.cfg.prop_base_thrust_ratio),
                 float(self.cfg.prop_flight_brake_ratio),
             ))
+            # Descent VELOCITY-BRAKE collective (see the
+            # prop_descent_brake_* config block): error-gated, faded on
+            # the same time-to-touchdown clock as the tilt budget.  Gives
+            # the tilt loop a real f_z to vector while falling.
+            _dbr = float(max(0.0, float(getattr(
+                self.cfg, "prop_descent_brake_ratio", 0.0
+            ))))
+            if (_dbr > 1e-9
+                    and bool(getattr(
+                        self.cfg, "flight_vel_ctrl_enable", False))
+                    and bool(self._props_armed_rt)):
+                ev_ref = float(max(0.05, float(getattr(
+                    self.cfg, "prop_descent_brake_ev_mps", 0.40
+                ))))
+                e_v_n = float(np.linalg.norm(
+                    np.asarray(desired_v_xy_w, dtype=float).reshape(2)
+                    - np.asarray(
+                        self._flight_vel[0:2], dtype=float
+                    ).reshape(2)
+                ))
+                vz_up_c = -float(self._v_hat_w[2])
+                vz_lo_c = (
+                    float(self._vz_lo)
+                    if (self._vz_lo is not None
+                        and np.isfinite(float(self._vz_lo)))
+                    else 0.0
+                )
+                t_td_c = max(0.0, (
+                    vz_up_c + max(0.0, vz_lo_c)
+                ) / max(0.5, float(self.gravity)))
+                settle_c = float(max(0.02, float(getattr(
+                    self.cfg, "flight_level_settle_s", 0.12
+                ))))
+                fade_c = float(_clipf(
+                    (t_td_c - settle_c) / settle_c, 0.0, 1.0
+                ))
+                prop_ratio += (
+                    _dbr
+                    * float(_clipf(e_v_n / ev_ref, 0.0, 1.0))
+                    * fade_c
+                )
         else:
             prop_ratio = float(self.cfg.prop_base_thrust_ratio)
         thrust_sum_ref = float(self.mass * self.gravity * float(prop_ratio))
@@ -2762,6 +2822,8 @@ class ModeECore:
         # convergence rides the existing attitude path, no new actuator law.
         self._fl_tilt_cmd_deg = 0.0
         self._fl_zb_des_xy[:] = 0.0
+        self._fl_ev_xy = 0.0
+        self._fl_lat_force_n = 0.0
         if bool(self._stance):
             # Slew state re-arms level for the next flight.
             self._fl_tilt_vec[:] = 0.0
@@ -2780,6 +2842,10 @@ class ModeECore:
                 np.asarray(desired_v_xy_w, dtype=float).reshape(2)
                 - np.asarray(self._flight_vel[0:2], dtype=float).reshape(2)
             )
+            self._fl_ev_xy = float(np.linalg.norm(
+                np.asarray(desired_v_xy_w, dtype=float).reshape(2)
+                - np.asarray(self._flight_vel[0:2], dtype=float).reshape(2)
+            ))
             # LANDING-UPRIGHT rule, CONTINUOUS form (no on/off gate): a
             # lean of theta needs theta/slew seconds to ramp level plus
             # the settle margin before touchdown, so the ballistic
@@ -2859,6 +2925,8 @@ class ModeECore:
             else:
                 f_xy_w = np.zeros(2, dtype=float)
                 f_n = 0.0
+            # Delivered lateral braking force [N]: f_z * tan(tilt).
+            self._fl_lat_force_n = float(f_n)
             if f_n > 1e-6 and np.all(np.isfinite(f_xy_w)):
                 f_mag = float(math.hypot(f_n, f_z_up))
                 # NOTE (2026-08-01, user: "energy 补充的时候才加 Fz"):
@@ -3610,17 +3678,32 @@ class ModeECore:
         xdot_for_pd = foot_vdot_vicon.copy()
 
         if not bool(self._stance):
-            # Raibert in WORLD FRD (+Z down, 竖直向下), same vertical sense as body/FK footpos.
-            #   target_xy_w = Kv * v_lo_xy_w + Kr * desired_v_xy_w
+            # Raibert RETURN-MAP placement in WORLD FRD (+Z down), same
+            # vertical sense as body/FK footpos.  Textbook two-term law:
+            #   target_xy_w = (T_st/2) * v_xy + flight_kv * (v_xy - v_des)
             #   target_z_w  = +sqrt(l0^2 - ||target_xy_w||^2)
             #   foot_des_b  = R_wb^T @ target_w   (quaternion body<-world)
+            # NEUTRAL POINT synced to the height channel: the stance is a
+            # half period of the nrc_k_n_m virtual spring, so
+            #   T_st/2 = (pi/2)*sqrt(m/k)
+            # follows the stance-stiffness knob automatically.  flight_kv
+            # is the pure feedback gain (see config).  v_des enters with
+            # the CORRECT Raibert sign (foot behind neutral to speed up);
+            # the old +flight_kr feedforward is retired.
             l0 = float(self.cfg.leg_l0_m)
-            kv = float(self.cfg.flight_kv)
-            kr = float(self.cfg.flight_kr)
+            kv = float(max(0.0, float(self.cfg.flight_kv)))
+            k_st = float(max(1.0, float(getattr(
+                self.cfg, "nrc_k_n_m", 1800.0
+            ))))
+            half_t_st = 0.5 * math.pi * math.sqrt(
+                float(self.mass) / k_st
+            )
             step_lim = float(abs(float(self.cfg.flight_stepper_lim_m)))
             v_xy_w = np.array([float(self._v_hat_w[0]), float(self._v_hat_w[1])], dtype=float)
             vdes_xy_w = np.array([float(desired_v_xy_w[0]), float(desired_v_xy_w[1])], dtype=float)
-            target_xy_w = (kv * v_xy_w + kr * vdes_xy_w).astype(float)
+            target_xy_w = (
+                (half_t_st + kv) * v_xy_w - kv * vdes_xy_w
+            ).astype(float)
             if bool(self.cfg.mode_1d):
                 target_xy_w[0] = 0.0
                 target_xy_w[1] = 0.0
@@ -4155,6 +4238,10 @@ class ModeECore:
             "fl_tilt_cmd_deg": float(self._fl_tilt_cmd_deg),
             "fl_zb_des_x": float(self._fl_zb_des_xy[0]),
             "fl_zb_des_y": float(self._fl_zb_des_xy[1]),
+            # Horizontal convergence: flight |v - v_des| and the
+            # DELIVERED prop lateral force f_z*tan(tilt).
+            "fl_ev_xy": float(self._fl_ev_xy),
+            "fl_lat_force_n": float(self._fl_lat_force_n),
             "energy_gate": int(bool(self._stance) and bool(energy_gate)),
             "vz_up": float(vz_up),
             # Wrench-level debug:

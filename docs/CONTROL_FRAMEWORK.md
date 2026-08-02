@@ -126,31 +126,75 @@ TD (q_shift ≤ -2cm) ──► COMPRESSION ──► PUSH latch (vz_f 过零去
 - **flight**：桨差分是唯一姿态执行器，同一个 \(k_R/k_W\) PD 跟踪 §6 的倾斜参考。
   腿此时做 Raibert 摆腿（§5），互不争抢。
 
-## 5. 速度：估计 + Raibert 落点
+## 5. 水平速度收敛（两层结构，与高度旋钮同步；2026-08-02 重构）
 
-**估计（不锁存）**：
-- stance：着地足里程计 \(v = -J\dot q\)（世界系），推进段末 N 拍均值作 LO 初值；
-- flight：从 LO 初值起 **IMU 世界系加速度逐 tick 外推** \(v \mathrel{+}= (R a_b + g)\,dt\)
-  ——桨的刹车会真实反映在速度里，Raibert 和倾斜环消费同一个活的估计（三旋翼串级的标准假设）。
+**问题定义**：镇定水平速度误差 \(e_v = \hat v_{xy} - v_{des}\)，同时 (a) 不侵占高度
+通道的能量预算，(b) 落地前身体回平，(c) 所有过渡连续。
 
-**Raibert 落点**（世界系 FRD）：
-\[ p_{xy} = K_v v_{xy} + K_r v_{des},\quad p_z = \sqrt{l_0^2 - \|p_{xy}\|^2},\quad p_b = R^T p_w \]
-摆腿是足空间笛卡尔 PD（侧向力正交于腿轴 + 轴向弹簧），限步长。
+**估计（两层共享同一个 \(\hat v\)，不锁存）**：
+- stance：着地足里程计 \(v = R(-\dot p_f^b - 0.1\,\omega\times p_f^b)\)（世界系），
+  推进段末 N 拍均值作 LO 初值；
+- flight：从 LO 初值起 **IMU 世界系比力逐 tick 外推** \(v \mathrel{+}= (R a_b + g)\,dt\)
+  ——桨的刹车会真实反映在速度里，两层消费同一个活的估计（三旋翼串级的标准假设，
+  Salazar-Cruz CEP'09）。
 
-## 6. 三旋翼飞行速度收敛（PogoX 式，连续）
+### 5a. Layer 1 —— Raibert 返回映射落点（hop-to-hop，主收敛）
 
-外环每 tick 闭在活的速度上（Salazar-Cruz CEP'09 / Lee CDC'10 / PogoX ICRA'24）：
-\[ a_{des} = k_v (v_{des} - v(t)) \;\rightarrow\; \text{期望推力方向} \;\rightarrow\; R_{des}(\text{保 yaw 倾斜}) \]
+教科书双项形式（Raibert 1986），世界系 FRD：
+\[ p_{xy} = \underbrace{\tfrac{T_{st}}{2}\,\hat v_{xy}}_{\text{中性点}}
+   + \underbrace{k_{step}\,(\hat v_{xy} - v_{des})}_{\text{反馈}},\qquad
+   p_z = \sqrt{l_0^2 - \|p_{xy}\|^2},\qquad p_b = R^T p_w \]
 
-- **倾斜参考斜坡限速**（`flight_vel_tilt_slew_dps`）：R_des 全程连续。
-- **连续落地预算**：倾角 θ 需要 θ/slew 秒还清 + settle 余量，弹道剩余时间只买得起
-  \[ \theta_{budget} = \mathrm{slew} \cdot \max(0,\; t_{td} - t_{settle}) \]
-  预算以 slew 速率本身线性收零 → 斜坡参考精确跟得上，落地前 `settle` 秒身体已回平。
-  没有 on/off 门。
-- **collective 不跟随倾斜**（2026-08-01）：倾斜只改姿态参考，刹车力矩由差分通道给，
-  Fz 死守怠速基座（+ §3 的补能）。误差收敛 → 倾角自己收零 → 精确退化回水平参考。
+- **中性点与高度通道同步**：stance 是 `nrc_k_n_m` 虚拟弹簧的半周期，
+  \(\tfrac{T_{st}}{2} = \tfrac{\pi}{2}\sqrt{m/k}\) **实时从刚度旋钮算出**
+  （k=1800 → 0.096 s）。改高度通道的 k，落点法则自动重新定时——以前这一项
+  被埋在一个手调增益里。
+- **反馈增益** \(k_{step}\) = `flight_kv`（现 0.08）：线性化返回映射的
+  deadbeat 值约为 \(T_{st}/2\)，故有效范围 0.03（温和）～0.10（近 deadbeat）。
+- \(v_{des}\) 以**正确的 Raibert 符号**进入（要向前走 → 脚落在中性点之后）；
+  旧的 `+flight_kr` 前馈退役。
+- 摆腿是足空间笛卡尔 PD（侧向力正交于腿轴 + 轴向弹簧），限步长
+  `flight_stepper_lim_m`。
 
-## 7. 分配器：怠速基座差分混合（有界抬升）
+### 5b. Layer 2 —— 三旋翼倾斜（within-flight，连续阻尼）
+
+外环每 tick 闭在活的速度上（Lee CDC'10 / PogoX ICRA'24）：
+\[ a_{des} = k_v^{tilt} (v_{des} - \hat v(t)) \;\rightarrow\;
+   z_b^{des} \propto \big[-m\,a_{des,xy},\; F_z\big] \;\rightarrow\; R_{des}(\text{保 yaw}) \]
+
+**方向来自速度环、幅值来自高度通道**：交付的侧向力是 \(f_{xy} = F_z\tan\theta\)，
+其中 \(F_z\) 是高度通道**当刻**的 collective（怠速 + §2b/§3 补能 + kh 反馈）。
+高度出多少力，速度环就借多少来转向——不为速度多叠 PWM，通道在意图上正交：
+
+| 飞行段 | \(F_z\) 来源 | 18° 倾角的侧向力 |
+|---|---|---|
+| 上升 | 怠速 + 能量补充（10–40 N） | 3–13 N（真刹车） |
+| 下降（旧） | 怠速 0.68 N | 0.2 N（≈无） |
+| 下降（新） | 怠速 + **下降刹车授权** | 最多 ~2.3 N |
+
+**下降刹车授权**（`prop_descent_brake_*`，修旧结构的硬伤）：
+\[ \Delta F_z = \rho_{brake}\, mg \cdot
+   \mathrm{clip}\!\big(\tfrac{\|e_v\|}{e_{ref}},0,1\big) \cdot
+   \mathrm{clip}\!\big(\tfrac{t_{td}-t_{settle}}{t_{settle}},0,1\big) \]
+误差门控（收敛了就归零）+ 与倾斜预算同一个 \(t_{td}\) 时钟淡出（落地前既回平又
+回怠速）。竖直方向的少量能量由逐跳 apex trim（§2b）跨跳吸收。
+
+**落地预算（PogoX，保留）**：倾角 θ 需要 θ/slew 秒还清 + settle 余量，
+\[ \theta_{budget} = \mathrm{slew}\cdot\max(0,\; t_{td} - t_{settle}) \]
+其中 \(t_{td}\) 由弹道预测——apex 目标是 `hop_height_m`×`nrc_h_trim`，
+**高度旋钮改了，倾斜授权窗口自动跟着变**。预算以 slew 速率收零，斜坡参考精确
+跟得上，无 on/off 门。倾斜参考在角度空间斜坡限速，R_des 全程连续。
+
+### 5c. 分工与饱和字典序
+
+- Layer 1 在触地瞬间以冲量方式消化误差（离散、大权限）；Layer 2 在飞行中连续
+  消耗误差并把 Layer 1 的落点残差在下一次触地前压小（连续、小权限）。
+  两层都指向同一个 \(v_{des}\)，靠共享 \(\hat v\) 自然协同，无仲裁逻辑。
+- 桨的饱和字典序：**collective（高度）> 差分回平（稳定）> 倾斜（速度）**——
+  倾斜只改姿态参考的方向，差分被 `prop_att_thrust_max_each_n` 硬顶，
+  collective 永远不被速度环触碰。
+
+## 6. 分配器：怠速基座差分混合（有界抬升）
 
 每桨命令 \(t_i = T/3 + c + s\,\Delta_i\)：
 
@@ -163,7 +207,7 @@ TD (q_shift ≤ -2cm) ──► COMPRESSION ──► PUSH latch (vz_f 过零去
 - **饱和**：单标量 \(s\in[0,1]\) 缩整个差分（力矩方向精确），遥测列 `prop_att_scale`
   记录实际交付比例（<1 说明姿态需求被削）。
 
-## 8. "无硬切"清单
+## 7. "无硬切"清单
 
 | 过渡 | 连续机制 |
 |---|---|
@@ -175,7 +219,7 @@ TD (q_shift ≤ -2cm) ──► COMPRESSION ──► PUSH latch (vz_f 过零去
 | 姿态饱和 | 单标量 s 缩放，方向不变 |
 | 反转地板进出 | 可行性触发 + 迟滞（"auto"），非角度阈值 |
 
-## 9. 调参表
+## 8. 调参表
 
 | 参数 | 现值 | 作用 |
 |---|---|---|
@@ -183,18 +227,20 @@ TD (q_shift ≤ -2cm) ──► COMPRESSION ──► PUSH latch (vz_f 过零去
 | `stance_kp_z / kd_z` | 1400 / 10 | 落地承接阻抗 |
 | `stance_push_blend_tau_s` | 0.01 | PUSH 力上升时间（抖→调大） |
 | `mode1_apex_adapt_gamma` | 0.4 | 逐跳能量学习速率 |
-| `prop_energy_max_ratio` | 0.35 | 桨补能上限（×mg） |
+| `prop_energy_max_ratio` | 0.60 | 桨补能上限（×mg，= 39.4 N） |
 | `prop_energy_apex_fade_vz` | 0.30 | apex 前滚降的 vz 窗口 |
 | `prop_base/stance_base_thrust_ratio` | 0.0103 | = PWM 1100 怠速基座 |
-| `prop_att_thrust_max_each_n` | 3.0 | 姿态差分每桨抬升上限（≈PWM 1380） |
-| `flight_kv / flight_kr` | 0.14 / 0.09 | Raibert 落点增益 |
-| `flight_vel_kv` | 4.0 | 空中速度环带宽（刹车力度） |
-| `flight_vel_tilt_max_deg` | 12 | 倾角上限（每度都要落地前还清） |
-| `flight_vel_tilt_slew_dps` | 120 | 倾斜斜坡速率（建立与回平同一速率） |
-| `flight_level_settle_s` | 0.14 | 落地前回平余量 |
-| `flight_kR / flight_kW` | 40 / 6 | 飞行姿态 PD（跟踪倾斜参考） |
+| `prop_att_thrust_max_each_n` | 5.0 | 姿态差分每桨抬升上限 |
+| `flight_kv` | 0.08 | Raibert 落点**纯反馈**增益（中性点 T_st/2 自动算） |
+| `flight_vel_kv` | 7.0 | 空中倾斜环带宽（辅助刹车力度） |
+| `flight_vel_tilt_max_deg` | 18 | 倾角上限（每度都要落地前还清） |
+| `flight_vel_tilt_slew_dps` | 180 | 倾斜斜坡速率（建立与回平同一速率） |
+| `flight_level_settle_s` | 0.12 | 落地前回平余量 |
+| `prop_descent_brake_ratio` | 0.10 | 下降段刹车 collective 额度（×mg，0=关） |
+| `prop_descent_brake_ev_mps` | 0.40 | 达到满额刹车授权的速度误差 |
+| `flight_kR / flight_kW` | 60 / 9 | 飞行姿态 PD（跟踪倾斜参考） |
 
-## 10. 关键遥测列
+## 9. 关键遥测列
 
 | 列 | 含义 |
 |---|---|
@@ -202,5 +248,8 @@ TD (q_shift ≤ -2cm) ──► COMPRESSION ──► PUSH latch (vz_f 过零去
 | `prop_energy_fz` | 桨补能 collective（含飞行淡出后实际值, N） |
 | `prop_att_scale` | 姿态差分交付比例（<1 = 被抬升上限削了） |
 | `fl_tilt_cmd_deg` / `fl_zb_des_x/y` | PogoX 倾斜命令角与方向 |
+| `fl_ev_xy` | 飞行段水平速度误差范数 \(\|\hat v - v_{des}\|\) (m/s) |
+| `fl_lat_force_n` | 倾斜实际交付的侧向力 \(F_z\tan\theta\) (N) |
+| `nrc_h_trim` | 逐跳 apex 返回映射的高度目标 trim |
 | `flight_vel_w` | IMU 外推的飞行速度（不锁存） |
 | `tau_out_scale_applied` | 腿力矩比例限幅（持续 <1 = 腿饱和） |
