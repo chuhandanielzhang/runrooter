@@ -565,15 +565,17 @@ class ModeEConfig:
     # nrc_leg_fz_max now fires through compression with the 1/cos(theta)
     # world-Z de-projection, see PROPELLER FUSION above).
     nrc_k_n_m: float = 1800.0            # virtual spring stiffness [N/m]
-    # 2026-08-02: 400 -> 150.  The pump coefficient 2*m*kR*omega ~ 88000
-    # at kR=400: with the stance vz estimate lagging ~25-50 ms
-    # (kinematics + 15 ms LPF), the pump keeps firing 100+ N after the
-    # true energy already crossed the target -- log 073212 delivered a
-    # ~0.15 m hop against the 0.07 m target with r STILL below r* at
-    # liftoff.  Sim with a lagged estimator reproduces 0.125-0.155 m at
-    # kR=400 vs 0.078-0.100 m at kR=150.  The remaining bias is closed
-    # by the per-hop apex trim (nrc_apex_trim_gain).
-    nrc_kR: float = 150.0                # norm-regulation gain [1/(m*s)]
+    # 2026-08-02 history: 400 -> 150 -> 350.  At 400 with no other
+    # protection, the ~25-50 ms vz-estimate lag made the pump keep
+    # firing past the target (log 073212: 0.15 m hops on a 0.07 m
+    # setpoint).  150 fixed the overshoot but gutted the injection: log
+    # 080815's first stance peaked at 133 N total demand -- barely the
+    # spring, 3 N left for the props, no liftoff ("propeller根本没出力").
+    # With the extension fade + per-hop apex trim now absorbing the
+    # lag-induced overshoot, the pump can be strong again: at 350 the
+    # sim (30 ms lag) launches cold, props saturate their 39 N cap each
+    # hop, and apex walks 10.6 -> 8.1 -> 7.4 -> 7.0 cm in 4 hops.
+    nrc_kR: float = 350.0                # norm-regulation gain [1/(m*s)]
     nrc_bz: float = 8.0                  # virtual damping [N*s/m]
     # Pump extension fade [m]: F_pump *= clip((l0 - h_com)/fade, 0, 1).
     # Energy injection belongs to the mid-stroke; the last few cm before
