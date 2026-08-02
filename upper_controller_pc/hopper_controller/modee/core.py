@@ -427,11 +427,17 @@ class ModeEConfig:
     stance_fz_max: float = 500.0
     hopper4_td_threshold_m: float = 0.02
     hopper4_lo_threshold_m: float = 0.0
-    # Minimum dwell (ticks) in a phase before TD/LO can fire again. 23:14 log:
-    # with 1 tick (2 ms) a hard landing produced 16-28 ms fake stance/flight
-    # chatter cycles, each firing a freshly-sized 200-500 N spring. 10 ticks
-    # = 20 ms; real stances/flights here are >= 100/200 ms.
-    hopper4_phase_min_steps: int = 10
+    # Minimum dwell (ticks) in a phase before TD/LO can fire again.
+    # 2026-08-03 (logs 013037/013455): 10 -> 50 (CASE2026 value).
+    # At 10 ticks = 20 ms the swing leg retracting in early ascent
+    # (q_shift → -2 cm while vz still +1..5 m/s) re-triggered stance
+    # mid-air ("空中误入 stance").  Real 7 cm hops have T_fl ≳ 0.16 s;
+    # 50 ticks = 100 ms blocks the 22-36 ms false flights.
+    hopper4_phase_min_steps: int = 50
+    # Extra TD gate: only accept touchdown while descending (or nearly
+    # stopped).  Stand-start vz≈0 still passes; mid-ascent swing
+    # retraction (vz > 0) does not.  0 disables.
+    hopper4_td_vz_max_mps: float = 0.15
 
     # Stance attitude PD (one gain for roll and pitch).
     # 2026-08-02: bumped ~1.4x for stronger balance authority.
@@ -531,7 +537,7 @@ class ModeEConfig:
     # `settle` seconds before ballistic touchdown, with no discontinuity.
     # 2026-08-03: OFF -- no descent brake / velocity-tilt Fz; props are
     # idle-1500 + attitude differential only.
-    flight_vel_ctrl_enable: bool = False
+    flight_vel_ctrl_enable: bool = True
     # 2026-08-02 later (log 114427): kv=4 / max=18 / slew=240 slammed
     # fl_tilt_cmd to 18° for 40-70% of every flight (sat threshold only
     # ~3 cm/s of |ev| at base 0.064). Soften so the damper stays in the
@@ -637,7 +643,13 @@ class ModeEConfig:
     #   prop_energy_max_ratio   -> prop collective ceiling (x m*g)
     #   prop_height_kh          -> flight apex-error gain (0 = leg only)
     #   prop_energy_apex_fade_vz-> ascent force rolls to 0 at apex
-    stance_energy_law: str = "fbslip"    # "fbslip" | "nrc" | "mode1"
+    # 2026-08-03 per user "改成 NRC 我要reference它": back to the NRC
+    # continuous law (Lo/Chu/Au, ACC 2020) as the CITABLE base, with two
+    # augmentations grafted onto NRC's own norm coordinates (see the
+    # nrc_vz_lag_s / nrc_deficit_kp blocks): the limit-cycle analysis of
+    # the base paper is untouched because both terms vanish on the
+    # cycle.  hop_height_m stays the ONE height knob.
+    stance_energy_law: str = "nrc"       # "fbslip" | "nrc" | "mode1"
     # ===== FB-SLIP stance (port of 37a1475, 2026-08-02 per user
     # "37a1475 stancephase改成这个") =====
     # The stance law that hopped reliably on 2026-07-25/26.  Three parts:
@@ -648,9 +660,11 @@ class ModeEConfig:
     #  BOTTOM -- one physical event: vz settled (>= -settle for
     #    stance_bottom_confirm_s) OR the body measurably rising off its
     #    deepest point (rebound latch).
-    #  PUSH -- constant force sized ONCE at the bottom (FB-SLIP v2):
-    #    F = m*g_st + m*v_to^2/(2*x0), held OPEN-LOOP (no measured state
-    #    in the loop, nothing to ring), blended in over
+    #  PUSH -- selectable via fbslip_push_mode (2026-08-03):
+    #    "energy" (default) -- SRB energy-deficit closed loop (CASE2026
+    #    style, no virtual spring), force decays to zero by liftoff.
+    #    "const" -- FB-SLIP v2 constant force sized ONCE at the bottom:
+    #    F = m*g_st + m*v_to^2/(2*x0), held OPEN-LOOP, blended in over
     #    stance_push_blend_tau_s.
     # Ballistic height that sizes ONLY the takeoff speed:
     #   v_to = sqrt(2*g_up*takeoff_height_m).
@@ -678,6 +692,48 @@ class ModeEConfig:
     stance_bottom_settle_mps: float = 0.10
     stance_bottom_confirm_s: float = 0.030
     stance_bottom_rebound_m: float = 0.004
+    # ---- PUSH law selector (2026-08-03, per user "不要虚拟弹簧 要 srb
+    # case那样") ----
+    # "energy": CASE2026/Hopper4-style SRB energy-DEFICIT regulation
+    # replaces the latched constant force.  Spring-free closed loop on
+    # the measured stance energy, re-evaluated every tick of the push:
+    #   E_now    = 0.5*m*max(0, vz)^2 + m*g_st*(x0 - x_z)
+    #   E_target = 0.5*m*v_to^2       + m*g_st*x0
+    #   F_push   = m*g_st + kp*(E_target - E_now)
+    # then the extension fade rolls the WHOLE force to zero over the
+    # last ~1.5 cm before full extension, so the leg is fully unloaded
+    # exactly at liftoff (the NRC "粘地" failure cannot happen: no
+    # residual force pins the foot).  As the stroke converts force into
+    # KE + PE the deficit shrinks, so F DECAYS monotonically instead of
+    # holding -- and the closed loop automatically replaces energy the
+    # torque rescale / friction ate, which the open-loop constant force
+    # could never see (systematic apex undershoot).  Cold start from
+    # stand: E_now ~ 0 -> deficit is maximal -> full push from the very
+    # first tick (no vz-proportional pump to wait for).
+    # "const": the original FB-SLIP v2 open-loop constant force.
+    fbslip_push_mode: str = "energy"     # "energy" | "const"
+    # Deficit gain [N/J].  CASE2026 energy_comp_kp = 12 carried over:
+    # at the bottom of a 0.07 m hop (deficit ~ 7 J at m=6.7) the push
+    # starts at m*g_st + ~84 N ~ 133 N -- same scale as the old
+    # constant force -- and tapers to m*g_st as the energy converges.
+    fbslip_push_energy_kp: float = 12.0
+    # F_push *= clip(x_z / fade, 0, 1): linear roll-off of the push to
+    # ZERO over the last centimeters of extension (x_z = l0 - h_com).
+    # Applied AFTER the blend LPF -- the fade is deterministic in
+    # position and must not be smeared by the blend, or 40+ N is still
+    # on the foot at liftoff (sim).
+    fbslip_push_ext_fade_m: float = 0.015
+    # Velocity-lag compensation horizon [s]: the energy estimate uses
+    #   vz_pred = vz_f + a_cmd * lag,  a_cmd = F_applied/m - g_st
+    # (the commanded acceleration is KNOWN, so the estimator group
+    # delay -- 20 ms stance vz LPF + kinematic pipeline -- can be
+    # compensated exactly).  Without it the deficit stays open ~50 ms
+    # too long each push and the apex DIVERGES hop-over-hop (1D sim:
+    # 7 cm target -> 35 cm runaway; with lag comp: bounded 8-9.5 cm
+    # for estimator delays anywhere in 0-50 ms).  Overcompensation is
+    # safe: if the force collapses early the deficit re-opens and the
+    # regulator brings it back (self-correcting, no stall latch).
+    fbslip_push_vz_lag_s: float = 0.05
     # 2026-08-02 (2): 2200 -> 1800 per user -- moderate the leg force
     # again; the compression deceleration the softer spring gives up is
     # picked up by the prop collective (the NRC residual above
@@ -691,7 +747,15 @@ class ModeEConfig:
     # cap rides for a few ticks and the per-hop apex trim absorbs the
     # clipped energy; the Raibert neutral point T_st/2 re-times itself
     # from this knob automatically.
-    nrc_k_n_m: float = 3200.0            # virtual spring stiffness [N/m]
+    # 2026-08-03 (log 013037): 3200 -> 1600.  At k=3200 the spring
+    # equilibrium x_eq = m*g_st/k ≈ 1.5 cm sits BELOW the TD preload
+    # (~2.1 cm from the contact threshold), so F_spring > weight the
+    # instant stance starts -- first hop never compresses ("没压下去"),
+    # then short flights + trim ratchet → fake-hop chatter.  k=1600
+    # puts x_eq ≈ 3.0 cm above the TD preload so gravity can sink the
+    # body ~1 cm before the spring catches; T_st ~ pi*sqrt(m/k) grows
+    # only to ~0.20 s.
+    nrc_k_n_m: float = 1000.0            # virtual spring stiffness [N/m]
     # 2026-08-02 history: 400 -> 150 -> 350.  At 400 with no other
     # protection, the ~25-50 ms vz-estimate lag made the pump keep
     # firing past the target (log 073212: 0.15 m hops on a 0.07 m
@@ -716,8 +780,44 @@ class ModeEConfig:
     # doubles the per-stroke injection so the stand-start escapes in
     # 1-2 pumps; the 20 ms vz LPF + extension fade + apex trim absorb
     # the extra noise/overshoot that killed 350 before.
-    nrc_kR: float = 300.0                # norm-regulation gain [1/(m*s)]
+    # 2026-08-03: 300 -> 150.  The cold-start escape that forced 300 is
+    # now owned by the deficit feedforward (nrc_deficit_kp below), so
+    # the pump can run at the low-noise gain again (noise gain
+    # 2*m*kR*om*|r-r*| halves; the f_ref jitter fix of log 115132).
+    nrc_kR: float = 150.0                # norm-regulation gain [1/(m*s)]
     nrc_bz: float = 8.0                  # virtual damping [N*s/m]
+    # ---- Robust-NRC augmentation 1: known-input lag compensation ----
+    # (2026-08-03) The pump coordinate x2 = vz/om and the deficit gate
+    # use  vz_pred = vz_f + INTEGRAL of the COMMANDED acceleration over
+    # the last nrc_vz_lag_s seconds  (a_cmd = F_applied/m - g_st, kept
+    # in a ring buffer).  The estimate vz_f is ~one group delay stale
+    # (20 ms stance vz LPF + kinematic pipeline); the force we applied
+    # over that window is our own KNOWN input, so the missing velocity
+    # increment can be reconstructed exactly.  NOT the constant-force
+    # extrapolation vz + a*lag: during the catch the force changes by
+    # 200+ N inside one horizon and that extrapolation flips the sign
+    # of x2 mid-compression (sim: apex ran away to 15.7 cm).  With the
+    # history integral the sim converges to 7.1 cm on a 7.0 cm target
+    # (vanilla NRC under the same 50 ms estimator: 9.3 cm, +33%).
+    # This is what turned lag into apex overshoot before (log 073212:
+    # 0.15 m hops on a 0.07 m setpoint -- the pump kept firing ~50 ms
+    # past the target).  0 disables (vanilla NRC).
+    nrc_vz_lag_s: float = 0.05
+    # ---- Robust-NRC augmentation 2: norm-deficit feedforward ----
+    # (2026-08-03) F_def = kp * 0.5*k*max(0, r*^2 - r^2), applied only
+    # while moving UP (one-sided, CASE2026-style energy compensation
+    # expressed in NRC's own norm coordinates: 0.5*k*(r*^2 - r^2) IS
+    # the energy gap to the limit cycle in Joules).  It fixes the two
+    # structural failures of the pure pump:
+    #  - cold start: pump ~ vz is ZERO at rest, so a stand-start could
+    #    only grow oscillations slowly and stalled (log 231912, 4 mm
+    #    short of liftoff, then 20-44 N dribble forever);
+    #  - late-stroke force vacuum: spring -> 0 at l0 and the faded pump
+    #    left the last cm of the stroke unpowered.
+    # On the limit cycle r = r* -> the term VANISHES, so the base
+    # paper's convergence analysis is preserved.  Shares the pump's
+    # extension fade.  0 disables.
+    nrc_deficit_kp: float = 12.0         # [N/J]
     # Pump extension fade [m]: F_pump *= clip((l0 - h_com)/fade, 0, 1).
     # Energy injection belongs to the mid-stroke; the last few cm before
     # liftoff are exactly where estimator lag turns residual pumping into
@@ -1326,6 +1426,8 @@ class ModeECore:
         self._fb_trav_plan: float = 0.0     # planned max travel [m]
         self._fb_xz_max: float = 0.0        # deepest x_z this stance [m]
         self._fb_push_f: float = 0.0        # latched constant push force [N]
+        self._fb_push_vto: float = 0.0      # latched takeoff speed [m/s]
+        self._fb_push_f_last: float = 0.0   # applied push force, prev tick [N]
         self._fb_fcomp_lpf: float | None = None
         # RB gamepad big-jump request (armed until consumed at a PUSH latch).
         self._big_jump_pending: bool = False
@@ -1335,6 +1437,14 @@ class ModeECore:
         self._nrc_r: float = 0.0
         self._nrc_r_star: float = 0.0
         self._nrc_f_des: float = 0.0
+        # Applied world-Z stance force, previous tick (leg + prop
+        # residual) -- the KNOWN input for the vz lag compensation.
+        self._nrc_f_last: float = 0.0
+        # Ring buffer of commanded accel (a_cmd = F/m - g_st) over the
+        # nrc_vz_lag_s horizon; its integral is the velocity increment
+        # the delayed estimate has not seen yet.
+        self._nrc_a_hist: list[float] = []
+        self._nrc_hist_td: float = -1.0
         # Per-hop apex return-map trim on the NRC height target
         # (see nrc_apex_trim_gain): h_tgt_eff = hop_height * trim.
         self._nrc_h_trim: float = 1.0
@@ -1550,6 +1660,8 @@ class ModeECore:
         self._fb_trav_plan = 0.0
         self._fb_xz_max = 0.0
         self._fb_push_f = 0.0
+        self._fb_push_vto = 0.0
+        self._fb_push_f_last = 0.0
         self._fb_fcomp_lpf = None
         self._prop_rev_on = False
         self._prop_att_scale = 1.0
@@ -1564,6 +1676,9 @@ class ModeECore:
         self._nrc_r = 0.0
         self._nrc_r_star = 0.0
         self._nrc_f_des = 0.0
+        self._nrc_f_last = 0.0
+        self._nrc_a_hist = []
+        self._nrc_hist_td = -1.0
         self._nrc_h_trim = 1.0
         self._eta_skip_once = False
         self._kw_obs_w[:] = 0.0
@@ -2524,18 +2639,32 @@ class ModeECore:
         apex_evt = False
 
         # ===== Hopper4-style phase machine =====
-        # Use only leg-length thresholds + minimum phase duration:
-        #   Flight -> Stance: q_shift <= -td_threshold
-        #   Stance -> Flight: q_shift >= +lo_threshold
+        # Flight -> Stance: q_shift <= -td_threshold AND min flight time
+        #   AND descending (vz_up <= td_vz_max) -- see hopper4_td_vz_max.
+        # Stance -> Flight: q_shift >= +lo_threshold AND min stance time.
         phase_min_steps = int(max(1, int(getattr(self.cfg, "hopper4_phase_min_steps", 10))))
         phase_min_t = float(phase_min_steps) * float(self.dt)
         td_thr = float(max(0.0, float(getattr(self.cfg, "hopper4_td_threshold_m", 0.02))))
         lo_thr = float(max(0.0, float(getattr(self.cfg, "hopper4_lo_threshold_m", 0.01))))
+        td_vz_max = float(getattr(self.cfg, "hopper4_td_vz_max_mps", 0.0))
 
         if (not bool(self._stance)) and np.isfinite(float(q_shift)):
             lo_t = float(self._lo_t) if self._lo_t is not None else 0.0
             t_in_flight = float(self.sim_time) - lo_t
-            cond_td = (float(q_shift) <= -td_thr) and (t_in_flight >= phase_min_t)
+            # World-up velocity (same sign as vz_up elsewhere).  Uninit
+            # estimate → 0 so stand-start TD is not blocked.
+            vz_up_gate = (
+                -float(self._v_hat_w[2])
+                if bool(self._v_hat_inited) else 0.0
+            )
+            cond_td = (
+                (float(q_shift) <= -td_thr)
+                and (t_in_flight >= phase_min_t)
+                and (
+                    td_vz_max <= 0.0
+                    or float(vz_up_gate) <= float(td_vz_max)
+                )
+            )
 
             if bool(cond_td):
                 touchdown_evt = True
@@ -2587,13 +2716,26 @@ class ModeECore:
                         and float(prev_stance_s) > _stance_max_td
                     )
                     if T_fl < 0.12:
-                        # Chatter/failed hop (see the ANTI-RATCHET note at
-                        # nrc_trim_stance_max_s): no usable apex, but the
-                        # hop demonstrably failed -- recover the trim by
-                        # one clipped step so the map is a two-way
-                        # contraction instead of a downward ratchet.
+                        # Short flight: TWO opposite failure modes.
+                        #  (a) STUCK (prev stance long): true miss —
+                        #      bump trim UP so the next stroke injects
+                        #      more energy (the original ANTI-RATCHET).
+                        #  (b) CHATTER (prev stance also short, log
+                        #      013037): fake hops with wild vz.  Bumping
+                        #      trim here ratcheted 1.0→1.6 in 3 hops,
+                        #      nrc_f_des exploded to 2000+ N and tau
+                        #      pegged 9 Nm.  FREEZE the trim on chatter.
+                        _stuck = bool(
+                            prev_stance_s is not None
+                            and float(prev_stance_s) > 0.25
+                        )
+                        _chatter = bool(
+                            prev_stance_s is not None
+                            and float(prev_stance_s) < 0.08
+                        )
                         if (_nrc_on_td and _trim_gain_td > 0.0
-                                and _trim_eclip_td > 0.0):
+                                and _trim_eclip_td > 0.0
+                                and _stuck and (not _chatter)):
                             self._nrc_h_trim = float(_clipf(
                                 float(self._nrc_h_trim)
                                 + _trim_gain_td * _trim_eclip_td,
@@ -2797,6 +2939,7 @@ class ModeECore:
                         ))
                         self._fb_xz_max = 0.0
                         self._fb_push_f = 0.0
+                        self._fb_push_f_last = 0.0
                         self._fb_fcomp_lpf = None
                     except Exception:
                         self._fb_s_tgt = float(getattr(
@@ -3629,7 +3772,49 @@ class ModeECore:
                     )
                     v_to_n = float(np.sqrt(2.0 * g_up * h_tgt_n))
                     x1_n = (float(h_com) - l0) + (m * g_st / k_nrc)
-                    x2_n = float(vz_f) / om_n
+                    # Robust-NRC aug 1: known-input lag compensation.
+                    # vz_pred = vz_f + integral of the COMMANDED accel
+                    # over the estimator group delay (ring buffer; see
+                    # the nrc_vz_lag_s config block -- NOT a constant-
+                    # force extrapolation).
+                    lag_n = float(max(0.0, float(getattr(
+                        self.cfg, "nrc_vz_lag_s", 0.0
+                    ))))
+                    n_hist = int(round(lag_n / float(max(
+                        1e-4, self.dt
+                    ))))
+                    td_key = (
+                        float(self._td_t)
+                        if self._td_t is not None else -1.0
+                    )
+                    if (float(self._nrc_hist_td) != td_key
+                            or len(self._nrc_a_hist) != n_hist):
+                        # New stance (or horizon change).  Real ballistic
+                        # flights seed a = -g_st; cold-start / chatter
+                        # (no usable prior flight) seed 0 -- seeding
+                        # -g_st from stand injected a fake vz ≈ -0.36
+                        # and made the pump EXTRACT during first COMP
+                        # (log 013037: energy_comp = -24 N at TD).
+                        self._nrc_hist_td = td_key
+                        t_fl_seed = (
+                            float(self._td_t) - float(self._lo_t)
+                            if (self._td_t is not None
+                                and self._lo_t is not None)
+                            else 0.0
+                        )
+                        a_seed = (
+                            -g_st if t_fl_seed >= 0.12 else 0.0
+                        )
+                        self._nrc_a_hist = [a_seed] * n_hist
+                    vz_n = float(vz_f) + (
+                        float(np.sum(self._nrc_a_hist)) * float(self.dt)
+                        if n_hist > 0 else 0.0
+                    )
+                    # Bound the compensated vz used by the pump /
+                    # deficit: chatter hops saw |vz| > 5 m/s and
+                    # nrc_f_des > 2000 N (log 013037 hop4-5).
+                    vz_n = float(_clipf(vz_n, -2.5, 2.5))
+                    x2_n = float(vz_n) / om_n
                     r_n = float(np.hypot(x1_n, x2_n))
                     r_star_n = float(np.hypot(
                         m * g_st / k_nrc, v_to_n / om_n
@@ -3647,15 +3832,34 @@ class ModeECore:
                     x_fade = float(getattr(
                         self.cfg, "nrc_pump_ext_fade_m", 0.0
                     ))
+                    ext_fade_n = 1.0
                     if x_fade > 1e-6:
-                        f_pump_n *= float(_clipf(
+                        ext_fade_n = float(_clipf(
                             (l0 - float(h_com)) / x_fade, 0.0, 1.0
                         ))
+                    f_pump_n *= ext_fade_n
+                    # Robust-NRC aug 2: norm-deficit feedforward.
+                    # 0.5*k*(r*^2 - r^2) is the energy gap to the limit
+                    # cycle; inject proportionally while moving UP.
+                    # Vanishes on the cycle (see nrc_deficit_kp config).
+                    kp_def_n = float(max(0.0, float(getattr(
+                        self.cfg, "nrc_deficit_kp", 0.0
+                    ))))
+                    f_def_n = 0.0
+                    if kp_def_n > 0.0 and vz_n > 0.0:
+                        e_gap_n = 0.5 * k_nrc * float(max(
+                            0.0,
+                            r_star_n * r_star_n - r_n * r_n,
+                        ))
+                        f_def_n = (
+                            kp_def_n * e_gap_n * ext_fade_n
+                        )
                     f_des_n = (
                         k_nrc * (l0 - float(h_com))
                         - float(max(0.0, float(self.cfg.nrc_bz)))
                         * float(vz_f)
                         + f_pump_n
+                        + f_def_n
                     )
                     # ---- split the demand: leg first, props take the rest ----
                     # The split point is the LEG's real authority
@@ -3697,12 +3901,22 @@ class ModeECore:
                                 self.cfg, "prop_energy_push_scale", 1.0
                             )), 0.0, 1.0))
                         self._prop_energy_fz = float(pe)
-                    energy_comp_fz = float(f_pump_n)
+                    energy_comp_fz = float(f_pump_n + f_def_n)
                     self._nrc_r = r_n
                     self._nrc_r_star = r_star_n
                     # Total stance demand before the leg/prop split: compare
                     # against f_ref_w2 + prop_energy_fz to see the split.
                     self._nrc_f_des = float(f_des_n)
+                    # Applied world-Z force this tick (leg + prop
+                    # residual) -- feeds the lag-comp ring buffer.
+                    self._nrc_f_last = float(
+                        f_nrc_leg + float(self._prop_energy_fz)
+                    )
+                    if len(self._nrc_a_hist) > 0:
+                        self._nrc_a_hist.append(
+                            float(self._nrc_f_last) / m - g_st
+                        )
+                        self._nrc_a_hist.pop(0)
 
                 # PUSH latch on the FILTERED world-Z velocity: the body
                 # has passed the bottom when vz turns positive.
@@ -3850,6 +4064,7 @@ class ModeECore:
                                 + m * v_to * v_to / (2.0 * x0),
                                 cap_fb,
                             ))
+                            self._fb_push_vto = float(v_to)
                             self._mode1_x0 = x0
                             # Blend starts from the compression force
                             # but NEVER from above the push target
@@ -3858,8 +4073,64 @@ class ModeECore:
                                 max(0.0, f_recv),
                                 float(self._fb_push_f),
                             ))
+                            # Seed the lag-comp force memory with the
+                            # force actually on the foot right now.
+                            self._fb_push_f_last = float(
+                                self._mode1_boost_f_state
+                            )
                     if bool(self._mode1_push_latched):
-                        # PUSH: latched constant force, open loop.
+                        push_mode = str(getattr(
+                            self.cfg, "fbslip_push_mode", "const"
+                        )).lower()
+                        if push_mode == "energy":
+                            # PUSH: SRB energy-deficit regulation (CASE
+                            # 2026 style, spring-free).  Re-evaluated
+                            # every tick: force = weight support + kp *
+                            # remaining energy deficit, faded to ZERO
+                            # over the last cm of extension.  See the
+                            # fbslip_push_mode config block.
+                            x0_p = float(max(0.01, float(
+                                self._mode1_x0
+                            )))
+                            v_to_p = float(self._fb_push_vto)
+                            e_tgt = (
+                                0.5 * m * v_to_p * v_to_p
+                                + m * g_st * x0_p
+                            )
+                            # Lag-compensated upward speed: extrapolate
+                            # the filtered estimate forward by the
+                            # KNOWN commanded acceleration over the
+                            # estimator group delay (see the
+                            # fbslip_push_vz_lag_s config block --
+                            # without this the deficit stays open too
+                            # long and the apex diverges hop-over-hop).
+                            lag_s = float(max(0.0, float(getattr(
+                                self.cfg,
+                                "fbslip_push_vz_lag_s", 0.0,
+                            ))))
+                            a_pred = (
+                                float(self._fb_push_f_last) / m - g_st
+                            )
+                            # Downward speed is NOT progress toward
+                            # liftoff -- only count upward KE.
+                            vz_up_p = float(max(
+                                0.0, float(vz_f) + a_pred * lag_s
+                            ))
+                            e_now = (
+                                0.5 * m * vz_up_p * vz_up_p
+                                + m * g_st
+                                * float(max(0.0, x0_p - x_z))
+                            )
+                            kp_e = float(max(0.0, float(
+                                self.cfg.fbslip_push_energy_kp
+                            )))
+                            f_push_tgt = float(_clipf(
+                                m * g_st + kp_e * (e_tgt - e_now),
+                                0.0, cap_fb,
+                            ))
+                        else:
+                            # PUSH: latched constant force, open loop.
+                            f_push_tgt = float(self._fb_push_f)
                         tau_blend = float(max(0.0, float(
                             self.cfg.stance_push_blend_tau_s
                         )))
@@ -3872,10 +4143,24 @@ class ModeECore:
                             ))
                         )
                         self._mode1_boost_f_state += a_blend * (
-                            float(self._fb_push_f)
+                            float(f_push_tgt)
                             - float(self._mode1_boost_f_state)
                         )
                         f_fb = float(self._mode1_boost_f_state)
+                        if push_mode == "energy":
+                            # Extension fade POST-blend: deterministic
+                            # in position, rolls the WHOLE push to zero
+                            # at full extension so the leg is unloaded
+                            # exactly at liftoff (no ground sticking).
+                            fade_m = float(getattr(
+                                self.cfg,
+                                "fbslip_push_ext_fade_m", 0.0,
+                            ))
+                            if fade_m > 1e-6:
+                                f_fb *= float(_clipf(
+                                    x_z / fade_m, 0.0, 1.0
+                                ))
+                        self._fb_push_f_last = float(f_fb)
                         energy_comp_fz = float(max(
                             0.0, f_fb - m * g_st
                         ))

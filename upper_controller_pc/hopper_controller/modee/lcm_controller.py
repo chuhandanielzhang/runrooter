@@ -218,7 +218,7 @@ class ModeELCMConfig:
     # - Setting this > 0 helps reduce flight-phase jitter/oscillation, because it dissipates energy using
     #   the motor's own high-rate velocity estimate (not the Python/Lcm qd).
     # - Applied per-phase (FLIGHT vs STANCE) so you can add a small amount in stance too.
-    ak60_flight_damp_kd: float = 0.0
+    ak60_flight_damp_kd: float = 0.1
     # 2026-07-19 stance anti-jitter: small motor-side damping using the
     # driver's own high-rate velocity (much cleaner than the ~230 Hz LCM qd).
     ak60_stance_damp_kd: float = 0
