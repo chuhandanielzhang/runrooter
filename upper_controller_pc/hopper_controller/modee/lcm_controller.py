@@ -129,7 +129,8 @@ class ModeELCMConfig:
     # ModeE as a prop_*_base_thrust_ratio override, so the allocator
     # differentiates attitude moments AROUND the support and any arm may dip
     # below 1600 when a moment needs it. Same window, same total lift.
-    hop_prop_base_pwm_us: float = 1600.0
+    # 2026-08-03: 1600 -> 1500 (user: propeller 1500 怠速, 只负责姿态).
+    hop_prop_base_pwm_us: float = 1500.0
     # TEMP: RT path legs-only bring-up. When True, RT never arms props and never
     # drives RM (+11.5->0). Flip back to False once the P4 leg hold looks good.
     rt_leg_only_no_prop_rm: bool = False
@@ -168,7 +169,8 @@ class ModeELCMConfig:
     # While RM unfolds in RT-STAND, force EVERY mapped prop motor to this
     # PWM (2026-07-24 07:15: 1500; 07:21: 1600 each).  P4 place still uses
     # switch_rb_prop_base_pwm_us (1200).
-    switch_rt_stand_prop_pwm_us: float = 1600.0
+    # 2026-08-03: 1600 -> 1500 to match idle-only prop mode.
+    switch_rt_stand_prop_pwm_us: float = 1500.0
     # SLIP-style loaded stand (2026-07-24 07:24 user: "PD加大 一定要像slip
     # 那样撑起来").  Log 071232 showed the leg sagging ~2 cm during the RM
     # unfold: the stand reused the FLIGHT swing gains (kp_z 1300 N/m, no

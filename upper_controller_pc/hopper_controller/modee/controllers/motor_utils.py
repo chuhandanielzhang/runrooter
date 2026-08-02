@@ -43,7 +43,7 @@ class MotorTableModel:
         torque_nm_bp: np.ndarray | None = None,
         tau_per_thrust: float | None = None,
         pwm_min_us: float = 1000.0,
-        pwm_max_us: float = 2000.0,
+        pwm_max_us: float = 1950.0,
     ):
         self.pwm_us_bp = np.asarray(pwm_us_bp, dtype=float).reshape(-1)
         self.thrust_n_bp = np.asarray(thrust_n_bp, dtype=float).reshape(-1)

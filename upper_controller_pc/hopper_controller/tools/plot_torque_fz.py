@@ -57,19 +57,44 @@ def main() -> None:
     ax1.legend(ncol=4, fontsize=8, loc="upper right")
     ax1.set_title(f"Motor Torque and Vertical Force vs Time — {src.name}")
 
-    ax2.plot(t, x["f_ref_w2"], color="black", lw=1.4, label="Fz reference")
+    # Leg Fz only (f_ref is capped at nrc_leg_fz_max; prop residual is
+    # NOT folded back into f_ref -- see prop_energy_fz / thrust_sum).
+    ax2.plot(t, x["f_ref_w2"], color="black", lw=1.4, label="leg Fz cmd (f_ref)")
     ax2.plot(t, x["f_contact_w2"], color="tab:purple", lw=1.0, alpha=0.8,
-             label="Fz allocated/contact")
-    ax2.axhline(230.1, color="crimson", ls=":", lw=1.4,
-                label="Fz budget 3.5mg ≈ 230 N")
+             label="leg Fz contact")
+    if "prop_energy_fz" in x.columns:
+        ax2.plot(t, x["prop_energy_fz"], color="tab:green", lw=1.2,
+                 label="prop Fz residual (energy)")
+    # Delivered prop collective (sum of 3 arm thrusts) -- what the body
+    # actually feels from the props on the world vertical (upright).
+    if all(c in x.columns for c in ("thrust0", "thrust1", "thrust2")):
+        tsum = (
+            x["thrust0"].to_numpy(dtype=float)
+            + x["thrust1"].to_numpy(dtype=float)
+            + x["thrust2"].to_numpy(dtype=float)
+        )
+        ax2.plot(t, tsum, color="tab:red", lw=1.0, ls="--", alpha=0.85,
+                 label="prop thrust_sum (delivered)")
+        if "prop_energy_fz" in x.columns:
+            ax2.plot(
+                t,
+                x["f_ref_w2"].to_numpy(dtype=float)
+                + x["prop_energy_fz"].to_numpy(dtype=float),
+                color="gray", lw=1.0, ls=":", alpha=0.9,
+                label="leg+prop Fz cmd",
+            )
+    ax2.axhline(70.0, color="tab:blue", ls=":", lw=1.2,
+                label="leg Fz ceiling 70 N")
+    ax2.axhline(230.1, color="crimson", ls=":", lw=1.0, alpha=0.6,
+                label="design F_max 3.5mg ≈ 230 N")
     ax2.set_ylabel("Vertical force Fz (N)")
     ax2.grid(True, alpha=0.25)
 
-    # Active prop channels are pwm1/2/3 (one per arm).
+    # Active prop channels are pwm1/2/3 (one per arm; pwm0/4/5 idle).
     for i, c in zip((1, 2, 3), colors):
         ax3.plot(t, x[f"pwm{i}"], color=c, lw=1.2, label=f"Prop arm {i} PWM")
-    ax3.axhline(1700, color="crimson", ls=":", lw=1.2, label="PUSH base 1700 us")
-    ax3.axhline(1100, color="gray", ls=":", lw=1.2, label="flight base 1100 us")
+    ax3.axhline(1950, color="crimson", ls=":", lw=1.2, label="PWM max 1950 us")
+    ax3.axhline(1250, color="gray", ls=":", lw=1.2, label="~idle base")
     ax3.set_ylabel("Prop PWM (us)")
     ax3.set_ylim(975, 2050)
     ax3.grid(True, alpha=0.25)
