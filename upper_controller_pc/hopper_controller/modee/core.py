@@ -433,7 +433,7 @@ class ModeEConfig:
     qd_ema_lambda: float = 0.4
 
     # Flight placement (classic Raibert) / swing PD.
-    flight_kv: float = 0.14
+    flight_kv: float = 0.17
     flight_kr: float = 0.09
     flight_stepper_lim_m: float = 0.13
     swing_kp_xy: float = 60.0
@@ -697,7 +697,11 @@ class ModeEConfig:
     att_accel_weight: float = -0.01
     att_stance_bound_lo: int = 90
     att_stance_bound_hi: int = 130
-    vel_push_tail_n: int = 20
+    # Stance XY velocity buffer length (samples).  Sized to cover a full
+    # stance (~0.4 s at 500 Hz); the estimate is the per-axis MEDIAN of
+    # the samples collected this stance (robust to leg chatter / omega
+    # spikes).  Flight XY is seeded from that same median at liftoff.
+    vel_push_tail_n: int = 250
 
     # Motor command limits.
     tau_cmd_max_nm: tuple[float, float, float] = (40.0, 40.0, 40.0)
@@ -1029,10 +1033,11 @@ class ModeECore:
         # MATLAB-style EMA on CAN-reported qd (qd_ema_lambda).
         self._qd_ema = np.zeros(3, dtype=float)
         self._qd_ema_init: bool = False
-        # Flight-phase XY velocity latched at liftoff (push tail mean).
+        # Flight-phase XY velocity seeded at liftoff from stance median.
         self._flight_vel = np.zeros(3, dtype=float)
-        # Per-stance push-phase ring buffer (last N samples for XY velocity).
-        _tail_n = int(max(1, int(getattr(self.cfg, "vel_push_tail_n", 10))))
+        # Per-stance ring of leg-kinematics velocity samples; the running
+        # per-axis MEDIAN is the stance XY estimate (see vel_push_tail_n).
+        _tail_n = int(max(1, int(getattr(self.cfg, "vel_push_tail_n", 250))))
         self._vel_push_tail_n = _tail_n
         self._push_vel_ring = np.zeros((_tail_n, 3), dtype=float)
         self._push_vel_ring_i: int = 0
@@ -1907,16 +1912,21 @@ class ModeECore:
         x = float(_clipf(float(x), 0.0, 1.0))
         return float(x * x * (3.0 - 2.0 * x))
 
-    def _push_vel_tail_mean(self) -> np.ndarray | None:
-        """Mean of the last vel_push_tail_n stance leg-kinematics samples
-        (MATLAB avg_foot_vel/pos rolling window; used only for flight_vel)."""
+    def _stance_vel_median(self) -> np.ndarray | None:
+        """Per-axis median of stance-phase leg-kinematics velocity samples.
+
+        Covers the samples collected since the last touchdown (up to
+        vel_push_tail_n).  Used as the stance XY estimate and as the
+        flight XY seed at liftoff -- median rejects the +- spikes from
+        leg vibration / omega x r that polluted the old rolling mean.
+        """
         n = int(self._push_vel_ring_cnt)
         if n <= 0:
             return None
         cap = int(self._vel_push_tail_n)
         if n < cap:
-            return np.mean(self._push_vel_ring[:n, :], axis=0)
-        return np.mean(self._push_vel_ring, axis=0)
+            return np.median(self._push_vel_ring[:n, :], axis=0)
+        return np.median(self._push_vel_ring, axis=0)
 
     def _init_unified_stance_profile(
         self,
@@ -2358,7 +2368,7 @@ class ModeECore:
 
                 # latch TD shift for compression measurement
                 self._q_shift_td = float(q_shift)
-                # Re-seed push-phase velocity ring (COMP samples excluded).
+                # Re-seed stance velocity ring (whole-stance median).
                 self._push_vel_ring[:] = 0.0
                 self._push_vel_ring_i = 0
                 self._push_vel_ring_cnt = 0
@@ -2428,11 +2438,11 @@ class ModeECore:
                 liftoff_evt = True
                 self._stance = False
                 self._lo_t = float(self.sim_time)
-                # Latch flight XY.
-                # MATLAB-style last-N stance mean; instantaneous LO fallback.
-                v_push_tail = self._push_vel_tail_mean()
-                if v_push_tail is not None:
-                    v_latch = np.asarray(v_push_tail, dtype=float).reshape(3)
+                # Latch flight XY from the WHOLE-stance median (same
+                # estimator used during stance). Instantaneous LO fallback.
+                v_st_med = self._stance_vel_median()
+                if v_st_med is not None:
+                    v_latch = np.asarray(v_st_med, dtype=float).reshape(3)
                 elif np.all(np.isfinite(v_base_from_foot_w)):
                     v_latch = v_base_from_foot_w.reshape(3).astype(float)
                 else:
@@ -2453,8 +2463,10 @@ class ModeECore:
                 self._apex_reached = False
 
         # ===== Body velocity =====
-        # XY: planted-foot odometry in stance, last-N mean latched at liftoff.
-        # Z: stance leg odometry, flight IMU integration.
+        # XY stance: per-axis MEDIAN of this stance's planted-foot odometry
+        # (whole stance, not instantaneous / not last-N mean).  Latched as
+        # the flight seed at liftoff.  Z: instantaneous stance odometry /
+        # flight IMU integration (NRC needs a responsive vz).
         g_w = np.array([0.0, 0.0, float(self.gravity)], dtype=float)  # +Z DOWN
         if np.all(np.isfinite(imu_acc_b)):
             a_w = (R_wb_hat @ imu_acc_b.reshape(3) + g_w.reshape(3)).reshape(3)
@@ -2466,21 +2478,27 @@ class ModeECore:
             self._v_hat_w[:] = 0.0
         elif bool(self._stance):
             if np.all(np.isfinite(v_base_from_foot_w)):
-                self._v_hat_w[0] = float(v_base_from_foot_w[0])
-                self._v_hat_w[1] = float(v_base_from_foot_w[1])
-                self._v_hat_w[2] = float(v_base_from_foot_w[2])
                 i = int(self._push_vel_ring_i)
                 self._push_vel_ring[i, :] = v_base_from_foot_w.reshape(3).astype(float)
                 self._push_vel_ring_i = (i + 1) % int(self._vel_push_tail_n)
                 self._push_vel_ring_cnt = min(
                     int(self._push_vel_ring_cnt) + 1, int(self._vel_push_tail_n)
                 )
+                v_med = self._stance_vel_median()
+                if v_med is not None:
+                    self._v_hat_w[0] = float(v_med[0])
+                    self._v_hat_w[1] = float(v_med[1])
+                else:
+                    self._v_hat_w[0] = float(v_base_from_foot_w[0])
+                    self._v_hat_w[1] = float(v_base_from_foot_w[1])
+                # Z stays instantaneous -- median would lag the NRC pump.
+                self._v_hat_w[2] = float(v_base_from_foot_w[2])
             else:
                 self._v_hat_w[2] = float(vz_pred)
         else:
             # FLIGHT XY: IMU dead-reckoning from the liftoff latch (2026-08-01,
             # user: "空中的速度不能锁存...不然空中只会保持一种姿态").  The
-            # latched last-N stance mean is the INITIAL CONDITION only; each
+            # latched stance MEDIAN is the INITIAL CONDITION only; each
             # flight tick propagates with the world specific force
             #     v_xy += (R*a_b + g)_xy * dt,
             # so prop braking (the PogoX tilt below) actually shows up in the
