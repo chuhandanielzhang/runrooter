@@ -384,6 +384,8 @@ class ModeEConfig:
     #   deadbeat at gamma = 1 (Koditschek-Buehler / Saranli energy
     #   regulation).
     use_energy_compensation: bool = True
+    # MATLAB stance_phase_ODE.m ke: F += ke*(E_des - E) while vz > 0.
+    energy_comp_kp: float = 12.0
     # 2026-08-02 (log 112743): 0.07 -> 0.12.  A 7 cm target sits at the
     # ground-chatter floor (flight ~0.24 s; with the trim floor the
     # effective target could fall to 2.8 cm -> vz_lo ~0.7 m/s, barely
@@ -643,13 +645,15 @@ class ModeEConfig:
     #   prop_energy_max_ratio   -> prop collective ceiling (x m*g)
     #   prop_height_kh          -> flight apex-error gain (0 = leg only)
     #   prop_energy_apex_fade_vz-> ascent force rolls to 0 at apex
-    # 2026-08-03 per user "改成 NRC 我要reference它": back to the NRC
-    # continuous law (Lo/Chu/Au, ACC 2020) as the CITABLE base, with two
-    # augmentations grafted onto NRC's own norm coordinates (see the
-    # nrc_vz_lag_s / nrc_deficit_kp blocks): the limit-cycle analysis of
-    # the base paper is untouched because both terms vanish on the
-    # cycle.  hop_height_m stays the ONE height knob.
-    stance_energy_law: str = "nrc"       # "fbslip" | "nrc" | "mode1"
+    # 2026-08-03 per user "腿部改成最朴实的和 matlab一样的 srb energy
+    # height": plain virtual spring + energy-height compensation from
+    # Documents/.../stance_phase_ODE.m (no NRC pump, no FB-SLIP latch).
+    #   F = -k*(l - l0)
+    #   if vz > 0: F += ke*(E_des - E)
+    #   E_des = 1/2 m |v_des|^2 + m g h_des
+    #   E     = 1/2 m |v|^2 + 1/2 k (l-l0)^2 + m g z
+    # hop_height_m is the ONE height knob (h_des = l0 + hop_height_m).
+    stance_energy_law: str = "matlab"    # "matlab" | "fbslip" | "nrc" | "mode1"
     # ===== FB-SLIP stance (port of 37a1475, 2026-08-02 per user
     # "37a1475 stancephase改成这个") =====
     # The stance law that hopped reliably on 2026-07-25/26.  Three parts:
@@ -3758,7 +3762,61 @@ class ModeECore:
                 )).lower()
                 nrc_on = (_law == "nrc")
                 fb_on = (_law == "fbslip")
+                matlab_on = (_law == "matlab")
                 f_nrc_leg = 0.0
+                f_matlab = 0.0
+                if matlab_on:
+                    # ===== MATLAB SRB energy-height (stance_phase_ODE.m) =====
+                    # Exactly the Chuhan hopping MATLAB law -- virtual
+                    # spring on leg length, energy compensation only
+                    # while the body is moving UP.  No bottom latch, no
+                    # pump, no deficit feedforward.
+                    self._prop_energy_fz = 0.0
+                    k_s = float(max(1.0, float(self.cfg.stance_kp_z)))
+                    ke = float(max(0.0, float(getattr(
+                        self.cfg, "energy_comp_kp", 12.0
+                    ))))
+                    dl = float(l_leg - l0)          # (l - l0); <0 compressed
+                    v_w = np.asarray(
+                        self._v_hat_w, dtype=float
+                    ).reshape(3)
+                    # Desired horizontal velocity (MATLAB v_desired from
+                    # position servo; here Raibert / joystick target).
+                    v_des = np.array([
+                        float(desired_v_xy_w[0]),
+                        float(desired_v_xy_w[1]),
+                        0.0,
+                    ], dtype=float)
+                    h_des = float(
+                        l0 + max(0.0, float(self.cfg.hop_height_m))
+                    )
+                    # PE uses body height above the planted foot (MATLAB
+                    # robot_pos(3) with foot at contact).
+                    E_des = (
+                        0.5 * m * float(np.dot(v_des, v_des))
+                        + m * g * h_des
+                    )
+                    E_now = (
+                        0.5 * m * float(np.dot(v_w, v_w))
+                        + 0.5 * k_s * dl * dl
+                        + m * g * float(h_com)
+                    )
+                    f_e = ke * (E_des - E_now)
+                    # MATLAB: spring_force = -k*(l-l0); positive scalar
+                    # pushes the body away from the foot (= our +Fz).
+                    f_s = -k_s * dl
+                    if (
+                        float(vz_up) > 0.0
+                        and bool(getattr(
+                            self.cfg, "use_energy_compensation", True
+                        ))
+                    ):
+                        f_s = f_s + f_e
+                        energy_comp_fz = float(f_e)
+                    else:
+                        energy_comp_fz = 0.0
+                    f_matlab = float(_clipf(f_s, 0.0, fz_cap))
+
                 if nrc_on:
                     k_nrc = float(max(1.0, float(self.cfg.nrc_k_n_m)))
                     om_n = float(np.sqrt(k_nrc / m))
@@ -4221,7 +4279,7 @@ class ModeECore:
                         )))
                     ):
                         self._mode1_push_latched = True
-                        latch_evt = not nrc_on
+                        latch_evt = (not nrc_on) and (not matlab_on)
 
                 if latch_evt:
                     # Push spring: released work from the current depth
@@ -4297,12 +4355,16 @@ class ModeECore:
                     self._mode1_boost_f_state = float(max(0.0, f_comp))
 
                 compress_active = not bool(self._mode1_push_latched)
-                energy_gate = (not nrc_on) and (not fb_on) and bool(
-                    self._mode1_push_latched
-                ) and bool(
-                    getattr(self.cfg, "use_energy_compensation", True)
+                energy_gate = (
+                    (not nrc_on) and (not fb_on) and (not matlab_on)
+                    and bool(self._mode1_push_latched)
+                    and bool(getattr(
+                        self.cfg, "use_energy_compensation", True
+                    ))
                 )
-                if nrc_on:
+                if matlab_on:
+                    springForce_scalar = float(f_matlab)
+                elif nrc_on:
                     springForce_scalar = float(f_nrc_leg)
                 elif fb_on:
                     springForce_scalar = float(f_fb)
@@ -4375,7 +4437,7 @@ class ModeECore:
                 # Exception -- Mode1 legacy: its f_ref was historically the
                 # total spring; keep that A/B path unchanged.
                 if (
-                    (not fb_on) and (not nrc_on)
+                    (not fb_on) and (not nrc_on) and (not matlab_on)
                     and bool(getattr(
                         self.cfg, "prop_energy_supplement_enable", False
                     ))
