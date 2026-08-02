@@ -69,9 +69,10 @@ class ModeELCMConfig:
     # - tau_out_scale: multiply final motor torques by this factor before sending (e.g. 0.1 for bring-up)
     # - tau_out_max_nm: absolute per-joint max torque sent to hardware (Nm); applied after scaling
     tau_out_scale: float = 1.0
-    # Default to a conservative output torque cap for bring-up safety.
-    # Increase gradually (e.g., 2, 3, 5...) as confidence grows.
-    tau_out_max_nm: float | None = 30
+    # 2026-08-02: 30 -> 9 = the real motor limit.  ModeECore now caps at
+    # 9 Nm internally (proportional + prop residual), so this output-side
+    # limiter is a pure backstop that should never bind.
+    tau_out_max_nm: float | None = 9
     # SAFE flag:
     # - If triggered, we request hopper_driver to enter DAMP (same as pressing B),
     #   and pause the Python controller loop for a few seconds.
@@ -215,10 +216,10 @@ class ModeELCMConfig:
     # - Setting this > 0 helps reduce flight-phase jitter/oscillation, because it dissipates energy using
     #   the motor's own high-rate velocity estimate (not the Python/Lcm qd).
     # - Applied per-phase (FLIGHT vs STANCE) so you can add a small amount in stance too.
-    ak60_flight_damp_kd: float = 0.1
+    ak60_flight_damp_kd: float = 0.0
     # 2026-07-19 stance anti-jitter: small motor-side damping using the
     # driver's own high-rate velocity (much cleaner than the ~230 Hz LCM qd).
-    ak60_stance_damp_kd: float = 0.1
+    ak60_stance_damp_kd: float = 0
 
     # ===== Command shaping / demo mode =====
     # To keep the hop process smooth, we rate-limit the commanded desired velocity.
@@ -1300,7 +1301,9 @@ class ModeELCMController:
                 "nrc_r_star",
                 "nrc_f_des",
                 "nrc_h_trim",
+                "mode1_Eloss_j",
                 "fl_ev_xy",
+                "fl_tilt_cmd_deg",
                 "fl_lat_force_n",
                 "prop_energy_fz",
                 "thrust_sum_ref",
@@ -1317,6 +1320,26 @@ class ModeELCMController:
                 "tau_total_w0",
                 "tau_total_w1",
                 "tau_total_w2",
+                # Stance attitude split (HFA debug): desired, leg target,
+                # leg delivered, prop residual, and utilization.
+                "tau_b_att_des0",
+                "tau_b_att_des1",
+                "tau_b_att_des2",
+                "tau_b_leg_des0",
+                "tau_b_leg_des1",
+                "tau_b_leg_des2",
+                "tau_b_leg_act0",
+                "tau_b_leg_act1",
+                "tau_b_leg_act2",
+                "tau_b_res_des0",
+                "tau_b_res_des1",
+                "tau_b_res_des2",
+                "tau_b_att_des_xy_norm",
+                "tau_b_leg_des_xy_norm",
+                "tau_props_xy_norm",
+                "leg_att_share",
+                "tau_cap_scale",
+                "prop_fz_assist_n",
                 # apex / takeoff debug
                 "z_apex_actual_m",
                 "v_to_cmd_m_s",
@@ -1681,7 +1704,9 @@ class ModeELCMController:
             nrc_r_star = float(info.get("nrc_r_star", float("nan")))
             nrc_f_des = float(info.get("nrc_f_des", float("nan")))
             nrc_h_trim = float(info.get("nrc_h_trim", float("nan")))
+            mode1_Eloss_j = float(info.get("mode1_Eloss_j", float("nan")))
             fl_ev_xy = float(info.get("fl_ev_xy", float("nan")))
+            fl_tilt_cmd_deg = float(info.get("fl_tilt_cmd_deg", float("nan")))
             fl_lat_force_n = float(info.get("fl_lat_force_n", float("nan")))
             prop_energy_fz = float(info.get("prop_energy_fz", float("nan")))
             thrust_sum_ref = float(info.get("thrust_sum_ref", float("nan")))
@@ -1853,7 +1878,9 @@ class ModeELCMController:
                 float(nrc_r_star),
                 float(nrc_f_des),
                 float(nrc_h_trim),
+                float(mode1_Eloss_j),
                 float(fl_ev_xy),
+                float(fl_tilt_cmd_deg),
                 float(fl_lat_force_n),
                 float(prop_energy_fz),
                 float(thrust_sum_ref),
@@ -1870,6 +1897,25 @@ class ModeELCMController:
                 float(tau_total_w[0]),
                 float(tau_total_w[1]),
                 float(tau_total_w[2]),
+                # Stance attitude split debug (full body-frame vectors).
+                float(info.get("tau_b_att_des0", float("nan"))),
+                float(info.get("tau_b_att_des1", float("nan"))),
+                float(info.get("tau_b_att_des2", float("nan"))),
+                float(info.get("tau_b_leg_des0", float("nan"))),
+                float(info.get("tau_b_leg_des1", float("nan"))),
+                float(info.get("tau_b_leg_des2", float("nan"))),
+                float(info.get("tau_b_leg_act0", float("nan"))),
+                float(info.get("tau_b_leg_act1", float("nan"))),
+                float(info.get("tau_b_leg_act2", float("nan"))),
+                float(info.get("tau_b_res_des0", float("nan"))),
+                float(info.get("tau_b_res_des1", float("nan"))),
+                float(info.get("tau_b_res_des2", float("nan"))),
+                float(info.get("tau_b_att_des_xy_norm", float("nan"))),
+                float(info.get("tau_b_leg_des_xy_norm", float("nan"))),
+                float(info.get("tau_props_xy_norm", float("nan"))),
+                float(info.get("leg_att_share", float("nan"))),
+                float(info.get("tau_cap_scale", float("nan"))),
+                float(info.get("prop_fz_assist_n", float("nan"))),
                 float(z_apex_actual_m),
                 float(v_to_cmd_m_s),
                 float(desired_vz_from_apex_m_s),

@@ -41,8 +41,8 @@ def main() -> None:
     t0 = float(x["t_s"].iloc[0])
     t = x["t_s"].to_numpy() - t0
 
-    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(
-        5, 1, figsize=(14, 17), sharex=True, constrained_layout=True
+    fig, (ax1, ax2, ax3, ax4, ax5, ax6, ax7) = plt.subplots(
+        7, 1, figsize=(14, 23), sharex=True, constrained_layout=True
     )
     colors = ["tab:blue", "tab:orange", "tab:green"]
     for i, c in enumerate(colors):
@@ -107,11 +107,39 @@ def main() -> None:
                  alpha=0.7, label="vy_des")
     ax5.axhline(0.0, color="gray", ls=":", lw=1.0)
     ax5.set_ylabel("XY velocity (m/s)")
-    ax5.set_xlabel(f"Time since {t0:.3f} s (s)")
     ax5.grid(True, alpha=0.25)
     ax5.legend(ncol=4, fontsize=8, loc="upper right")
 
+    # Body attitude (estimator roll/pitch; yaw is free and not plotted).
+    roll_deg = np.degrees(x["rpy_hat_roll"].to_numpy(dtype=float))
+    pitch_deg = np.degrees(x["rpy_hat_pitch"].to_numpy(dtype=float))
+    ax6.plot(t, roll_deg, color="tab:blue", lw=1.2, label="roll")
+    ax6.plot(t, pitch_deg, color="tab:orange", lw=1.2, label="pitch")
+    if "fl_tilt_cmd_deg" in x.columns:
+        ax6.plot(t, x["fl_tilt_cmd_deg"], color="tab:green", lw=1.0, ls="--",
+                 alpha=0.8, label="fl_tilt_cmd")
+    ax6.axhline(0.0, color="gray", ls=":", lw=1.0)
+    ax6.set_ylabel("Body attitude (deg)")
+    ax6.grid(True, alpha=0.25)
+    ax6.legend(ncol=3, fontsize=8, loc="upper right")
+
+    # Foot placement: desired (Raibert) vs actual foot position in world XYZ.
+    # Note: foot_b is body FRD; foot_des_w and foot_des_b are logged as well.
+    ax7.set_title("Foot placement: desired vs actual (world XYZ, cm)")
+    for i, (comp, c) in enumerate(zip(["x", "y", "z"], colors)):
+        ax7.plot(t, x[f"foot_b{i}"] * 100.0, color=c, lw=1.2,
+                 label=f"foot_{comp} actual (body)")
+        if f"foot_des_w{i}" in x.columns:
+            ax7.plot(t, x[f"foot_des_w{i}"] * 100.0, color=c, lw=1.0,
+                     ls="--", alpha=0.75, label=f"foot_{comp} des (world)")
+    ax7.axhline(0.0, color="gray", ls=":", lw=1.0)
+    ax7.set_ylabel("Foot pos (cm)")
+    ax7.set_xlabel(f"Time since {t0:.3f} s (s)")
+    ax7.grid(True, alpha=0.25)
+    ax7.legend(ncol=3, fontsize=7, loc="upper right")
+
     phase = x["phase"].astype(str).to_numpy()
+    axes = (ax1, ax2, ax3, ax4, ax5, ax6, ax7)
     for label, face, alpha in [
         ("STANCE:COMP", "royalblue", 0.08),
         ("STANCE:PUSH", "darkorange", 0.10),
@@ -120,12 +148,11 @@ def main() -> None:
         starts = np.flatnonzero(mask & ~np.r_[False, mask[:-1]])
         ends = np.flatnonzero(mask & ~np.r_[mask[1:], False])
         for a, b in zip(starts, ends):
-            ax1.axvspan(t[a], t[b], color=face, alpha=alpha, lw=0)
-            ax2.axvspan(t[a], t[b], color=face, alpha=alpha, lw=0,
-                        label=label if a == starts[0] else None)
-            ax3.axvspan(t[a], t[b], color=face, alpha=alpha, lw=0)
-            ax4.axvspan(t[a], t[b], color=face, alpha=alpha, lw=0)
-            ax5.axvspan(t[a], t[b], color=face, alpha=alpha, lw=0)
+            for ax in axes:
+                ax.axvspan(
+                    t[a], t[b], color=face, alpha=alpha, lw=0,
+                    label=(label if (ax is ax2 and a == starts[0]) else None),
+                )
 
     handles, labels = ax2.get_legend_handles_labels()
     seen, H, L = set(), [], []
