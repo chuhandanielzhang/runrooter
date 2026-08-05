@@ -368,15 +368,16 @@ class ModeEConfig:
     pogox_seed_weight_frac: float = 0.4     # 静止种子支撑重量比
     pogox_min_spring_frac: float = 0.5      # 负泵最多把弹簧削到这个比例
     pogox_lo_taper_m: float = 0.015         # 离地前最后这段力→0
-    # ---- 泵抖动抑制 (2026-08-05, log 200745) ----
-    # f_ref_z 每 tick 跳 ~12 N (p95 60 N, 主频 250 Hz)：vz_ax 是 500 Hz
-    # 差分编码器速度，20 ms 一阶滤波压不住，再乘 2*m*kr*|r-r*| 被放大。
-    # 泵专用 vz 滤波时间常数（只影响 _px_vz_ax，不动 mode1/nrc 的
-    # stance_vz_lpf_tau_s）。
+    # ---- 泵平滑：只靠模型输入滤波，不硬切泵输出 ----
+    # 泵专用 vz 滤波时间常数（只影响 _px_vz_ax）。平滑来自输入，
+    # 这样泵项是物理律的直接结果，hop_height 旋钮才能线性兑现。
     pogox_vz_ax_lpf_tau_s: float = 0.03
-    # 泵项斜率限幅 (N/s)：2000 N/s = 每 tick(2ms) ±4 N。只限泵项，
-    # 弹簧项 k_v*x 不受限，TD 冲击响应不变。
-    pogox_pump_slew_nps: float = 2000.0
+    # 泵项斜率限幅 (N/s)：0 = 关闭。硬切会把能量注入掐死在自设
+    # 墙上（log 205009: 64% tick 顶着 ±4 N），破坏单一旋钮。保留
+    # 参数只作诊断开关，默认不开。
+    pogox_pump_slew_nps: float = 0.0
+    # ---- 每跳 apex 回授（冷启动 trim，避免前几跳必然偏低）----
+    nrc_apex_trim_init: float = 1.4
     # ---- Raibert 落点（水平速度收敛，靠落脚，不靠倾斜）----
     flight_kv: float = 0.13                 # 速度误差反馈 [m/(m/s)]
     flight_stepper_lim_m: float = 0.18      # |foot_xy| 上限
@@ -910,7 +911,12 @@ class ModeEConfig:
     # feasibility line, so the trim can never command a hop the leg
     # cannot physically separate from.
     nrc_apex_trim_min: float = 0.7
-    nrc_apex_trim_max: float = 1.6
+    # 2026-08-05 (log 205009): 1.6 -> 2.5.  With hop_height=5 cm the
+    # trim pinned at 1.6 from hop 4 onward while measured apex stuck at
+    # 3-4.5 cm -- that self-imposed ceiling was the height wall.  2.5
+    # leaves headroom for the return map to keep lifting h* until the
+    # knobs actually deliver; err_clip still bounds each hop step.
+    nrc_apex_trim_max: float = 2.5
     # Per-hop clip on the RELATIVE apex error fed to the trim (0 = off).
     # 2026-08-02: the first hop-off transient apexes at 0.01-0.03 m (-70%
     # error) and one gain=0.5 step yanked trim to ~1.35 -> hop 2 overshot
@@ -1525,7 +1531,13 @@ class ModeECore:
         self._nrc_f_des: float = 0.0
         # Per-hop apex return-map trim on the NRC height target
         # (see nrc_apex_trim_gain): h_tgt_eff = hop_height * trim.
-        self._nrc_h_trim: float = 1.0
+        # Start above 1.0 so cold-start hops are not forced low while
+        # the return map climbs (nrc_apex_trim_init).
+        self._nrc_h_trim: float = float(_clipf(
+            float(getattr(self.cfg, "nrc_apex_trim_init", 1.0)),
+            float(self.cfg.nrc_apex_trim_min),
+            float(self.cfg.nrc_apex_trim_max),
+        ))
         # Runtime compat: lcm_controller sets this after the RT transition so
         # the first-flight apex/eta estimate skips one corrupted arc.
         self._eta_skip_once: bool = False
@@ -1757,7 +1769,11 @@ class ModeECore:
         self._nrc_r = 0.0
         self._nrc_r_star = 0.0
         self._nrc_f_des = 0.0
-        self._nrc_h_trim = 1.0
+        self._nrc_h_trim = float(_clipf(
+            float(getattr(self.cfg, "nrc_apex_trim_init", 1.0)),
+            float(self.cfg.nrc_apex_trim_min),
+            float(self.cfg.nrc_apex_trim_max),
+        ))
         self._eta_skip_once = False
         self._kw_obs_w[:] = 0.0
         self._kw_obs_tau_prev[:] = 0.0
@@ -4120,12 +4136,12 @@ class ModeECore:
                             f_pump_px,
                             -(1.0 - beta_px) * k_v * x_leg_px,
                         ))
-                        # Slew limit ON THE PUMP TERM ONLY (see
-                        # pogox_pump_slew_nps): residual vz noise makes the
-                        # pump chatter +-12 N per 2 ms tick; the spring term
-                        # k_v*x stays unlimited so the TD impact response is
-                        # untouched.  2000 N/s tracks every real transient
-                        # (the slack floor itself moves < 500 N/s).
+                        # Optional pump slew (pogox_pump_slew_nps): default
+                        # OFF.  Hard-cutting the pump pinned energy inject
+                        # on a self-imposed wall (log 205009: 64% of stance
+                        # ticks at ±4 N) and broke the single hop_height
+                        # knob.  Smoothness comes from the vz LPF on the
+                        # pump INPUT, not from clipping the OUTPUT.
                         slew_px = float(max(0.0, float(getattr(
                             self.cfg, "pogox_pump_slew_nps", 0.0
                         ))))
