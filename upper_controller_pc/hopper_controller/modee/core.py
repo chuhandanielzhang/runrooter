@@ -388,11 +388,15 @@ class ModeEConfig:
     # ---- ★ 姿态收敛速度开关（飞行水平速度 → fl_tilt）----
     # False = 只调平，不倾斜刹水平速度（推荐先关着调跳高）
     # True  = 开 fl_tilt，用桨矢量刹 v_xy
-    flight_vel_ctrl_enable: bool = False
+    flight_vel_ctrl_enable: bool = True
     flight_vel_kv: float = 0.5              # 开了才生效：阻尼带宽 [1/s]
     flight_vel_tilt_max_deg: float = 10.0
     flight_vel_tilt_slew_dps: float = 180.0
     flight_level_settle_s: float = 0.03
+    # 只在 [离地, apex] 段刹速度；apex 后按 slew 平滑回 0，落地必然是平的。
+    # apex 是 vz 变号直接观测到的，不像 flight_level_settle_s 的落地预算依赖
+    # t_td 预测（预测偏大时 tilt 会一路顶到触地，然后被 stance 复位阶跃清零）。
+    flight_vel_apex_only: bool = True
     # ---- 桨怠速（姿态差动的底座）----
     # Idle PWM 1200: T≈2.7 N → ratio≈0.0491 @ m=5.61
     prop_base_thrust_ratio: float = 0.0491
@@ -3520,6 +3524,20 @@ class ModeECore:
                 ang_tgt = min(t_max_r, math.atan2(f_n_raw, f_z_up))
                 tilt_tgt = (f_xy_raw / f_n_raw) * ang_tgt
             else:
+                tilt_tgt = np.zeros(2, dtype=float)
+            # ASCENT-ONLY gate (flight_vel_apex_only): damp velocity from
+            # liftoff to apex, then command level so the slew limiter walks
+            # the lean out over the descent.  The landing budget above is
+            # PREDICTION-based (t_td from the previous hop's airtime), and
+            # when the prediction ran long the lean sat at the 10 deg cap
+            # right up to contact -- the stance branch then zeroed the slew
+            # state, stepping R_des by 10 deg exactly at touchdown (log
+            # 004804 TD2, body already 4.8 deg off and still rotating).
+            # Apex is a DIRECTLY OBSERVED event (vz sign change), so the
+            # ramp-down always starts in time: 10 deg at 180 deg/s takes
+            # 55 ms while the descent is half the airtime (~100 ms at 5 cm).
+            if (bool(getattr(self.cfg, "flight_vel_apex_only", True))
+                    and bool(self._apex_reached)):
                 tilt_tgt = np.zeros(2, dtype=float)
             slew_r = math.radians(slew_dps_fl) * float(self.dt)
             d_tl = tilt_tgt - self._fl_tilt_vec
