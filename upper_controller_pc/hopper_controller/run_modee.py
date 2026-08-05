@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import signal
 import threading
 import time
 
@@ -346,6 +347,15 @@ Examples:
     ctrl_thread = threading.Thread(target=ctl.run_controller, daemon=False)
     lcm_thread.start()
     ctrl_thread.start()
+
+    # systemd stop sends SIGTERM; Python's default action would kill the process
+    # WITHOUT running the finally block below, i.e. without the zero-output /
+    # remote-DAMP frames from run_controller's shutdown path. Convert it to the
+    # same clean-exit path as Ctrl-C.
+    def _sigterm(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _sigterm)
 
     try:
         while True:

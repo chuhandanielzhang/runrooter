@@ -77,8 +77,8 @@ class ModeELCMConfig:
     # - If triggered, we request hopper_driver to enter DAMP (same as pressing B),
     #   and pause the Python controller loop for a few seconds.
     safe_rp_deg: float = 50.0
-    safe_q_min: float = -0.8553   # -49 deg (normal mechanical retract limit)
-    safe_q_max: float = 1.4835  # +85 deg (mechanical extend limit; matches kAk60LcmQOffsetRad)
+    safe_q_min: float = -1.06     # CASE: retract limit (with kAk60LcmQOffsetRad=-60 deg)
+    safe_q_max: float = 1.38      # CASE: extend limit (with kAk60LcmQOffsetRad=-60 deg)
     # Whole-robot gait switch:
     # - OFF/DAMP + LT: no actuator motion; current RM pose is labeled q=+11.5
     #   and MOBILE is selected.
@@ -111,7 +111,7 @@ class ModeELCMConfig:
     switch_rb_tau_max_nm: float = 1.0       # RT leg torque cap (Nm)
     switch_rb_pushdelay_s: float = 1.0      # stand this long, then enter hopping (push)
     # First hop out of RT: temporarily override leg_l0_m so the spring push
-    # extends toward full leg (~0.554 m at AK60 setZero / q_lcm=1.4835).
+    # extends toward full leg (~0.554 m at AK60 setZero / q_lcm≈-1.047).
     # Restored at the first liftoff. 2026-07-24 03:52: 0.53 -> 0.54 (~1.4 cm
     # margin below full extension; stroke from 0.47 stand ~= 7 cm).
     switch_rb_first_hop_l0_m: float = 0.54
@@ -129,8 +129,8 @@ class ModeELCMConfig:
     # ModeE as a prop_*_base_thrust_ratio override, so the allocator
     # differentiates attitude moments AROUND the support and any arm may dip
     # below 1600 when a moment needs it. Same window, same total lift.
-    # 2026-08-03: 1600 -> 1500 (user: propeller 1500 怠速, 只负责姿态).
-    hop_prop_base_pwm_us: float = 1500.0
+    # 2026-08-03: idle -> 1200.
+    hop_prop_base_pwm_us: float = 1200.0
     # TEMP: RT path legs-only bring-up. When True, RT never arms props and never
     # drives RM (+11.5->0). Flip back to False once the P4 leg hold looks good.
     rt_leg_only_no_prop_rm: bool = False
@@ -169,8 +169,8 @@ class ModeELCMConfig:
     # While RM unfolds in RT-STAND, force EVERY mapped prop motor to this
     # PWM (2026-07-24 07:15: 1500; 07:21: 1600 each).  P4 place still uses
     # switch_rb_prop_base_pwm_us (1200).
-    # 2026-08-03: 1600 -> 1500 to match idle-only prop mode.
-    switch_rt_stand_prop_pwm_us: float = 1500.0
+    # Match hop idle 1200.
+    switch_rt_stand_prop_pwm_us: float = 1200.0
     # SLIP-style loaded stand (2026-07-24 07:24 user: "PD加大 一定要像slip
     # 那样撑起来").  Log 071232 showed the leg sagging ~2 cm during the RM
     # unfold: the stand reused the FLIGHT swing gains (kp_z 1300 N/m, no
@@ -218,7 +218,7 @@ class ModeELCMConfig:
     # - Setting this > 0 helps reduce flight-phase jitter/oscillation, because it dissipates energy using
     #   the motor's own high-rate velocity estimate (not the Python/Lcm qd).
     # - Applied per-phase (FLIGHT vs STANCE) so you can add a small amount in stance too.
-    ak60_flight_damp_kd: float = 0.1
+    ak60_flight_damp_kd: float = 0.08
     # 2026-07-19 stance anti-jitter: small motor-side damping using the
     # driver's own high-rate velocity (much cleaner than the ~230 Hz LCM qd).
     ak60_stance_damp_kd: float = 0
@@ -268,18 +268,22 @@ class ModeELCMConfig:
     rm_hopping_hold: bool = True
     rm_hold_iq_max_a: float = 2.0        # |current| cap for the station hold (A)
 
-    # ===== MOBILE: kiwi drive, 3 hub-motor wheels at 120 deg ================
+    # ===== MOBILE: kiwi drive, 3x RM M2006/C610 at 120 deg ================
     # Chassis (top view, body +x forward): the wheels sit evenly spaced on
-    # a circle of radius wheel_base_radius_m, each hub axis pointing at the
+    # a circle of radius wheel_base_radius_m, each wheel axis pointing at the
     # chassis center, so wheel i drives along the tangent
     #   t_i = (-sin(az_i), +cos(az_i))
     # and side slip rides on the omni rollers. Inverse kinematics from the
     # body twist (vx, vy [m/s], wz [rad/s, CCW+ seen from above]):
     #   v_i     = -sin(az_i)*vx + cos(az_i)*vy + R*wz     (rim speed, m/s)
     #   omega_i = sign_i * v_i / r_wheel                   (rad/s, to LCM)
+    # Upper layer still publishes wheel_cmd_lcmt.speed_des_rad_s as OUTPUT
+    # shaft / wheel rad/s. Jetson RmWheelController closes a local speed PI
+    # and talks C610 current on can1 (IDs 1..3). Folding-arm M2006s remain
+    # on Pixhawk and are unrelated to this bus.
     wheel_azimuth_deg: tuple = (0.0, 120.0, 240.0)
     wheel_base_radius_m: float = 0.20    # center -> wheel contact point
-    wheel_radius_m: float = 0.05         # hub wheel rolling radius
+    wheel_radius_m: float = 0.05         # rolling radius (re-measure after hub swap)
     # Per-wheel sign to absorb wiring/mounting direction; calibrate with an
     # on-robot spin test (same procedure as the prop mapping).
     wheel_dir_sign: tuple = (1.0, 1.0, 1.0)
@@ -288,9 +292,9 @@ class ModeELCMConfig:
     # scales the whole twist uniformly so the direction is preserved.
     mobile_v_max_mps: float = 0.8
     mobile_wz_max_rad_s: float = 1.5
-    # DM-H6215: rated 120 rpm = 12.6 rad/s, no-load 320 rpm = 33.5 rad/s.
-    # Cap between the two -- brief transients above rated are fine, sustained
-    # driving should stay near it (drop mobile_v_max_mps if wheels run hot).
+    # Output-shaft cap after the M2006 36:1 gearbox. 25 rad/s ~ 239 rpm
+    # shaft / ~8600 rpm rotor -- brief peaks ok, sustained driving should
+    # stay near continuous rating (drop mobile_v_max_mps if wheels run hot).
     wheel_speed_max_rad_s: float = 25.0
 
 
@@ -574,6 +578,19 @@ class ModeELCMController:
             self._rm_zero_until = 0.0
             if int(self._mode_est) != DAMP:
                 self._mode_est = DAMP
+            # Hard-stop props on the B edge instead of waiting for the
+            # remainder of this control tick (including core.step).  force=True
+            # bypasses the soft-start limiter and also resets its previous-PWM
+            # state to the stop point.  The normal end-of-tick publication sends
+            # another OFF frame for best-effort UDP redundancy.
+            pwm_stop = np.full(
+                6, float(self.modee_cfg.pwm_min_us), dtype=float
+            )
+            self._publish_motor_pwm(
+                pwm_stop,
+                control_mode=int(self.lcm_cfg.prop_ctrl_mode_off),
+                force=True,
+            )
             print("[prop] OFF (B) -> legs DAMP + props stop (control_mode=%d)"
                   % int(self.lcm_cfg.prop_ctrl_mode_off))
         elif bool(x_now) and (not bool(self._mode_last_x)) and (int(self._mode_est) != PD):
@@ -1103,9 +1120,16 @@ class ModeELCMController:
             pwm_min = float(self.modee_cfg.pwm_min_us)
         except Exception:
             pwm_min = 1000.0
+        # Clear the latched RM current so the zeroed hopper_cmd does not carry
+        # a stale nonzero rm_iq_des out with it.
+        try:
+            self._rm_iq_des = np.zeros(3, dtype=float)
+        except Exception:
+            pass
         for _ in range(5):
             try:
                 self._publish_hopper_cmd(np.zeros(3, dtype=float))
+                self._publish_wheel_cmd(np.zeros(3, dtype=float), enable=False)
                 self._publish_motor_pwm(np.full(6, pwm_min, dtype=float), control_mode=-1, force=True)
             except Exception:
                 break

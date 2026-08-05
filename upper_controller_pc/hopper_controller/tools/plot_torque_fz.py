@@ -41,8 +41,8 @@ def main() -> None:
     t0 = float(x["t_s"].iloc[0])
     t = x["t_s"].to_numpy() - t0
 
-    fig, (ax1, ax2, ax3, ax4, ax5, ax6, ax7) = plt.subplots(
-        7, 1, figsize=(14, 23), sharex=True, constrained_layout=True
+    fig, (ax1, axF, ax2, ax3, ax4, ax5, ax6, axA, ax7) = plt.subplots(
+        9, 1, figsize=(14, 29), sharex=True, constrained_layout=True
     )
     colors = ["tab:blue", "tab:orange", "tab:green"]
     for i, c in enumerate(colors):
@@ -55,39 +55,71 @@ def main() -> None:
     ax1.set_ylim(-11.5, 11.5)
     ax1.grid(True, alpha=0.25)
     ax1.legend(ncol=4, fontsize=8, loc="upper right")
-    ax1.set_title(f"Motor Torque and Vertical Force vs Time — {src.name}")
+    ax1.set_title(f"Motor Torque / Prop Force / Attitude — {src.name}")
 
-    # Leg Fz only (f_ref is capped at nrc_leg_fz_max; prop residual is
-    # NOT folded back into f_ref -- see prop_energy_fz / thrust_sum).
-    ax2.plot(t, x["f_ref_w2"], color="black", lw=1.4, label="leg Fz cmd (f_ref)")
-    ax2.plot(t, x["f_contact_w2"], color="tab:purple", lw=1.0, alpha=0.8,
-             label="leg Fz contact")
-    if "prop_energy_fz" in x.columns:
-        ax2.plot(t, x["prop_energy_fz"], color="tab:green", lw=1.2,
-                 label="prop Fz residual (energy)")
-    # Delivered prop collective (sum of 3 arm thrusts) -- what the body
-    # actually feels from the props on the world vertical (upright).
-    if all(c in x.columns for c in ("thrust0", "thrust1", "thrust2")):
-        tsum = (
-            x["thrust0"].to_numpy(dtype=float)
-            + x["thrust1"].to_numpy(dtype=float)
-            + x["thrust2"].to_numpy(dtype=float)
+    # Leg XYZ force that maps to joint torque (f_tau_delta / J^T F),
+    # plus world-frame contact / reference for stance.
+    for i, (comp, c) in enumerate(zip(["x", "y", "z"], colors)):
+        if f"f_tau_delta{i}" in x.columns:
+            axF.plot(t, x[f"f_tau_delta{i}"], color=c, lw=1.3,
+                     label=f"f_tau_{comp} (→JᵀF)")
+        if f"f_contact_w{i}" in x.columns:
+            axF.plot(t, x[f"f_contact_w{i}"], color=c, lw=1.0, ls="--",
+                     alpha=0.7, label=f"f_contact_w{comp}")
+        if f"f_ref_w{i}" in x.columns:
+            axF.plot(t, x[f"f_ref_w{i}"], color=c, lw=0.9, ls=":",
+                     alpha=0.85, label=f"f_ref_w{comp}")
+    axF.axhline(0.0, color="gray", ls=":", lw=1.0)
+    axF.set_ylabel("Leg force XYZ (N)")
+    axF.grid(True, alpha=0.25)
+    axF.legend(ncol=3, fontsize=7, loc="upper right")
+
+    # Propeller world-frame force: actual = F_total_w - f_contact_w
+    # (= z_thrust_w * thrust_sum).  Cmd = same axis * thrust_sum_ref.
+    has_prop_f = all(
+        c in x.columns
+        for c in (
+            "F_total_w0", "F_total_w1", "F_total_w2",
+            "f_contact_w0", "f_contact_w1", "f_contact_w2",
+            "thrust_sum", "thrust_sum_ref",
         )
-        ax2.plot(t, tsum, color="tab:red", lw=1.0, ls="--", alpha=0.85,
-                 label="prop thrust_sum (delivered)")
-        if "prop_energy_fz" in x.columns:
-            ax2.plot(
-                t,
-                x["f_ref_w2"].to_numpy(dtype=float)
-                + x["prop_energy_fz"].to_numpy(dtype=float),
-                color="gray", lw=1.0, ls=":", alpha=0.9,
-                label="leg+prop Fz cmd",
-            )
-    ax2.axhline(70.0, color="tab:blue", ls=":", lw=1.2,
-                label="leg Fz ceiling 70 N")
-    ax2.axhline(230.1, color="crimson", ls=":", lw=1.0, alpha=0.6,
-                label="design F_max 3.5mg ≈ 230 N")
-    ax2.set_ylabel("Vertical force Fz (N)")
+    )
+    if has_prop_f:
+        f_prop_act = np.column_stack([
+            x["F_total_w0"].to_numpy(dtype=float)
+            - x["f_contact_w0"].to_numpy(dtype=float),
+            x["F_total_w1"].to_numpy(dtype=float)
+            - x["f_contact_w1"].to_numpy(dtype=float),
+            x["F_total_w2"].to_numpy(dtype=float)
+            - x["f_contact_w2"].to_numpy(dtype=float),
+        ])
+        tsum = x["thrust_sum"].to_numpy(dtype=float)
+        tref = x["thrust_sum_ref"].to_numpy(dtype=float)
+        scale = np.divide(
+            tref, tsum,
+            out=np.zeros_like(tref),
+            where=np.abs(tsum) > 1e-6,
+        )
+        f_prop_cmd = f_prop_act * scale[:, None]
+        for i, (comp, c) in enumerate(zip(["x", "y", "z"], colors)):
+            ax2.plot(t, f_prop_cmd[:, i], color=c, lw=1.3,
+                     label=f"prop F{comp} cmd")
+            ax2.plot(t, f_prop_act[:, i], color=c, lw=1.0, ls="--",
+                     alpha=0.85, label=f"prop F{comp} actual")
+        ax2.plot(t, tref, color="black", lw=1.0, ls=":", alpha=0.7,
+                 label="thrust_sum_ref (|cmd|)")
+        ax2.plot(t, tsum, color="gray", lw=1.0, ls=":", alpha=0.7,
+                 label="thrust_sum (|actual|)")
+    else:
+        # Fallback if an older log is missing F_total_w.
+        if "thrust_sum_ref" in x.columns:
+            ax2.plot(t, x["thrust_sum_ref"], color="black", lw=1.3,
+                     label="thrust_sum_ref (cmd)")
+        if "thrust_sum" in x.columns:
+            ax2.plot(t, x["thrust_sum"], color="tab:red", lw=1.0, ls="--",
+                     label="thrust_sum (actual)")
+    ax2.axhline(0.0, color="gray", ls=":", lw=1.0)
+    ax2.set_ylabel("Prop force XYZ (N)")
     ax2.grid(True, alpha=0.25)
 
     # Active prop channels are pwm1/2/3 (one per arm; pwm0/4/5 idle).
@@ -135,18 +167,75 @@ def main() -> None:
     ax5.grid(True, alpha=0.25)
     ax5.legend(ncol=4, fontsize=8, loc="upper right")
 
-    # Body attitude (estimator roll/pitch; yaw is free and not plotted).
-    roll_deg = np.degrees(x["rpy_hat_roll"].to_numpy(dtype=float))
-    pitch_deg = np.degrees(x["rpy_hat_pitch"].to_numpy(dtype=float))
-    ax6.plot(t, roll_deg, color="tab:blue", lw=1.2, label="roll")
-    ax6.plot(t, pitch_deg, color="tab:orange", lw=1.2, label="pitch")
+    # Apex height used by the return map / height law (latched at apex).
+    if "z_apex_actual_m" in x.columns:
+        axA.plot(t, x["z_apex_actual_m"] * 100.0, color="tab:purple", lw=1.3,
+                 label="z_apex_actual (held)")
+    if "hop_height_m" in x.columns:
+        axA.plot(t, x["hop_height_m"] * 100.0, color="black", lw=1.0, ls="--",
+                 label="hop_height target")
+    apex_mask = np.zeros(len(x), dtype=bool)
+    if "apex" in x.columns:
+        apex_mask = x["apex"].fillna(0).astype(bool).to_numpy()
+    # Per-hop apex from the FLIGHT-TIME measurement (h = g*T^2/8 variant),
+    # which core.py writes into z_apex_actual_m at each touchdown. The
+    # in-flight "apex event" value comes from vz-crossing + position
+    # integration, which drifts badly (log 200745 read 5.8 cm for a real
+    # 2.5 cm hop) -- so mark the drift-free TD value at the flight midpoint.
+    if all(c in x.columns for c in ("liftoff", "touchdown", "z_apex_actual_m")):
+        za = x["z_apex_actual_m"].to_numpy(dtype=float)
+        lo_idx = np.where(x["liftoff"].fillna(0).to_numpy(dtype=float) > 0.5)[0]
+        td_idx = np.where(x["touchdown"].fillna(0).to_numpy(dtype=float) > 0.5)[0]
+        hop_t, hop_h = [], []
+        for i_lo in lo_idx:
+            nxt = td_idx[td_idx > i_lo]
+            if len(nxt) == 0:
+                continue
+            i_td = int(nxt[0])
+            # z_apex_actual_m is overwritten by the flight-time formula ON
+            # the TD row; read a row after to be safe against ordering.
+            h_cm = za[min(i_td + 1, len(za) - 1)] * 100.0
+            if np.isfinite(h_cm):
+                hop_t.append(0.5 * (t[i_lo] + t[i_td]))
+                hop_h.append(h_cm)
+        if hop_t:
+            axA.plot(hop_t, hop_h, "o", color="crimson", ms=7, zorder=5,
+                     label="apex (flight-time, per hop)")
+            for ta, ha in zip(hop_t, hop_h):
+                axA.annotate(f"{ha:.1f}", (ta, ha), textcoords="offset points",
+                             xytext=(0, 6), ha="center", fontsize=7,
+                             color="crimson")
+    axA.set_ylabel("Apex height (cm)")
+    axA.grid(True, alpha=0.25)
+    axA.legend(ncol=3, fontsize=8, loc="upper right")
+
+    # Algorithm attitude estimate (rpy_hat from R_wb_hat) — this is what
+    # attitude PD / fl_tilt / Raibert actually close on. IMU raw rpy is
+    # overlaid for comparison; apex moments marked.
+    roll_hat = np.degrees(x["rpy_hat_roll"].to_numpy(dtype=float))
+    pitch_hat = np.degrees(x["rpy_hat_pitch"].to_numpy(dtype=float))
+    ax6.plot(t, roll_hat, color="tab:blue", lw=1.3, label="roll_hat (alg)")
+    ax6.plot(t, pitch_hat, color="tab:orange", lw=1.3, label="pitch_hat (alg)")
+    if "imu_rpy_roll" in x.columns and "imu_rpy_pitch" in x.columns:
+        ax6.plot(t, np.degrees(x["imu_rpy_roll"].to_numpy(dtype=float)),
+                 color="tab:blue", lw=0.8, ls=":", alpha=0.7, label="roll_imu")
+        ax6.plot(t, np.degrees(x["imu_rpy_pitch"].to_numpy(dtype=float)),
+                 color="tab:orange", lw=0.8, ls=":", alpha=0.7, label="pitch_imu")
     if "fl_tilt_cmd_deg" in x.columns:
         ax6.plot(t, x["fl_tilt_cmd_deg"], color="tab:green", lw=1.0, ls="--",
                  alpha=0.8, label="fl_tilt_cmd")
+    if np.any(apex_mask):
+        ax6.plot(t[apex_mask], roll_hat[apex_mask], "o", color="tab:blue",
+                 ms=7, zorder=5, label="roll @ apex")
+        ax6.plot(t[apex_mask], pitch_hat[apex_mask], "o", color="tab:orange",
+                 ms=7, zorder=5, label="pitch @ apex")
+        for ta in t[apex_mask]:
+            ax6.axvline(ta, color="crimson", ls=":", lw=0.9, alpha=0.55)
+            axA.axvline(ta, color="crimson", ls=":", lw=0.9, alpha=0.55)
     ax6.axhline(0.0, color="gray", ls=":", lw=1.0)
-    ax6.set_ylabel("Body attitude (deg)")
+    ax6.set_ylabel("Attitude estimate (deg)")
     ax6.grid(True, alpha=0.25)
-    ax6.legend(ncol=3, fontsize=8, loc="upper right")
+    ax6.legend(ncol=3, fontsize=7, loc="upper right")
 
     # Foot placement: desired (Raibert) vs actual foot position in world XYZ.
     # Note: foot_b is body FRD; foot_des_w and foot_des_b are logged as well.
@@ -164,7 +253,7 @@ def main() -> None:
     ax7.legend(ncol=3, fontsize=7, loc="upper right")
 
     phase = x["phase"].astype(str).to_numpy()
-    axes = (ax1, ax2, ax3, ax4, ax5, ax6, ax7)
+    axes = (ax1, axF, ax2, ax3, ax4, ax5, ax6, axA, ax7)
     for label, face, alpha in [
         ("STANCE:COMP", "royalblue", 0.08),
         ("STANCE:PUSH", "darkorange", 0.10),
