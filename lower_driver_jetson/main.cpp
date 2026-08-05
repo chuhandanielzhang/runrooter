@@ -75,6 +75,14 @@ int main(int argc, char** argv) {
             }
             hopper_ptr->clear_motor_pwm_control_mode();
         }
+        // Link-loss failsafe: PD/PWMPD keep applying the last hopper_cmd forever
+        // unless we watch freshness. If the PC / ethernet dies mid-run, force
+        // DAMP within 200 ms (same window as the wheel cmd watchdog).
+        if ((mode == HOPPER_mode::PD || mode == HOPPER_mode::PWMPD) &&
+            !hopper_ptr->is_hopper_cmd_fresh(0.2f)) {
+            std::cout << "force DAMP (hopper_cmd stale >200ms / link loss)" << std::endl;
+            mode = HOPPER_mode::DAMP;
+        }
         if(mode == HOPPER_mode::OFF){
             hopper_ptr->step_with_only_receiving();
         }else if(mode == HOPPER_mode::DAMP){

@@ -24,7 +24,7 @@ static inline float wrap_to_pi(float a) {
 //   (2026-06-27) identity mapping {0,1,2}: LCM q0->motor 0, q1->motor 1, q2->motor 2
 static constexpr int kDeltaAk60MotorIdFromJointIdx[3] = {0, 1, 2};
 // LCM q = -motor_pos + offset. Full extension -> q_lcm = 0 when motor_pos = offset.
-static constexpr float kAk60LcmQOffsetRad = 1.4835f;  // +85 deg (reverted from +90 per user 2026-07-10)
+static constexpr float kAk60LcmQOffsetRad = -1.047f;  // -60 deg (CASE hopperHFAcase2026)
 
 HopperHardware::HopperHardware(bool is_publish_lcm_data):
         Controller2Robot("udpm://239.255.76.67:7667?ttl=255"),
@@ -123,12 +123,13 @@ HopperHardware::HopperHardware(bool is_publish_lcm_data):
             }
         }
     }
-    // MOBILE kiwi wheels: 3x DaMiao DM-H6215, velocity mode, dedicated can1.
-    // init() degrades gracefully (prints a WARN and no-ops) when the bus is
-    // not attached, so hop-only operation is unaffected.
-    wheel_controller_ptr_ = new DmWheelController();
+    // MOBILE kiwi wheels: 3x RM M2006/C610, speed PI on dedicated can1.
+    // Folding-arm M2006s stay on Pixhawk; init() degrades gracefully when
+    // can1 is missing so hop-only operation is unaffected.
+    wheel_controller_ptr_ = new RmWheelController();
     wheel_controller_ptr_->init("can1");
     std::cout << "Driver: 3x DaMiao DM4310 (can0, MIT, IDs 1-3) + Lpms IMU -> hopper_data_lcmt / hopper_imu_lcmt @ 500Hz" << std::endl;
+    std::cout << "Wheels: 3x RM M2006/C610 (can1, speed-PI current). Folding arms on Pixhawk." << std::endl;
     std::cout << "Propellers remain on Pixhawk (px4_bridge); disable px4-dds-bridge to avoid duplicate IMU." << std::endl;
     // initialize the xbox controller
     xbox_controller_ptr_ = new XboxController();
@@ -178,6 +179,14 @@ int HopperHardware::get_motor_pwm_control_mode() {
 void HopperHardware::clear_motor_pwm_control_mode() {
     std::lock_guard<std::mutex> lock(lcm_cmd_mutex);
     motor_pwm_lcmt_.control_mode = 0;
+}
+
+bool HopperHardware::is_hopper_cmd_fresh(float timeout_s) {
+    std::lock_guard<std::mutex> lock(lcm_cmd_mutex);
+    if (!hopper_cmd_seen_) return false;
+    const float age = std::chrono::duration<float>(
+        std::chrono::steady_clock::now() - hopper_cmd_rx_t_).count();
+    return age < timeout_s;
 }
 void HopperHardware::step_with_only_receiving(){
     if(step_counter== 0)
@@ -381,6 +390,8 @@ void HopperHardware::handleController2RobotLCM(const lcm::ReceiveBuffer* rbuf,
     {
         std::lock_guard<std::mutex> lock(lcm_cmd_mutex);
         memcpy(&hopper_cmd_lcmt_, msg, sizeof(hopper_cmd_lcmt));
+        hopper_cmd_rx_t_ = std::chrono::steady_clock::now();
+        hopper_cmd_seen_ = true;
     }
     // RM logical-position initialization (0 -> nonzero edge). Choose the
     // offset so the current physical shaft position reads rm_zero_at_rad:

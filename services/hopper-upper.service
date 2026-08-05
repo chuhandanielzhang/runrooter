@@ -15,7 +15,9 @@ Environment=OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_N
 # Skip numpy's __array_function__ dispatch layer (numpy 1.23 on the Jetson):
 # pure-overhead for plain ndarray code, worth ~0.2ms per 500Hz control step.
 Environment=NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
-ExecStart=/usr/bin/python3 -u run_modee.py --tau-max 1
+# No --tau-max override: use the code defaults (ModeEConfig / LcmConfig,
+# tau_out_max_nm=9) so the Jetson service behaves exactly like a PC launch.
+ExecStart=/usr/bin/python3 -u run_modee.py
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=70
 # Do NOT auto-restart: if the controller dies mid-hop we want the driver's

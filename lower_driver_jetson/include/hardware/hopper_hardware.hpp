@@ -18,7 +18,7 @@
 #include "rm_esc_data_lcmt.hpp"
 #include "wheel_cmd_lcmt.hpp"
 #include "ak60_controller.h"
-#include "dm_wheel_controller.h"
+#include "rm_wheel_controller.h"
 #include "ImuWrapper.h"
 #include "xbox_controller.hpp"
 
@@ -56,6 +56,10 @@ class HopperHardware
         // One-shot remote safety request: after main.cpp consumes a negative control_mode and forces DAMP,
         // clear the stored value so the gamepad can freely switch modes afterwards.
         void clear_motor_pwm_control_mode();
+        // True iff hopper_cmd_lcmt was received within timeout_s (default 200 ms).
+        // Used by main.cpp as a link-loss failsafe: PD/PWMPD with a stale
+        // (or never-received) upper command forces DAMP -- same as pressing B.
+        bool is_hopper_cmd_fresh(float timeout_s = 0.2f);
         // Counter to track number of steps and prevent overwhelming the system
         // Used to rate limit control loop execution
         int step_counter = 0;
@@ -79,6 +83,11 @@ class HopperHardware
                               const gamepad_lcmt* msg);
         gamepad_lcmt gamepad_cmd_lcmt_;
         hopper_cmd_lcmt hopper_cmd_lcmt_;
+        // Freshness of hopper_cmd_lcmt from the upper controller (PC). If the
+        // ethernet/LCM link drops while legs are in PD, main.cpp uses this to
+        // force DAMP so we never hold the last PD setpoint forever.
+        std::chrono::steady_clock::time_point hopper_cmd_rx_t_;
+        bool hopper_cmd_seen_ = false;
         hopper_data_lcmt hopper_data_lcmt_;
         hopper_imu_lcmt hopper_imu_lcmt_;
         // motor_pwm_lcmt is still subscribed: we only read control_mode for the
@@ -104,17 +113,19 @@ class HopperHardware
         // Publish the (gated) M2006 current command. Call once per control step:
         // enabled=true forwards rm_iq_des, enabled=false streams zero current.
         void _publish_rm_cmd(bool enabled);
-        // ---- MOBILE kiwi wheels: 3x DaMiao DM-H6215 on can1 (velocity) ----
-        // Leg-class gating, same policy as rm_iq_des: only PD/PWMPD forward
-        // wheel_cmd_lcmt (and only with msg.enable set and the command fresh
-        // within 200 ms); every other mode disables the wheels (freewheel).
+        // ---- MOBILE kiwi wheels: 3x RM M2006/C610 on can1 (speed PI) ----
+        // Replaces the DaMiao DM-H6215 hubs. Folding-arm M2006s stay on
+        // Pixhawk; these three share Jetson can1 only. Leg-class gating,
+        // same policy as rm_iq_des: only PD/PWMPD forward wheel_cmd_lcmt
+        // (and only with msg.enable set and the command fresh within
+        // 200 ms); every other mode coasts at 0 A.
         wheel_cmd_lcmt wheel_cmd_lcmt_;
         std::chrono::steady_clock::time_point wheel_cmd_rx_t_;
         bool wheel_cmd_seen_ = false;
         // Drive/disable the wheels. Call once per control step with the same
         // enabled flag as _publish_rm_cmd.
         void _update_wheels(bool enabled);
-        DmWheelController* wheel_controller_ptr_ = nullptr;
+        RmWheelController* wheel_controller_ptr_ = nullptr;
         AK60Controller* ak60_controller_ptr_ = nullptr;
         ImuWrapper* imu_wrapper_ptr_ = nullptr;
         IG1ImuDataI imu_raw_data_;

@@ -69,6 +69,7 @@ rsync -a "${SVC_SRC}/px4-bridge.service" "${SVC_SRC}/px4-dds-bridge.service" \
   "${SVC_SRC}/canable-watchdog.service" \
   "${SVC_SRC}/canable_watchdog.sh" "${SVC_SRC}/99-canable.rules" \
   "${SVC_SRC}/jetson-power.service" "${SVC_SRC}/hopper-driver.service" \
+  "${SVC_SRC}/hopper-upper.service" \
   nvidia@${JETSON_IP}:/tmp/hopper_svc/ \
   && $SSH 'sudo install -m644 /tmp/hopper_svc/*.service /etc/systemd/system/ && sudo systemctl daemon-reload \
     && sudo systemctl reenable canable2.service >/dev/null 2>&1; true' \
@@ -88,7 +89,10 @@ $SSH 'sudo install -m644 /tmp/hopper_svc/99-canable.rules /etc/udev/rules.d/ \
 # ── 3. bring up lower-layer services on Jetson ──
 say "3/4  starting lower + upper on Jetson"
 # HOPPER_UPPER (PC env) is forwarded so the heredoc can decide pc-vs-jetson upper.
-$SSH "HOPPER_UPPER='${HOPPER_UPPER:-pc}' bash -s" <<'EOF'
+# Default since 2026-08-05: BOTH layers run on the Jetson; the PC/ethernet is
+# only the launcher (start/stop hopper-upper over ssh). Set HOPPER_UPPER=pc to
+# go back to launching run_modee.py on the PC.
+$SSH "HOPPER_UPPER='${HOPPER_UPPER:-jetson}' bash -s" <<'EOF'
 need_active(){ systemctl is-active "$1" >/dev/null 2>&1 || sudo systemctl restart "$1"; }
 # Jetson multicast route MUST point at the wired NIC. After (re)boot it can land on
 # lo or the WiFi (2026-07-06: it was on lo -> LCM stayed Jetson-local, PC saw nothing).
@@ -122,6 +126,29 @@ else
   echo "   IMU: no Lpms (/dev/ttyUSB*) -> Pixhawk DDS serves IMU + props"
 fi
 sudo systemctl restart px4-dds-bridge.service
+# DDS session race (2026-08-05): restarting only the bridge gives it a fresh DDS
+# participant while PX4's uXRCE client can stay bound to the agent's old session
+# -> bridge prints "pub 0.0Hz" forever ("props keep beeping, won't connect").
+# Heal: if the bridge reports 0Hz, bounce the agent (forces PX4 client to
+# re-handshake) then the bridge, and re-check.  Only meaningful when the DDS
+# bridge serves the IMU (no Lpms); with --no-imu there are no rate lines.
+if ! ls /dev/ttyUSB* >/dev/null 2>&1; then
+  dds_ok(){ journalctl -u px4-dds-bridge -n 3 --no-pager 2>/dev/null \
+            | grep -qE 'pub +[1-9][0-9]*\.[0-9]+Hz'; }
+  sleep 4
+  if ! dds_ok; then
+    echo "   DDS 0Hz -> bouncing xrce-agent + bridge (PX4 client re-handshake)"
+    sudo systemctl restart xrce-agent.service
+    sleep 6            # PX4 uXRCE client retries its session every few seconds
+    sudo systemctl restart px4-dds-bridge.service
+    sleep 4
+  fi
+  if dds_ok; then
+    echo "   DDS IMU: OK ($(journalctl -u px4-dds-bridge -n 1 --no-pager | grep -oE 'pub +[0-9.]+Hz'))"
+  else
+    echo "   WARN: DDS IMU still 0Hz -> check TELEM2 wiring or reboot Pixhawk (scripts/reboot_pixhawk.sh)"
+  fi
+fi
 sudo systemctl restart hopper-driver.service     # disabled by default -> always start
 sleep 3
 # CAN feedback check; if motors silent, try a canable reset once (clears bus-off)
@@ -147,7 +174,7 @@ if pgrep -f 'run_modee.py' >/dev/null 2>&1; then
   pkill -9 -f 'run_modee.py' 2>/dev/null || true
   sleep 1
 fi
-if [ "${HOPPER_UPPER:-pc}" = "jetson" ]; then
+if [ "${HOPPER_UPPER:-jetson}" = "jetson" ]; then
   sudo systemctl start hopper-upper.service
   echo "   upper: Jetson service started (HOPPER_UPPER=jetson)"
 else
@@ -182,9 +209,13 @@ PY
 cat <<TXT
 
 ================ upper + lower BOTH running on Jetson ================
-Watch upper status line :  ssh nvidia@${JETSON_IP} journalctl -fu hopper-upper
-Restart upper           :  ssh nvidia@${JETSON_IP} sudo systemctl restart hopper-upper
+PC is only the launcher; network loss no longer matters mid-hop
+(upper<->lower LCM stays local on the Jetson).
+
+Start upper             :  ssh nvidia@${JETSON_IP} sudo systemctl start hopper-upper
 Stop upper              :  ssh nvidia@${JETSON_IP} sudo systemctl stop hopper-upper
+Restart upper           :  ssh nvidia@${JETSON_IP} sudo systemctl restart hopper-upper
+Watch upper status line :  ssh nvidia@${JETSON_IP} journalctl -fu hopper-upper
 Fetch CSV logs to PC    :  rsync -a nvidia@${JETSON_IP}:hopper_upper/hopper_controller/logs/ /home/abc/Hopper/robot_runtime/upper_controller_pc/hopper_controller/logs/
 Gamepad: X = enter PD mode,  A = props on,  B = full stop.
 ======================================================================
