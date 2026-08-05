@@ -379,7 +379,7 @@ class ModeEConfig:
     # ---- 每跳 apex 回授（冷启动 trim，避免前几跳必然偏低）----
     nrc_apex_trim_init: float = 1.4
     # ---- Raibert 落点（水平速度收敛，靠落脚，不靠倾斜）----
-    flight_kv: float = 0.13                 # 速度误差反馈 [m/(m/s)]
+    flight_kv: float = 0.12                 # 速度误差反馈 [m/(m/s)]
     flight_stepper_lim_m: float = 0.18      # |foot_xy| 上限
     # ---- 飞行姿态（桨调平；与速度收敛独立）----
     flight_kR: float = 40.0
@@ -3980,31 +3980,49 @@ class ModeECore:
                     # left ~70 N at q_shift≈0 when the body was tilted
                     # (log 104932), then flight swing torque reversed hard.
                     x_leg_px = float(max(0.0, -float(q_shift)))
-                    h_star = float(max(0.0, float(self.cfg.hop_height_m)))
-                    # Per-hop apex return map (shared with NRC, see
-                    # nrc_apex_trim_*): the in-stance pump regulates the
-                    # ESTIMATED cycle energy, so taper losses / vz bias land
-                    # at a biased apex every hop (log 200745: 1.9-3.4 cm vs
-                    # the 5 cm target, all 6 hops).  The trim, updated at
-                    # each touchdown from the drift-free flight-time apex,
-                    # scales the height target (and through it k_v and r*)
-                    # until the MEASURED apex matches hop_height_m.
-                    h_star *= float(_clipf(
+                    # TWO height targets, deliberately decoupled.
+                    #
+                    #   h_spring -> designs the leg spring k_v
+                    #   h_tgt    -> sets the limit-cycle target r*
+                    #
+                    # They used to be the same variable, with the apex trim
+                    # scaling both -- and that made the return map push the
+                    # WRONG WAY (log 212547: trim 1.56 -> 2.50 while apex
+                    # decayed 3.45 -> 1.79 cm).  The reason is that the
+                    # stroke-anchored spring ties omega to v*: for large v*,
+                    # k_v ~ m*v*^2/X^2, so omega ~ v*/X and v*/omega -> X, a
+                    # CONSTANT.  Raising the target therefore lifted r* by
+                    # only ~11% while stiffening the leg 54%; the stiffer leg
+                    # compressed less on the same landing speed, so each hop
+                    # stored less energy and apex fell -- a death spiral the
+                    # old trim_max=1.6 ceiling had merely been hiding.
+                    #
+                    # Anchoring k_v to the knob (plus the deliberate one-shot
+                    # boost) makes omega constant, so r* now scales properly
+                    # with the target (+39% over the same trim range) and the
+                    # feedback sign is correct.  The trim never re-stiffens
+                    # the leg.
+                    h_knob = float(max(0.0, float(self.cfg.hop_height_m)))
+                    boost_px = 1.0
+                    if bool(self._big_jump_pending):
+                        # One-shot RB boost: not a feedback loop, so it may
+                        # size the spring as well as the target.
+                        boost_px = float(max(1.0, float(
+                            self.cfg.big_jump_height_gain
+                        )))
+                    h_spring = h_knob * boost_px
+                    h_tgt = h_spring * float(_clipf(
                         float(self._nrc_h_trim),
                         float(self.cfg.nrc_apex_trim_min),
                         float(self.cfg.nrc_apex_trim_max),
                     ))
-                    if bool(self._big_jump_pending):
-                        # One-hop RB boost: taller apex target this stance.
-                        h_star *= float(max(1.0, float(
-                            self.cfg.big_jump_height_gain
-                        )))
-                    v_star = float(np.sqrt(2.0 * g_up * h_star))
+                    v_spring = float(np.sqrt(2.0 * g_up * h_spring))
+                    v_star = float(np.sqrt(2.0 * g_up * h_tgt))
                     X_str = float(max(0.02, float(
                         self.cfg.leg_stroke_max_m
                     )))
                     k_v = (
-                        (m * v_star * v_star
+                        (m * v_spring * v_spring
                          + 2.0 * m * g_st * X_str)
                         / (X_str * X_str)
                     )
