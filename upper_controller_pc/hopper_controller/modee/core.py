@@ -400,6 +400,22 @@ class ModeEConfig:
     # ---- 桨怠速（姿态差动的底座）----
     # Idle PWM 1200: T≈2.7 N → ratio≈0.0491 @ m=5.61
     prop_base_thrust_ratio: float = 0.0491
+    # ---- ★ 桨-腿高度耦合（PogoX 式，随 hop_height 旋钮自动缩放）----
+    # 腿只负责它标定过的高度份额 prop_hop_leg_height_m（5 cm 已实证：
+    # 9 Nm 饱和 23%、apex 稳定兑现）。旋钮超出的部分由桨补：
+    #     rho_hop = clip(1 - leg_h/hop_height, 0, ratio_max)
+    # 生效窗口 = PUSH 锁存起 → apex（vz 变号）止；压缩段不加
+    # （下落时加升力会抵消蓄能）。三个耦合同时成立：
+    #   1) g_up = g*(1 - base - rho_hop) 变小 → v*/k_v 不再随旋钮上涨，
+    #      腿的峰值力封顶在 5 cm 水平（不会撞 9 Nm 墙）；
+    #   2) push+上升段总推力 = rho_hop*m*g 随旋钮增长；
+    #   3) fl_tilt 的矢量推力权限 = f_z*tan(θ) 随之增长
+    #      （h*=10cm 时 ~30 N 推力 → 10° 给 5.3 N 横向 ≈ 0.2 m/s/跳，
+    #       h*=5cm 时 rho_hop=0，跟现在完全一样）。
+    # apex 飞行时间测量的 g_up 用实际上升推力比，回授层保持无偏。
+    prop_hop_couple_enable: bool = True
+    prop_hop_leg_height_m: float = 0.05
+    prop_hop_ratio_max: float = 0.5
 
     # ======================================================================
     # PRIMARY TUNING
@@ -1504,6 +1520,12 @@ class ModeECore:
         # and the DELIVERED lateral force f_z*tan(tilt) [N].
         self._fl_ev_xy: float = 0.0
         self._fl_lat_force_n: float = 0.0
+        # PogoX prop/leg height split (see prop_hop_* config): this tick's
+        # prop height share, and the TOTAL ascent thrust ratio actually
+        # flown last flight (consumed by the TD apex formula so the
+        # asymmetric-arc measurement stays unbiased when rho_hop > 0).
+        self._rho_hop: float = 0.0
+        self._rho_ascent_used: float = float(cfg.prop_base_thrust_ratio)
         # Propeller PUSH energy supplement latched for the current stance (N).
         self._prop_energy_fz: float = 0.0
         # FB-SLIP stance state (37a1475 port; sized at TD, consumed per tick).
@@ -1785,6 +1807,8 @@ class ModeECore:
         self._v_hat_inited = False
         self._prev_vz = None
         self._apex_reached = False
+        self._rho_hop = 0.0
+        self._rho_ascent_used = float(self.cfg.prop_base_thrust_ratio)
         self._z_lo = None
         self._vz_lo = None
         self._z_apex_actual = float("nan")
@@ -2860,8 +2884,13 @@ class ModeECore:
                         tilt_fl = float(_clipf(
                             -float(z_thrust_w[2]), 0.0, 1.0
                         ))
+                        # Total ascent ratio actually flown (idle base +
+                        # rho_hop height share, latched during the ascent
+                        # by the collective plan) -- NOT the config base,
+                        # otherwise the apex measurement over-reads when
+                        # the prop/leg split is active.
                         rho_up_m = (
-                            float(self.cfg.prop_base_thrust_ratio) * tilt_fl
+                            float(self._rho_ascent_used) * tilt_fl
                             if bool(self._props_armed_rt) else 0.0
                         )
                         rho_dn_m = (
@@ -3315,16 +3344,42 @@ class ModeECore:
         # Upstream: desired net wrench (F_des from f_ref, Tau from SO(3) PD).
         # Downstream: closed-form leg forces + lstsq prop thrust (no WBC-QP).
         #   f_contact_w: GRF in world frame; z_thrust_w = -R_wb[:, 2] for prop thrust direction.
-        # Collective plan (2026-08-01): PWM-1100 idle base for the WHOLE hop
-        # cycle.  The ONLY planned addition is the PUSH energy supplement,
-        # which -- unlike the leg -- persists through the flight ASCENT
-        # (props have no stroke limit) and fades out CONTINUOUSLY at apex:
-        #     F(t) = F_prop * clip(vz_up / vz_fade, 0, 1)
-        # vz_up is the physical fade variable: it reaches zero exactly AT
-        # apex, so the force rolls off with the remaining ascent -- no
-        # switch, no timer ("不要硬 cut").  Descent adds nothing.
+        # Collective plan (2026-08-05, PogoX prop/leg height split -- see
+        # the prop_hop_* config block): idle base for the whole cycle,
+        # PLUS the props' height share rho_hop*m*g over exactly the
+        # window [PUSH latch -> apex].  rho_hop derives from the SAME
+        # hop_height knob as the leg spring, so one knob moves both
+        # actuators coherently; at hop_height <= prop_hop_leg_height_m
+        # it is zero and this plan reduces to the previous idle-only one.
+        # Compression adds nothing (extra lift would fight energy
+        # storage); descent keeps the existing brake logic.
+        rho_hop = 0.0
+        if (bool(getattr(self.cfg, "prop_hop_couple_enable", False))
+                and bool(self._props_armed_rt)):
+            _h_leg_cap = float(max(1e-3, float(getattr(
+                self.cfg, "prop_hop_leg_height_m", 0.05
+            ))))
+            _h_knob_rh = float(max(0.0, float(self.cfg.hop_height_m)))
+            if _h_knob_rh > _h_leg_cap:
+                rho_hop = float(_clipf(
+                    1.0 - _h_leg_cap / _h_knob_rh,
+                    0.0,
+                    float(_clipf(
+                        float(getattr(
+                            self.cfg, "prop_hop_ratio_max", 0.5
+                        )),
+                        0.0, 0.8,
+                    )),
+                ))
+        self._rho_hop = float(rho_hop)
+        rho_hop_active = 0.0
         if bool(self._stance):
             prop_ratio = float(self.cfg.prop_stance_base_thrust_ratio)
+            if rho_hop > 0.0 and bool(self._mode1_push_latched):
+                # PUSH share: props start paying their height fraction
+                # the moment the push begins, together with the leg.
+                rho_hop_active = rho_hop
+                prop_ratio += rho_hop
         elif (
             -float(self._v_hat_w[2])
             < -float(self.cfg.prop_flight_brake_vz_mps)
@@ -3384,13 +3439,27 @@ class ModeECore:
                 )
         else:
             prop_ratio = float(self.cfg.prop_base_thrust_ratio)
+            if rho_hop > 0.0 and not bool(self._apex_reached):
+                # ASCENT share: the props keep carrying rho_hop*m*g from
+                # liftoff to apex -- this is exactly the g_up the stance
+                # law designed v* against, and it is also the f_z the
+                # fl_tilt loop vectors (authority scales with the knob).
+                rho_hop_active = rho_hop
+                prop_ratio += rho_hop
+            # Record the TOTAL ascent thrust ratio actually flown; the TD
+            # asymmetric-arc apex formula uses this instead of the config
+            # base so the measurement stays unbiased when rho_hop > 0.
+            if not bool(self._apex_reached):
+                self._rho_ascent_used = float(
+                    float(self.cfg.prop_base_thrust_ratio) + rho_hop
+                )
         thrust_sum_ref = float(self.mass * self.gravity * float(prop_ratio))
-        # Prop energy supplement in FLIGHT: DISABLED (2026-08-02, user
-        # "flight phase只负责控制姿态").  The supplement is consumed in
-        # the stance push (see above).  Flight keeps only the idle base
-        # collective + optional descent brake so the prop differential is
-        # free for attitude.
-        self._prop_energy_fz = 0.0
+        # _prop_energy_fz telemetry now logs the prop height share [N]
+        # (0 whenever rho_hop is inactive -- e.g. hop_height <= leg cap,
+        # compression, descent, or props disarmed).
+        self._prop_energy_fz = float(
+            self.mass * self.gravity * rho_hop_active
+        )
         # Global propeller enable gate. 2026-07-09: keyed off the RUNTIME armed
         # state (A switch) instead of the deleted pure_leg_mode -- when the user
         # never presses A, the controller must not assume prop assist anywhere
@@ -3839,9 +3908,17 @@ class ModeECore:
                     if (props_z and bool(self.cfg.stance_use_props))
                     else 0.0
                 )
+                # Ascent ratio includes the PogoX prop/leg height share
+                # (_rho_hop, planned this same tick by the collective
+                # plan above): g_up shrinks with the knob, so v* -- and
+                # hence k_v and the leg's peak force -- stays pinned at
+                # the calibrated prop_hop_leg_height_m level instead of
+                # growing into the 9 Nm torque wall.
                 rho_up = (
                     float(_clipf(
-                        float(self.cfg.prop_base_thrust_ratio), 0.0, 0.8
+                        float(self.cfg.prop_base_thrust_ratio)
+                        + float(getattr(self, "_rho_hop", 0.0)),
+                        0.0, 0.8,
                     ))
                     if props_z
                     else 0.0
@@ -3989,7 +4066,9 @@ class ModeECore:
                 # to the limit cycle -- no sub-phase machine, no caps.
                 f_px = 0.0
                 if px_on:
-                    self._prop_energy_fz = 0.0
+                    # (_prop_energy_fz is NOT zeroed here anymore: the
+                    # collective plan above owns it -- it logs the PogoX
+                    # prop/leg height share rho_hop*m*g during the push.)
                     # MATLAB stance_phase_ODE.m:
                     #   l = norm(robot_pos-foot_pos)
                     #   spring_force = -k_spring*(l-l0)
@@ -4989,11 +5068,15 @@ class ModeECore:
                 * float(self.cfg.thrust_total_ratio_max)
             )
         else:
+            # The ceiling grows by the prop height share during the
+            # ascent ONLY (rho_hop_active is zero after apex), so the
+            # planned rho_hop collective is deliverable but the descent
+            # keeps the tight anti-float cap.
             thrust_sum_max = float(
                 self.mass * self.gravity
-                * float(getattr(
+                * (float(getattr(
                     self.cfg, "flight_thrust_sum_max_ratio", 0.18
-                ))
+                )) + float(rho_hop_active))
             )
         props_on = bool(props_enabled_ctrl)
         if not props_on:
