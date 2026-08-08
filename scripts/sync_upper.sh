@@ -24,3 +24,11 @@ if ssh "nvidia@${JETSON_IP}" 'systemctl is-active --quiet hopper-upper.service';
 else
   echo "hopper-upper not running (start: ssh nvidia@${JETSON_IP} sudo systemctl start hopper-upper)"
 fi
+
+# Jetson-local perception (D435 + AprilTag; services/hopper-perception.service).
+if ssh "nvidia@${JETSON_IP}" 'systemctl is-active --quiet hopper-perception.service'; then
+  ssh "nvidia@${JETSON_IP}" 'sudo systemctl restart hopper-perception.service'
+  echo "hopper-perception was RUNNING -> restarted with the new code"
+else
+  echo "hopper-perception not running (start: ssh nvidia@${JETSON_IP} sudo systemctl start hopper-perception)"
+fi

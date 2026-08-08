@@ -60,7 +60,10 @@ if [[ "${START_SERVER}" == "1" ]]; then
     echo "[ok] Jetson D435 server already listening on ${JETSON_IP}:5556"
   else
     echo "[..] starting d435_net_server.py on ${JETSON_IP}"
-    "${SSH[@]}" "bash -lc '
+    # SSH on the Jetson can transiently reject connections while the camera
+    # server is still coming up. Do not let `set -e` silently terminate the
+    # viewer; always verify the actual TCP service afterward.
+    if ! "${SSH[@]}" "bash -lc '
       set -e
       cd ${REMOTE_TOOLS}
       if ! python3 - <<EOF
@@ -72,8 +75,11 @@ EOF
         echo \"[err] no RealSense on Jetson (check USB)\"
         exit 2
       fi
-      pkill -f \"[p]ython3.*d435_net_server.py\" 2>/dev/null || true
+      # Kill only the listener. `pkill -f` also matched this remote shell's
+      # full command string and silently killed the launcher itself.
+      fuser -k 5556/tcp >/dev/null 2>&1 || true
       sleep 0.3
+      : >/tmp/d435_net_server.log
       nohup python3 -u d435_net_server.py >/tmp/d435_net_server.log 2>&1 </dev/null &
       for i in 1 2 3 4 5 6 7 8 9 10; do
         sleep 1
@@ -85,9 +91,12 @@ EOF
       echo \"[err] server failed to bind :5556\"
       tail -30 /tmp/d435_net_server.log || true
       exit 3
-    '"
+    '"; then
+      echo "[warn] SSH camera start returned an error; checking :5556 anyway"
+    fi
     if ! port_open; then
       echo "[err] PC still cannot connect to ${JETSON_IP}:5556"
+      echo "[hint] check D435 USB, Jetson power, and /tmp/d435_net_server.log"
       exit 1
     fi
     echo "[ok] D435 server up on ${JETSON_IP}:5556"

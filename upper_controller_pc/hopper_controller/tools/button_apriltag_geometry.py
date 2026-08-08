@@ -9,11 +9,11 @@ against tag side length:
   - button center ≈ 16.5 cm RIGHT of tag center
   - button center ≈ 2.6 cm DOWN of tag center
   - button face protrudes 5 cm from the wall (user)
-  - press stroke is 1 cm into the wall (along -Z_tag)
+  - press stroke is 2 cm into the wall (along -Z_tag)
 
 So in tag coordinates:
   p_face  = (+0.165, +0.026, +0.05)
-  p_press = (+0.165, +0.026, +0.04)
+  p_press = (+0.165, +0.026, +0.03)
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import numpy as np
 DEFAULT_RIGHT_M = 0.165
 DEFAULT_DOWN_M = 0.026
 DEFAULT_PROTRUDE_M = 0.05
-DEFAULT_PRESS_M = 0.01
+DEFAULT_PRESS_M = 0.02
 
 # Printed wall tag (user 2026-08-08): 90 mm black detection square, id=1.
 DEFAULT_WALL_TAG_SIZE_M = 0.09

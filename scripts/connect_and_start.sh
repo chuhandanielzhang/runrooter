@@ -69,7 +69,7 @@ rsync -a "${SVC_SRC}/px4-bridge.service" "${SVC_SRC}/px4-dds-bridge.service" \
   "${SVC_SRC}/canable-watchdog.service" \
   "${SVC_SRC}/canable_watchdog.sh" "${SVC_SRC}/99-canable.rules" \
   "${SVC_SRC}/jetson-power.service" "${SVC_SRC}/hopper-driver.service" \
-  "${SVC_SRC}/hopper-upper.service" \
+  "${SVC_SRC}/hopper-upper.service" "${SVC_SRC}/hopper-perception.service" \
   nvidia@${JETSON_IP}:/tmp/hopper_svc/ \
   && $SSH 'sudo install -m644 /tmp/hopper_svc/*.service /etc/systemd/system/ && sudo systemctl daemon-reload \
     && sudo systemctl reenable canable2.service >/dev/null 2>&1; true' \
@@ -83,8 +83,9 @@ $SSH 'sudo install -m644 /tmp/hopper_svc/99-canable.rules /etc/udev/rules.d/ \
   && sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=tty --action=add \
   && sudo systemctl daemon-reload \
   && sudo systemctl reenable canable.service >/dev/null 2>&1 \
-  && sudo systemctl enable --now canable-watchdog.service >/dev/null 2>&1' \
-  && ok "CAN self-heal installed (udev + BindsTo + watchdog)" || bad "CAN self-heal install failed"
+  && sudo systemctl enable canable-watchdog.service >/dev/null 2>&1 \
+  && sudo systemctl restart canable-watchdog.service >/dev/null 2>&1' \
+  && ok "CAN self-heal installed (udev + BindsTo + watchdog, can0+can1)" || bad "CAN self-heal install failed"
 
 # ── 3. bring up lower-layer services on Jetson ──
 say "3/4  starting lower + upper on Jetson"
@@ -107,6 +108,17 @@ fi
 sudo nvpmodel -m 2 >/dev/null 2>&1 || true
 sudo jetson_clocks 2>/dev/null || true
 need_active canable.service
+# Wheel bus (can1, OPTIONAL adapter): canable2 is hot-plug only
+# (WantedBy=dev-canable2.device), so a missed udev event leaves the adapter
+# present with the bridge down -- and hopper-driver binds its can1 socket ONCE
+# at init (2026-08-08: wheels "connected but never move"). Ensure the bridge is
+# active BEFORE the hopper-driver restart below so the driver binds a live can1.
+if [ -e /dev/canable2 ]; then
+  need_active canable2.service
+  echo "   wheel bus: canable2 $(systemctl is-active canable2) (can1 for RM wheels)"
+else
+  echo "   wheel bus: /dev/canable2 absent (adapter unplugged -> hop-only, legs unaffected)"
+fi
 # Jetson supply-voltage monitor -> lcm-spy channel "jetson_power_lcmt"
 sudo systemctl enable --now jetson-power.service >/dev/null 2>&1 || true
 sudo systemctl restart jetson-power.service 2>/dev/null || true
@@ -160,6 +172,27 @@ if [ "$((r2-r1))" -le 0 ]; then
   r1=$(cat /sys/class/net/can0/statistics/rx_packets 2>/dev/null||echo 0); sleep 1
   r2=$(cat /sys/class/net/can0/statistics/rx_packets 2>/dev/null||echo 0)
 fi
+# Wheel CAN feedback (can1): C610 ESCs stream feedback whenever the wheel
+# battery is on, so a zero here with the adapter present = battery off OR the
+# driver socket bound before canable2 came up (rerun this script to heal).
+if [ -e /dev/canable2 ]; then
+  w1=$(cat /sys/class/net/can1/statistics/rx_packets 2>/dev/null||echo 0); sleep 1
+  w2=$(cat /sys/class/net/can1/statistics/rx_packets 2>/dev/null||echo 0)
+  if [ "$((w2-w1))" -gt 0 ]; then
+    echo "   wheel CAN (can1): OK ($((w2-w1)) frames/s from ESCs)"
+  else
+    echo "   WARN: wheel CAN (can1) silent -> wheel battery off? (legs unaffected)"
+  fi
+fi
+# Jetson-side perception (D435 + AprilTag/plane -> UDP 5558 local, PC monitor
+# on 5559/5560). Independent of the upper: a missing detector just reads as
+# "searching", so a start failure (camera unplugged) must not abort bring-up.
+sudo systemctl enable hopper-perception.service >/dev/null 2>&1 || true
+if sudo systemctl restart hopper-perception.service 2>/dev/null; then
+  echo "   perception: hopper-perception restarted (AprilTag/plane on Jetson)"
+else
+  echo "   WARN: hopper-perception failed to start (D435 unplugged? journalctl -u hopper-perception)"
+fi
 # Upper layer (ModeE): there must be EXACTLY ONE running controller. During
 # 2026-07-05 debugging the Jetson service and a PC-launched run_modee.py ran
 # simultaneously and fought over the torque channel (violent shaking).
@@ -181,7 +214,7 @@ else
   echo "   upper: NOT started on Jetson -> launch on PC: python3 run_modee.py --tau-max ..."
 fi
 sleep 1
-echo "SERVICES canable=$(systemctl is-active canable) driver=$(systemctl is-active hopper-driver) upper=$(systemctl is-active hopper-upper) xrce=$(systemctl is-active xrce-agent) dds=$(systemctl is-active px4-dds-bridge 2>/dev/null || echo stopped) [props=TELEM2/DDS, USB px4-bridge retired]"
+echo "SERVICES canable=$(systemctl is-active canable) canable2=$(systemctl is-active canable2 2>/dev/null || echo n/a) driver=$(systemctl is-active hopper-driver) upper=$(systemctl is-active hopper-upper) perception=$(systemctl is-active hopper-perception 2>/dev/null || echo n/a) xrce=$(systemctl is-active xrce-agent) dds=$(systemctl is-active px4-dds-bridge 2>/dev/null || echo stopped) [props=TELEM2/DDS, USB px4-bridge retired]"
 echo "CAN_RX_DELTA=$((r2-r1))"
 EOF
 

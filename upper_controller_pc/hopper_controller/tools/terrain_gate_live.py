@@ -31,10 +31,14 @@ Usage:
   python3 tools/terrain_gate_live.py --headless --frames 40   # smoke test
 """
 import argparse
+import json
+import socket
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 
@@ -310,6 +314,38 @@ def main():
     ap.add_argument("--frames", type=int, default=0, help="stop after N (0=run)")
     ap.add_argument("--rotate", type=int, default=90, choices=(0, 90, 180, 270),
                     help="clockwise display rotation in degrees (default 90)")
+    ap.add_argument("--no-button-tag", action="store_true",
+                    help="disable AprilTag button overlay/setpoint publisher")
+    ap.add_argument("--tag-id", type=int, default=1)
+    ap.add_argument("--tag-size", type=float, default=0.09)
+    ap.add_argument("--button-right-m", type=float, default=0.165)
+    ap.add_argument("--button-down-m", type=float, default=0.026)
+    ap.add_argument("--button-protrude-m", type=float, default=0.05)
+    ap.add_argument("--button-press-m", type=float, default=0.01)
+    ap.add_argument(
+        "--button-setpoint",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent
+        / "logs" / "button_setpoint.json",
+    )
+    ap.add_argument(
+        "--button-setpoint-port", type=int, default=5558,
+        help="UDP port used to send AprilTag targets to the Jetson controller",
+    )
+    ap.add_argument(
+        "--dashboard-status",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent
+        / "logs" / "dashboard_status.json",
+        help="controller gait/leg status JSON",
+    )
+    ap.add_argument(
+        "--dashboard-status-port", type=int, default=5557,
+        help="UDP port for live controller status from Jetson",
+    )
+    ap.add_argument("--no-record", action="store_true",
+                    help="disable automatic MANIPULATION dashboard video")
+    ap.add_argument("--record-fps", type=float, default=10.0)
     args = ap.parse_args()
     flat_mode = not args.full
     auto_ground = flat_mode and not args.fixed_pose
@@ -337,6 +373,38 @@ def main():
     gate = TerrainGate(TerrainGateConfig())
     cfg = gate.cfg
     proj = Projector(R, t, src.fx, src.fy, src.cx, src.cy)
+
+    # Optional button detector shares the same RGB frame and publishes the
+    # exact JSON consumed by MANIPULATION. The terrain corridor and button
+    # approach path therefore appear in one dashboard/window.
+    button_detector = None
+    button_T_L_C = None
+    button_geometry = None
+    button_last_write = 0.0
+    button_targets_last = None
+    button_udp_sock = None
+    if not args.no_button_tag:
+        try:
+            from pupil_apriltags import Detector
+            from button_apriltag_geometry import (
+                button_targets_from_detection,
+                load_T_L_C,
+            )
+            button_detector = Detector(
+                families="tag36h11", nthreads=2, quad_decimate=1.0
+            )
+            button_T_L_C = load_T_L_C()
+            button_geometry = button_targets_from_detection
+            button_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            args.button_setpoint.parent.mkdir(parents=True, exist_ok=True)
+            print(
+                "[button] dashboard enabled: "
+                f"id={args.tag_id}, size={args.tag_size*1000:.0f} mm, "
+                f"right={args.button_right_m*100:.1f} cm, "
+                f"down={args.button_down_m*100:.1f} cm"
+            )
+        except Exception as e:
+            print(f"[button] disabled ({e})")
 
     plt.ion()
     fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(17, 5.2))
@@ -395,6 +463,79 @@ def main():
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc="upper left", fontsize=8)
     banner = fig.suptitle("...", fontsize=16, fontweight="bold")
+    button_txt = ax0.text(
+        0.02, 0.98, "BUTTON TAG: waiting",
+        transform=ax0.transAxes, va="top", ha="left",
+        color="white", fontsize=9, family="monospace",
+        bbox=dict(boxstyle="round", fc="black", ec="white", alpha=0.72),
+    )
+
+    # Alternative right-hand panels shown only while the controller reports
+    # MANIPULATION. They occupy the same slots as depth/profile.
+    ax_leg_cmd = fig.add_axes(ax1.get_position(), visible=False)
+    ax_leg_path = fig.add_axes(ax2.get_position(), visible=False)
+    cmd_lines = [
+        ax_leg_cmd.plot([], [], lw=1.5, label=f"cmd {axis}")[0]
+        for axis in ("X", "Y", "Z")
+    ]
+    actual_lines = [
+        ax_leg_cmd.plot(
+            [], [], lw=1.0, ls="--", alpha=0.7, label=f"actual {axis}"
+        )[0]
+        for axis in ("X", "Y", "Z")
+    ]
+    ax_leg_cmd.set_title("Leg Cartesian cmd / actual")
+    ax_leg_cmd.set_xlabel("time (s)")
+    ax_leg_cmd.set_ylabel("foot coordinate in L frame (m)")
+    ax_leg_cmd.grid(True, alpha=0.3)
+    ax_leg_cmd.legend(fontsize=7, ncol=2, loc="best")
+
+    (planned_path_ln,) = ax_leg_path.plot(
+        [], [], "o-", lw=2.0, label="PRE → FACE → PRESS"
+    )
+    (cmd_point_ln,) = ax_leg_path.plot(
+        [], [], "o", ms=9, label="current cmd"
+    )
+    (actual_point_ln,) = ax_leg_path.plot(
+        [], [], "x", ms=9, mew=2, label="actual foot"
+    )
+    ax_leg_path.set_title("Leg command path (X-Z)")
+    ax_leg_path.set_xlabel("foot X_L (m)")
+    ax_leg_path.set_ylabel("foot Z_L (m)")
+    ax_leg_path.grid(True, alpha=0.3)
+    ax_leg_path.legend(fontsize=7, loc="best")
+    leg_info_txt = ax_leg_path.text(
+        0.02, 0.98, "",
+        transform=ax_leg_path.transAxes, va="top", ha="left",
+        fontsize=8, family="monospace",
+        bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.75),
+    )
+    leg_t_hist = deque(maxlen=300)
+    leg_cmd_hist = [deque(maxlen=300) for _ in range(3)]
+    leg_actual_hist = [deque(maxlen=300) for _ in range(3)]
+    leg_status_last_stamp = -1.0
+    manip_active_prev = False
+    video_writer = None
+    video_path = None
+    video_t0 = 0.0
+    video_frames = 0
+    controller_status_net = None
+    controller_status_rx_t = float("-inf")
+    status_sock = None
+    try:
+        status_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        status_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        status_sock.bind(("", int(args.dashboard_status_port)))
+        status_sock.setblocking(False)
+        print(
+            f"[status] listening on UDP :{args.dashboard_status_port} "
+            "for Jetson controller"
+        )
+    except OSError as exc:
+        print(f"[status] UDP unavailable ({exc}); using local JSON fallback")
+        if status_sock is not None:
+            status_sock.close()
+            status_sock = None
 
     n = 0
     mode = "STOP"
@@ -430,7 +571,177 @@ def main():
             verdict = deb.update(raw)
 
             if rgb is not None:
-                im_rgb.set_data(_rot_img(rgb, rot_cw))
+                rgb_annotated = np.ascontiguousarray(rgb.copy())
+                button_status = "BUTTON TAG: waiting"
+                if button_detector is not None and button_geometry is not None:
+                    try:
+                        gray = cv2.cvtColor(rgb_annotated, cv2.COLOR_RGB2GRAY)
+                        detections = button_detector.detect(
+                            gray,
+                            estimate_tag_pose=True,
+                            camera_params=(src.fx, src.fy, src.cx, src.cy),
+                            tag_size=float(args.tag_size),
+                        )
+                        chosen = next(
+                            (
+                                det for det in detections
+                                if int(det.tag_id) == int(args.tag_id)
+                            ),
+                            None,
+                        )
+                        if chosen is not None:
+                            pose_R = np.asarray(
+                                chosen.pose_R, dtype=float
+                            ).reshape(3, 3)
+                            pose_t = np.asarray(
+                                chosen.pose_t, dtype=float
+                            ).reshape(3)
+                            targets = button_geometry(
+                                pose_R=pose_R,
+                                pose_t=pose_t,
+                                T_L_C=button_T_L_C,
+                                right_m=float(args.button_right_m),
+                                down_m=float(args.button_down_m),
+                                protrude_m=float(args.button_protrude_m),
+                                press_m=float(args.button_press_m),
+                            )
+                            button_targets_last = targets
+
+                            # RGB overlay: tag outline plus PRE -> FACE ->
+                            # PRESS path. Colors are RGB tuples (the array is
+                            # displayed directly by matplotlib).
+                            corners = np.rint(chosen.corners).astype(np.int32)
+                            cv2.polylines(
+                                rgb_annotated, [corners], True,
+                                (255, 230, 0), 2, cv2.LINE_AA,
+                            )
+
+                            def project_button_point(p_cam):
+                                p_cam = np.asarray(
+                                    p_cam, dtype=float
+                                ).reshape(3)
+                                if float(p_cam[2]) <= 1e-4:
+                                    return None
+                                return (
+                                    int(round(
+                                        src.fx * float(p_cam[0])
+                                        / float(p_cam[2]) + src.cx
+                                    )),
+                                    int(round(
+                                        src.fy * float(p_cam[1])
+                                        / float(p_cam[2]) + src.cy
+                                    )),
+                                )
+
+                            p_pre = project_button_point(
+                                targets["camera"]["pre"]
+                            )
+                            p_face = project_button_point(
+                                targets["camera"]["face"]
+                            )
+                            p_press = project_button_point(
+                                targets["camera"]["press"]
+                            )
+                            path_px = [
+                                p for p in (p_pre, p_face, p_press)
+                                if p is not None
+                            ]
+                            if len(path_px) >= 2:
+                                cv2.polylines(
+                                    rgb_annotated,
+                                    [np.asarray(path_px, dtype=np.int32)],
+                                    False, (0, 255, 255), 3, cv2.LINE_AA,
+                                )
+                            if p_pre is not None:
+                                cv2.circle(
+                                    rgb_annotated, p_pre, 14,
+                                    (0, 255, 255), 2, cv2.LINE_AA,
+                                )
+                            if p_face is not None:
+                                cv2.circle(
+                                    rgb_annotated, p_face, 10,
+                                    (255, 165, 0), 2, cv2.LINE_AA,
+                                )
+                            if p_press is not None:
+                                cv2.circle(
+                                    rgb_annotated, p_press, 6,
+                                    (255, 0, 0), -1, cv2.LINE_AA,
+                                )
+
+                            face_L = targets["leg"]["face"]
+                            press_L = targets["leg"]["press"]
+                            pre_L = targets["leg"]["pre"]
+                            n_in = targets["wall_normal_in_L"]
+                            button_status = (
+                                f"TAG {int(chosen.tag_id)} LOCKED  "
+                                f"z={float(pose_t[2]):.3f}m\n"
+                                f"PRE   {pre_L[0]:+.3f} "
+                                f"{pre_L[1]:+.3f} {pre_L[2]:+.3f}\n"
+                                f"FACE  {face_L[0]:+.3f} "
+                                f"{face_L[1]:+.3f} {face_L[2]:+.3f}\n"
+                                f"PRESS {press_L[0]:+.3f} "
+                                f"{press_L[1]:+.3f} {press_L[2]:+.3f}\n"
+                                f"N_IN  {n_in[0]:+.2f} "
+                                f"{n_in[1]:+.2f} {n_in[2]:+.2f}"
+                            )
+
+                            now_button = time.time()
+                            if now_button - button_last_write > 0.05:
+                                payload = {
+                                    "t_wall": now_button,
+                                    "tag_id": int(chosen.tag_id),
+                                    "tag_size_m": float(args.tag_size),
+                                    "right_m": float(args.button_right_m),
+                                    "down_m": float(args.button_down_m),
+                                    "protrude_m": float(
+                                        args.button_protrude_m
+                                    ),
+                                    "press_m": float(args.button_press_m),
+                                    "foot_pre_L": [
+                                        float(x) for x in pre_L
+                                    ],
+                                    "foot_face_L": [
+                                        float(x) for x in face_L
+                                    ],
+                                    "foot_press_L": [
+                                        float(x) for x in press_L
+                                    ],
+                                    "wall_normal_in_L": [
+                                        float(x) for x in n_in
+                                    ],
+                                    "wall_normal_out_L": [
+                                        float(x) for x
+                                        in targets["wall_normal_out_L"]
+                                    ],
+                                    "press_along_wall_normal": True,
+                                    "valid": True,
+                                }
+                                tmp = args.button_setpoint.with_suffix(
+                                    ".json.tmp"
+                                )
+                                encoded_payload = json.dumps(payload)
+                                tmp.write_text(
+                                    json.dumps(payload, indent=2)
+                                )
+                                tmp.replace(args.button_setpoint)
+                                button_udp_sock.sendto(
+                                    encoded_payload.encode("utf-8"),
+                                    (
+                                        args.net or "127.0.0.1",
+                                        int(args.button_setpoint_port),
+                                    ),
+                                )
+                                button_last_write = now_button
+                        else:
+                            button_status = (
+                                f"BUTTON TAG {args.tag_id}: NOT FOUND\n"
+                                "cyan=PRE orange=FACE red=PRESS"
+                            )
+                    except Exception as e:
+                        button_status = f"BUTTON DETECTOR ERROR\n{e}"
+
+                button_txt.set_text(button_status)
+                im_rgb.set_data(_rot_img(rgb_annotated, rot_cw))
             im_d.set_data(_rot_img(np.where(np.isfinite(d), d, 0.0), rot_cw))
             if vote.profile_x is not None and vote.profile_z is not None:
                 ln.set_data(vote.profile_x, vote.profile_z * 100.0)
@@ -482,15 +793,242 @@ def main():
                     f" | steps {vote.n_steps} | {hz:.1f} Hz)   [{src.label}]"
                 )
                 banner.set_color(MODE_COLOR.get(mode, "black"))
+
+            # Controller-aware panel switch. HOPPING/MOBILE retain depth and
+            # terrain profile; MANIPULATION replaces those two panels with
+            # leg command history and the Cartesian approach path.
+            controller_status = None
+            controller_status_age = float("inf")
+            if status_sock is not None:
+                while True:
+                    try:
+                        raw_status, _peer = status_sock.recvfrom(65535)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        break
+                    try:
+                        controller_status_net = json.loads(
+                            raw_status.decode("utf-8")
+                        )
+                        controller_status_rx_t = time.monotonic()
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        pass
+            net_age = time.monotonic() - controller_status_rx_t
+            if controller_status_net is not None and net_age <= 0.5:
+                controller_status = controller_status_net
+                controller_status_age = net_age
+            try:
+                if controller_status is None:
+                    controller_status = json.loads(
+                        args.dashboard_status.read_text()
+                    )
+                    controller_status_age = (
+                        time.time()
+                        - float(controller_status.get("t_wall", 0.0))
+                    )
+                    if controller_status_age > 0.5:
+                        controller_status = None
+            except Exception:
+                controller_status = None
+            if controller_status is None:
+                age_text = (
+                    "missing"
+                    if not np.isfinite(controller_status_age)
+                    else f"stale {controller_status_age:.1f}s"
+                )
+                button_txt.set_text(
+                    button_txt.get_text()
+                    + f"\nCTRL: OFFLINE/{age_text} — restart run_modee"
+                )
+            manip_active = bool(
+                controller_status is not None
+                and controller_status.get("gait_mode") == "manipulation"
+            )
+            if (
+                controller_status is not None
+                and controller_status.get("gait_mode") == "mobile"
+            ):
+                mobile_tag_state = str(
+                    controller_status.get("mobile_tag_state", "searching")
+                ).upper()
+                reach_err = controller_status.get(
+                    "mobile_tag_reach_error_m"
+                )
+                reach_text = (
+                    ""
+                    if reach_err is None
+                    else f" clip={float(reach_err)*100:.1f}cm"
+                )
+                button_txt.set_text(
+                    button_txt.get_text()
+                    + f"\nCTRL MOBILE: {mobile_tag_state}{reach_text}"
+                )
+            ax1.set_visible(not manip_active)
+            ax2.set_visible(not manip_active)
+            ax_leg_cmd.set_visible(manip_active)
+            ax_leg_path.set_visible(manip_active)
+
+            if manip_active and controller_status is not None:
+                if not manip_active_prev:
+                    leg_t_hist.clear()
+                    for hist in leg_cmd_hist + leg_actual_hist:
+                        hist.clear()
+                    leg_status_last_stamp = -1.0
+                stamp = float(controller_status.get("t_wall", time.time()))
+                cmd = np.asarray(
+                    controller_status.get(
+                        "foot_cmd_L", [np.nan, np.nan, np.nan]
+                    ),
+                    dtype=float,
+                ).reshape(3)
+                actual_raw = controller_status.get(
+                    "foot_actual_L", [None, None, None]
+                )
+                actual = np.asarray(
+                    [
+                        np.nan if value is None else float(value)
+                        for value in actual_raw
+                    ],
+                    dtype=float,
+                ).reshape(3)
+                if stamp > leg_status_last_stamp + 1e-6:
+                    leg_status_last_stamp = stamp
+                    leg_t_hist.append(stamp)
+                    for axis in range(3):
+                        leg_cmd_hist[axis].append(float(cmd[axis]))
+                        leg_actual_hist[axis].append(float(actual[axis]))
+
+                if leg_t_hist:
+                    t_rel = np.asarray(leg_t_hist) - float(leg_t_hist[0])
+                    for axis in range(3):
+                        cmd_lines[axis].set_data(
+                            t_rel, np.asarray(leg_cmd_hist[axis])
+                        )
+                        actual_lines[axis].set_data(
+                            t_rel, np.asarray(leg_actual_hist[axis])
+                        )
+                    ax_leg_cmd.relim()
+                    ax_leg_cmd.autoscale_view()
+
+                if button_targets_last is not None:
+                    leg_pts = button_targets_last["leg"]
+                    route = np.asarray(
+                        [
+                            leg_pts["pre"],
+                            leg_pts["face"],
+                            leg_pts["press"],
+                        ],
+                        dtype=float,
+                    ).reshape(3, 3)
+                    planned_path_ln.set_data(route[:, 0], route[:, 2])
+                cmd_point_ln.set_data([cmd[0]], [cmd[2]])
+                if np.all(np.isfinite(actual)):
+                    actual_point_ln.set_data([actual[0]], [actual[2]])
+                else:
+                    actual_point_ln.set_data([], [])
+                ax_leg_path.relim()
+                ax_leg_path.autoscale_view()
+                # Keep a useful minimum view even before the route arrives.
+                if np.isfinite(cmd[0]) and np.isfinite(cmd[2]):
+                    ax_leg_path.set_xlim(cmd[0] - 0.08, cmd[0] + 0.08)
+                    ax_leg_path.set_ylim(cmd[2] - 0.08, cmd[2] + 0.08)
+
+                tau = np.asarray(
+                    controller_status.get("tau_cmd", [0.0, 0.0, 0.0]),
+                    dtype=float,
+                ).reshape(3)
+                stage = str(controller_status.get("button_stage", "?"))
+                err = controller_status.get("manip_err_m")
+                err_text = (
+                    "nan" if err is None else f"{float(err)*1000:.1f}mm"
+                )
+                leg_info_txt.set_text(
+                    f"stage={stage}\n"
+                    f"cmd={cmd[0]:+.3f},{cmd[1]:+.3f},{cmd[2]:+.3f}\n"
+                    f"err={err_text}\n"
+                    f"tau={tau[0]:+.2f},{tau[1]:+.2f},{tau[2]:+.2f} Nm"
+                )
+                banner.set_text(
+                    f"MANIPULATION  stage={stage}  err={err_text}  "
+                    f"|tau|max={np.max(np.abs(tau)):.2f} Nm  "
+                    f"[{src.label}]"
+                )
+                banner.set_color("tab:purple")
+            manip_active_prev = manip_active
+
+            need_canvas_frame = bool(
+                manip_active and not args.no_record
+            )
+            if not args.headless or need_canvas_frame:
+                fig.canvas.draw()
             if not args.headless:
-                fig.canvas.draw_idle()
                 fig.canvas.flush_events()
                 plt.pause(0.001)
+
+            # Automatically record the complete switched dashboard while
+            # MANIPULATION is active. Frame duplication keeps real-time video
+            # duration correct even if terrain processing has variable Hz.
+            if need_canvas_frame:
+                if video_writer is None:
+                    videos_dir = (
+                        Path(__file__).resolve().parent.parent
+                        / "logs" / "videos"
+                    )
+                    videos_dir.mkdir(parents=True, exist_ok=True)
+                    video_path = videos_dir / (
+                        "manip_dashboard_"
+                        + time.strftime("%Y%m%d_%H%M%S")
+                        + ".mp4"
+                    )
+                    width, height = fig.canvas.get_width_height()
+                    fps_record = float(max(1.0, args.record_fps))
+                    video_writer = cv2.VideoWriter(
+                        str(video_path),
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        fps_record,
+                        (int(width), int(height)),
+                    )
+                    if not video_writer.isOpened():
+                        print(f"[video] failed to open {video_path}")
+                        video_writer.release()
+                        video_writer = None
+                        video_path = None
+                    else:
+                        video_t0 = time.time()
+                        video_frames = 0
+                        print(f"[video] MANIPULATION -> {video_path}")
+                if video_writer is not None:
+                    rgba = np.asarray(fig.canvas.buffer_rgba())
+                    frame_bgr = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+                    fps_record = float(max(1.0, args.record_fps))
+                    due = max(
+                        1, int((time.time() - video_t0) * fps_record) + 1
+                    )
+                    while video_frames < due:
+                        video_writer.write(frame_bgr)
+                        video_frames += 1
+            elif video_writer is not None:
+                video_writer.release()
+                print(
+                    f"[video] saved {video_frames} frames -> {video_path}"
+                )
+                video_writer = None
+                video_path = None
+                video_frames = 0
+
             n += 1
             if args.frames and n >= args.frames:
                 break
     except KeyboardInterrupt:
         pass
+    if video_writer is not None:
+        video_writer.release()
+        print(f"[video] saved {video_frames} frames -> {video_path}")
+    if status_sock is not None:
+        status_sock.close()
+    if button_udp_sock is not None:
+        button_udp_sock.close()
     if args.headless and n:
         out = Path(__file__).resolve().parent.parent / "logs" / "figs" \
             / "terrain_gate_live_snapshot.png"

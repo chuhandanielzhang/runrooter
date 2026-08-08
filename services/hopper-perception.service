@@ -1,0 +1,28 @@
+[Unit]
+Description=Hopper Jetson perception (D435 + AprilTag button/box, UDP 5558)
+# Independent of hopper-upper: the controller treats missing setpoints as
+# "searching", so perception may start/stop at any time.
+After=multi-user.target
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/home/nvidia/hopper_upper/hopper_controller
+# Perception is vision-heavy but not control-critical: default scheduling,
+# single-threaded BLAS to stay off the hopper-upper cores.
+Environment=OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+ExecStart=/usr/bin/python3 -u tools/jetson_perception.py
+# Restart is safe here (unlike hopper-upper): perception only publishes
+# detections; a crash must not leave the controller blind for long.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
+# Install (once, on the Jetson):
+#   sudo cp /home/nvidia/hopper_upper/../services/hopper-perception.service \
+#        /etc/systemd/system/    # or scp from the PC repo services/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hopper-perception.service
+# Dependency (once): pip3 install pupil-apriltags
