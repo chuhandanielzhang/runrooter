@@ -273,99 +273,6 @@ def _clipf(x, lo: float, hi: float) -> float:
     return x
 
 
-def fall_rescue_model_step(
-    *,
-    t_flight_s: float,
-    vz_lo_mps: float,
-    rho_ascent: float,
-    rho_base: float,
-    gravity: float,
-    dt: float,
-    was_active: bool,
-    v_model_prev_mps: float,
-    rho_prev: float,
-    ratio_max: float,
-    band_mps: float,
-    window_s: float,
-    nominal_drop_m: float = 0.0,
-    timing_margin_s: float = 0.0,
-    baseline_ready: bool = True,
-) -> dict:
-    """One step of the contact-timing drop detector and descent controller.
-
-    The nominal asymmetric ballistic arc predicts same-height touchdown.
-    Remaining airborne after that event is a model residual indicating a
-    lower landing surface.  Once triggered, the internal descent model is
-    propagated with the *applied rescue force*, closing the loop around the
-    controlled model rather than continuing an unforced ballistic clock.
-    """
-    g = float(max(1e-3, gravity))
-    vz_lo = float(max(0.0, vz_lo_mps))
-    rho_up = _clipf(rho_ascent, 0.0, 0.9)
-    rho_0 = _clipf(rho_base, 0.0, 0.9)
-    g_up = float(max(1e-3, g * (1.0 - rho_up)))
-    g_dn = float(max(1e-3, g * (1.0 - rho_0)))
-    t_apex = float(vz_lo / g_up)
-    h_apex = float(vz_lo * vz_lo / (2.0 * g_up))
-    drop_nom = float(max(0.0, nominal_drop_m))
-    t_descent_nom = float(math.sqrt(
-        2.0 * max(0.0, h_apex + drop_nom) / g_dn
-    ))
-    # Confidence-bound normal-contact time.  The corresponding v_cap is
-    # deliberately conservative: normal flight variability inside the
-    # learned timing envelope cannot trigger rescue.
-    t_td_nom = float(
-        t_apex + t_descent_nom + max(0.0, float(timing_margin_s))
-    )
-    v_cap = float(g_dn * max(0.0, t_td_nom - t_apex))
-    residual_t = float(t_flight_s - t_td_nom)
-    in_window = bool(0.0 < residual_t <= max(0.0, float(window_s)))
-
-    if (not bool(baseline_ready) or not in_window
-            or vz_lo <= 1e-3 or float(ratio_max) <= 1e-9):
-        return {
-            "active": False,
-            "rho": 0.0,
-            "v_model_mps": 0.0,
-            "v_cap_mps": v_cap,
-            "t_td_nom_s": t_td_nom,
-            "residual_t_s": residual_t,
-        }
-
-    if bool(was_active) and np.isfinite(float(v_model_prev_mps)):
-        # v_down_dot = g*(1-rho_base-rho_rescue).  This incorporates the
-        # previous rescue command, unlike the old open-loop ballistic clock.
-        v_model = float(max(
-            0.0,
-            float(v_model_prev_mps)
-            + g * (1.0 - rho_0 - max(0.0, float(rho_prev)))
-            * max(0.0, float(dt)),
-        ))
-    else:
-        # Exact uncontrolled model state at first barrier crossing.
-        v_model = float(v_cap + g_dn * residual_t)
-
-    error_v = float(max(0.0, v_model - v_cap))
-    band = float(max(0.05, band_mps))
-    activation = _clipf(error_v / band, 0.0, 1.0)
-    # Saturated model feedback.  The unsaturated target requests gravity
-    # cancellation plus correction of the excess speed over one natural
-    # band-crossing time band/g_dn.  Hardware ratio_max may prevent full
-    # arrest; in that case this remains bounded impact-speed mitigation.
-    rho_req = float(
-        activation * (1.0 - rho_0) * (1.0 + error_v / band)
-    )
-    rho = _clipf(rho_req, 0.0, _clipf(ratio_max, 0.0, 0.9))
-    return {
-        "active": True,
-        "rho": rho,
-        "v_model_mps": v_model,
-        "v_cap_mps": v_cap,
-        "t_td_nom_s": t_td_nom,
-        "residual_t_s": residual_t,
-    }
-
-
 def _quat_from_omega_dt(omega_b: np.ndarray, dt: float) -> np.ndarray:
     w = np.asarray(omega_b, dtype=float).reshape(3)
     th = float(np.linalg.norm(w) * float(dt))
@@ -1353,52 +1260,6 @@ class ModeEConfig:
     # (tilt 5 deg → ~1 N lateral).  Error gate + TD fade still apply.
     prop_descent_brake_ratio: float = 0.2
     prop_descent_brake_ev_mps: float = 0.40
-    # ===== FALL-RATE rescue collective (2026-08-08, user) =====
-    # Dropping off a step makes the fall FASTER than the same-height arc
-    # the stance soft-land was sized for.  MODEL-CLOCK BALLISTIC BARRIER
-    # (paper form) -- self-calibrated from the latched liftoff speed AND
-    # normal-flight contact timing, no hand-tuned terrain height constant,
-    # no dependence on the biased
-    # flight world-vz estimate (log 032521 / 2026-08-08: v_hat_w2 sees
-    # <= 0.11 m/s of a ~2 m/s fall, so a measured-vz gate is blind):
-    #   ascent   g_up = g*(1 - base - rho_ascent),  t_apex = vz_lo/g_up
-    #   descent  g_dn = g*(1 - base)
-    #   model descent speed  v_dn(t) = g_dn*(t - t_apex)
-    #   learned normal drop  d0 <- touchdown timing (leg/contact geometry)
-    #   confidence time      t_bar = t_model(d0) + max(t_min, mu_e+4.5 sigma_e)
-    #   barrier speed        v_cap = g_dn*(t_bar-t_apex)
-    # The 4.5-sigma timing envelope is updated from non-rescue touchdowns.
-    # v_dn > v_cap <=> the robot is past the learned normal-contact envelope
-    # and still airborne
-    # <=> it has fallen below the launch plane (step-down).  After triggering,
-    # an INTERNAL descent model is propagated with the previous applied
-    # rescue force:
-    #   v_hat[k+1] = v_hat[k] + g*(1-base-rho[k])*dt
-    # and saturated feedback regulates excess speed e_v=v_hat-v_cap:
-    #   alpha = clip(e_v/band, 0, 1)
-    #   rho_req = alpha*(1-base)*(1 + e_v/band)
-    #   rho = clip(rho_req, 0, ratio_max)
-    # This is model feedback, not the old unforced time ramp.  If ratio_max
-    # is below (1-base), hardware cannot cancel gravity completely; then the
-    # guarantee is bounded impact-speed mitigation, not descent arrest.
-    # NO touchdown fade: braking is wanted to contact -- it lowers v_td,
-    # which also shrinks the stance soft-land compression.
-    # The share is added to the FLIGHT thrust ceiling like the ascent
-    # height assist, otherwise the 0.15 m*g attitude-only cap clamps it
-    # to ~8 N.  ratio_max=0 disables.
-    # window_s: the barrier only holds for this long past the nominal
-    # touchdown time (0.5 s = ~1.2 m of extra free-fall, far beyond any
-    # step).  Longer means the robot was CAUGHT/CARRIED mid-hop -- the
-    # 2026-08-08 logs show 2-6 s held-in-air FLIGHT segments -- and the
-    # props must NOT spool to ratio_max in the operator's hands.
-    prop_fall_rescue_ratio_max: float = 0.6
-    prop_fall_rescue_band_mps: float = 0.30
-    prop_fall_rescue_window_s: float = 0.5
-    prop_fall_rescue_calib_hops: int = 5
-    prop_fall_rescue_drop_alpha: float = 0.2
-    prop_fall_rescue_t_margin_min_s: float = 0.03
-    prop_fall_rescue_t_sigma: float = 4.5
-    prop_fall_rescue_history_n: int = 20
     # 2026-07-19 (per user): 3D / bidirectional thrust DISABLED everywhere.
     # prop_bidir=False makes negative thrust idle at pwm_min in the PWM map,
     # forces forward-only floors in the stance overlays / daisy chain, and
@@ -1845,13 +1706,6 @@ class ModeECore:
         # correct the ballistic time-to-touchdown prediction that gates
         # the flight tilt budget and descent brake (0 = unknown).
         self._flight_dur_prev: float = 0.0
-        # Model-feedback state for post-nominal-TD fall-rate rescue.
-        self._fall_rescue_active: bool = False
-        self._fall_rescue_v_model_mps: float = 0.0
-        self._fall_rescue_rho_prev: float = 0.0
-        self._fall_drop_nom_m: float = 0.0
-        self._fall_drop_nom_valid: bool = False
-        self._fall_timing_err_s: list[float] = []
         # Measured previous stance duration (s); 0 = none yet.
         self._stance_dur_prev: float = 0.0
         # Flight-phase XY velocity latched at liftoff (push tail mean).
@@ -2236,12 +2090,6 @@ class ModeECore:
         self._apex_reached = False
         self._rho_hop = 0.0
         self._rho_ascent_used = float(self.cfg.prop_base_thrust_ratio)
-        self._fall_rescue_active = False
-        self._fall_rescue_v_model_mps = 0.0
-        self._fall_rescue_rho_prev = 0.0
-        self._fall_drop_nom_m = 0.0
-        self._fall_drop_nom_valid = False
-        self._fall_timing_err_s = []
         # Disarm every loop that is gated on "a liftoff has happened":
         # the prop tilt loop (_lo_t is not None) and the ballistic flight
         # rescue.  Leaving _lo_t set kept them armed against a freshly
@@ -3582,7 +3430,6 @@ class ModeECore:
             if bool(cond_td):
                 touchdown_evt = True
                 self._stance = True
-                fall_rescue_was_active = bool(self._fall_rescue_active)
                 # Duration of the stance BEFORE the flight that just ended
                 # (for the double-pump trim guard, see nrc_trim_stance_max_s).
                 prev_stance_s = None
@@ -3623,74 +3470,6 @@ class ModeECore:
                     # fall.  Only real hops count, chatter would shrink it.
                     if 0.12 <= T_fl <= 1.5:
                         self._flight_dur_prev = T_fl
-                        # Learn normal LO->TD geometry/timing only from
-                        # unassisted landings.  A rescued step-down must not
-                        # redefine the flat-ground confidence envelope.
-                        if (not fall_rescue_was_active
-                                and self._vz_lo is not None
-                                and np.isfinite(float(self._vz_lo))
-                                and float(self._vz_lo) > 1e-3):
-                            _g_cal = float(self.gravity)
-                            _rho_up_cal = _clipf(
-                                float(self._rho_ascent_used), 0.0, 0.8
-                            )
-                            _rho_dn_cal = (
-                                _clipf(
-                                    float(self.cfg.prop_base_thrust_ratio),
-                                    0.0, 0.8,
-                                )
-                                if bool(self._props_armed_rt) else 0.0
-                            )
-                            _gu_cal = max(
-                                1e-3, _g_cal * (1.0 - _rho_up_cal)
-                            )
-                            _gd_cal = max(
-                                1e-3, _g_cal * (1.0 - _rho_dn_cal)
-                            )
-                            _vlo_cal = float(self._vz_lo)
-                            _ta_cal = _vlo_cal / _gu_cal
-                            _ha_cal = _vlo_cal * _vlo_cal / (2.0 * _gu_cal)
-                            if self._fall_drop_nom_valid:
-                                _tp_cal = _ta_cal + math.sqrt(
-                                    2.0 * max(
-                                        0.0,
-                                        _ha_cal + self._fall_drop_nom_m,
-                                    ) / _gd_cal
-                                )
-                                self._fall_timing_err_s.append(
-                                    float(T_fl - _tp_cal)
-                                )
-                                _hn = int(max(5, int(getattr(
-                                    self.cfg,
-                                    "prop_fall_rescue_history_n",
-                                    20,
-                                ))))
-                                self._fall_timing_err_s = (
-                                    self._fall_timing_err_s[-_hn:]
-                                )
-                            _tdn_cal = max(0.0, T_fl - _ta_cal)
-                            _drop_obs = _clipf(
-                                0.5 * _gd_cal * _tdn_cal * _tdn_cal
-                                - _ha_cal,
-                                0.0, 0.5,
-                            )
-                            if self._fall_drop_nom_valid:
-                                _a_drop = _clipf(float(getattr(
-                                    self.cfg,
-                                    "prop_fall_rescue_drop_alpha",
-                                    0.2,
-                                )), 0.0, 1.0)
-                                self._fall_drop_nom_m = float(
-                                    (1.0 - _a_drop)
-                                    * self._fall_drop_nom_m
-                                    + _a_drop * _drop_obs
-                                )
-                            else:
-                                self._fall_drop_nom_m = float(_drop_obs)
-                                self._fall_drop_nom_valid = True
-                    self._fall_rescue_active = False
-                    self._fall_rescue_v_model_mps = 0.0
-                    self._fall_rescue_rho_prev = 0.0
                     # The apex-trim return map serves BOTH continuous energy
                     # laws: nrc and pogox regulate an ESTIMATED in-stance
                     # energy, so any vz bias / taper loss lands at a biased
@@ -4044,9 +3823,6 @@ class ModeECore:
                     np.isfinite(float(q_shift))
                 ) else 0.0
                 self._lo_t = float(self.sim_time)
-                self._fall_rescue_active = False
-                self._fall_rescue_v_model_mps = 0.0
-                self._fall_rescue_rho_prev = 0.0
                 self._lo_event_q_shift = float(q_shift)
                 self._p_lo_w = np.asarray(
                     self._p_hat_w, dtype=float
@@ -4498,11 +4274,6 @@ class ModeECore:
             ))
         rho_hop_active = 0.0
         rho_flight_rescue = 0.0
-        rho_fall_rescue = 0.0
-        fall_v_model_mps = float("nan")
-        fall_v_cap_mps = float("nan")
-        fall_t_td_nom_s = float("nan")
-        fall_residual_t_s = float("nan")
         if bool(self._stance):
             prop_ratio = float(self.cfg.prop_stance_base_thrust_ratio)
             if bool(self._mode1_push_latched):
@@ -4608,79 +4379,6 @@ class ModeECore:
                     if _settle > 1e-9 else 1.0
                 )
                 prop_ratio += _rho_dn * _ev_gate * _td_fade
-            # ---- FALL-RATE rescue (see prop_fall_rescue_* docs) ----
-            # Contact-timing residual triggers a lower-ground event; after
-            # that, model feedback propagates v_down with the applied rescue
-            # force and regulates it toward the same-height impact cap.
-            _fr_max = float(_clipf(float(getattr(
-                self.cfg, "prop_fall_rescue_ratio_max", 0.0
-            )), 0.0, 0.9))
-            if (flight_assist_armed and _fr_max > 1e-9
-                    and self._lo_t is not None
-                    and self._vz_lo is not None
-                    and np.isfinite(float(self._vz_lo))
-                    and float(self._vz_lo) > 1e-3):
-                _base_fr = float(_clipf(
-                    float(self.cfg.prop_base_thrust_ratio), 0.0, 0.8
-                )) if bool(self._props_armed_rt) else 0.0
-                _cal_n_fr = int(max(1, int(getattr(
-                    self.cfg, "prop_fall_rescue_calib_hops", 5
-                ))))
-                _baseline_ready_fr = bool(
-                    self._fall_drop_nom_valid
-                    and len(self._fall_timing_err_s) >= _cal_n_fr
-                )
-                _margin_fr = float(max(0.0, float(getattr(
-                    self.cfg, "prop_fall_rescue_t_margin_min_s", 0.03
-                ))))
-                if self._fall_timing_err_s:
-                    _te_fr = np.asarray(
-                        self._fall_timing_err_s, dtype=float
-                    ).reshape(-1)
-                    _mu_fr = float(np.mean(_te_fr))
-                    _sd_fr = float(np.std(
-                        _te_fr, ddof=1
-                    )) if _te_fr.size >= 2 else 0.0
-                    _margin_fr = max(
-                        _margin_fr,
-                        _mu_fr + float(max(0.0, float(getattr(
-                            self.cfg, "prop_fall_rescue_t_sigma", 4.0
-                        )))) * _sd_fr,
-                    )
-                _fr = fall_rescue_model_step(
-                    t_flight_s=float(self.sim_time) - float(self._lo_t),
-                    vz_lo_mps=float(self._vz_lo),
-                    rho_ascent=float(self._rho_ascent_used),
-                    rho_base=_base_fr,
-                    gravity=float(self.gravity),
-                    dt=float(self.dt),
-                    was_active=bool(self._fall_rescue_active),
-                    v_model_prev_mps=float(self._fall_rescue_v_model_mps),
-                    rho_prev=float(self._fall_rescue_rho_prev),
-                    ratio_max=_fr_max,
-                    band_mps=float(getattr(
-                        self.cfg, "prop_fall_rescue_band_mps", 0.30
-                    )),
-                    window_s=float(getattr(
-                        self.cfg, "prop_fall_rescue_window_s", 0.5
-                    )),
-                    nominal_drop_m=float(self._fall_drop_nom_m),
-                    timing_margin_s=_margin_fr,
-                    baseline_ready=_baseline_ready_fr,
-                )
-                self._fall_rescue_active = bool(_fr["active"])
-                self._fall_rescue_v_model_mps = float(_fr["v_model_mps"])
-                rho_fall_rescue = float(_fr["rho"])
-                self._fall_rescue_rho_prev = rho_fall_rescue
-                fall_v_model_mps = float(_fr["v_model_mps"])
-                fall_v_cap_mps = float(_fr["v_cap_mps"])
-                fall_t_td_nom_s = float(_fr["t_td_nom_s"])
-                fall_residual_t_s = float(_fr["residual_t_s"])
-                prop_ratio += rho_fall_rescue
-            else:
-                self._fall_rescue_active = False
-                self._fall_rescue_v_model_mps = 0.0
-                self._fall_rescue_rho_prev = 0.0
         thrust_sum_ref = float(self.mass * self.gravity * float(prop_ratio))
         # Telemetry: active height-assist share [N], zero in compression
         # and descent.
@@ -6583,13 +6281,11 @@ class ModeECore:
         else:
             # Height-assist headroom exists only until apex; descent
             # returns to the attitude-only ceiling with the share off.
-            # The fall-rate rescue share opens the same headroom on the
-            # way DOWN (otherwise the 0.15 m*g cap clamps the brake).
             thrust_sum_max = float(
                 self.mass * self.gravity
                 * (float(getattr(
                     self.cfg, "flight_thrust_sum_max_ratio", 0.18
-                )) + float(rho_hop_active) + float(rho_fall_rescue))
+                )) + float(rho_hop_active))
             )
         props_on = bool(props_enabled_ctrl)
         if not props_on:
@@ -7079,14 +6775,6 @@ class ModeECore:
             "rho_hop_nominal": float(rho_hop),
             "rho_hop_active": float(rho_hop_active),
             "rho_flight_rescue": float(rho_flight_rescue),
-            "rho_fall_rescue": float(rho_fall_rescue),
-            "fall_rescue_active": int(bool(self._fall_rescue_active)),
-            "fall_v_model_mps": float(fall_v_model_mps),
-            "fall_v_cap_mps": float(fall_v_cap_mps),
-            "fall_t_td_nom_s": float(fall_t_td_nom_s),
-            "fall_residual_t_s": float(fall_residual_t_s),
-            "fall_drop_nom_m": float(self._fall_drop_nom_m),
-            "fall_calib_n": int(len(self._fall_timing_err_s)),
             "td_precomp_m": float(getattr(self, "_td_precomp_m", 0.0)),
             "td_q_ref_m": float(getattr(self, "_flight_q_ref", 0.0)),
             # Wrench-level debug:

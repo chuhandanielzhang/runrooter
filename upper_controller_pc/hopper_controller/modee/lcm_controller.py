@@ -3266,14 +3266,6 @@ class ModeELCMController:
                 "rpy_des_pitch",
                 "fl_lat_force_n",
                 "prop_energy_fz",
-                "rho_fall_rescue",
-                "fall_rescue_active",
-                "fall_v_model_mps",
-                "fall_v_cap_mps",
-                "fall_t_td_nom_s",
-                "fall_residual_t_s",
-                "fall_drop_nom_m",
-                "fall_calib_n",
                 "thrust_sum_ref",
                 "thrust_sum",
                 "F_total_w0",
@@ -3832,26 +3824,6 @@ class ModeELCMController:
             ).reshape(3)
             fl_lat_force_n = float(info.get("fl_lat_force_n", float("nan")))
             prop_energy_fz = float(info.get("prop_energy_fz", float("nan")))
-            rho_fall_rescue = float(info.get(
-                "rho_fall_rescue", float("nan")
-            ))
-            fall_rescue_active = int(info.get("fall_rescue_active", 0))
-            fall_v_model_mps = float(info.get(
-                "fall_v_model_mps", float("nan")
-            ))
-            fall_v_cap_mps = float(info.get(
-                "fall_v_cap_mps", float("nan")
-            ))
-            fall_t_td_nom_s = float(info.get(
-                "fall_t_td_nom_s", float("nan")
-            ))
-            fall_residual_t_s = float(info.get(
-                "fall_residual_t_s", float("nan")
-            ))
-            fall_drop_nom_m = float(info.get(
-                "fall_drop_nom_m", float("nan")
-            ))
-            fall_calib_n = int(info.get("fall_calib_n", 0))
             thrust_sum_ref = float(info.get("thrust_sum_ref", float("nan")))
             thrust_sum = float(info.get("thrust_sum", float("nan")))
             F_total_w = np.asarray(info.get("F_total_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
@@ -4028,14 +4000,6 @@ class ModeELCMController:
                 float(rpy_des[1]),
                 float(fl_lat_force_n),
                 float(prop_energy_fz),
-                float(rho_fall_rescue),
-                int(fall_rescue_active),
-                float(fall_v_model_mps),
-                float(fall_v_cap_mps),
-                float(fall_t_td_nom_s),
-                float(fall_residual_t_s),
-                float(fall_drop_nom_m),
-                int(fall_calib_n),
                 float(thrust_sum_ref),
                 float(thrust_sum),
                 float(F_total_w[0]),
