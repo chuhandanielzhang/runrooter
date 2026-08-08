@@ -220,7 +220,7 @@ void HopperHardware::step_with_damping(){
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     for(int i = 0; i < NUM_MOTORS; i++){
-        ak60_controller_ptr_->setMotorParams(i, 0.0, 0.0, 0.0, 0.0, 0.8);
+        ak60_controller_ptr_->setMotorParams(i, 0.0, 0.0, 0.0, 0.0, 2.0);
     }
     ak60_controller_ptr_->sendMotorCommands();
     ak60_controller_ptr_->updateMotorStates();

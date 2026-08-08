@@ -1,0 +1,15 @@
+{
+  "t_foot_tag_m": [
+    0.0,
+    0.0,
+    -0.07
+  ],
+  "tag_size_m": 0.02,
+  "tag_family": "tag36h11",
+  "tag_id": 0,
+  "note": "tag on leg axis, face \u22a5 leg, 7cm from foot tip toward base",
+  "printed_png_total_side_m": 0.025,
+  "tag_size_definition": "outer black detection square (raw PNG cells 1..8 of 10)",
+  "camera_pose_samples_original_assumed_tag_size_m": 0.025,
+  "camera_translation_correction_scale": 0.8
+}

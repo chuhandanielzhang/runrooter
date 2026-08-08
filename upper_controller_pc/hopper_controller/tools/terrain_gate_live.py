@@ -23,6 +23,8 @@ Usage:
   python3 tools/terrain_gate_live.py                 # local camera or demo
   python3 tools/terrain_gate_live.py --net 192.168.1.100
                              # camera on the Jetson via d435_net_server.py
+  python3 tools/terrain_gate_live.py --net 192.168.1.100 --rotate 90
+                             # clockwise display rotation (camera mount)
   python3 tools/terrain_gate_live.py --demo          # force synthetic
   python3 tools/terrain_gate_live.py --full          # old 3-mode gate, fixed pose
   python3 tools/terrain_gate_live.py --fixed-pose --pitch 30 --cam-height 0.367
@@ -34,6 +36,28 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+
+def _rot_img(img: np.ndarray, rot_cw: int) -> np.ndarray:
+    """Rotate image clockwise by rot_cw degrees (0/90/180/270)."""
+    k = (int(rot_cw) // 90) % 4
+    if k == 0:
+        return img
+    return np.rot90(img, k=-k)  # np.rot90 is CCW; negative -> CW
+
+
+def _rot_uv(uv: np.ndarray, w: int, h: int, rot_cw: int) -> np.ndarray:
+    """Map original pixel (u,v) into display coords after CW rotation."""
+    k = (int(rot_cw) // 90) % 4
+    if k == 0 or uv.size == 0:
+        return uv
+    u, v = uv[:, 0], uv[:, 1]
+    if k == 1:      # CW 90: (u,v) -> (h-1-v, u)
+        return np.stack([h - 1.0 - v, u], axis=1)
+    if k == 2:      # 180
+        return np.stack([w - 1.0 - u, h - 1.0 - v], axis=1)
+    # CW 270
+    return np.stack([v, w - 1.0 - u], axis=1)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from modee.terrain_gate import (  # noqa: E402
@@ -284,9 +308,12 @@ def main():
     ap.add_argument("--cam-height", type=float, default=0.367)
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--frames", type=int, default=0, help="stop after N (0=run)")
+    ap.add_argument("--rotate", type=int, default=90, choices=(0, 90, 180, 270),
+                    help="clockwise display rotation in degrees (default 90)")
     args = ap.parse_args()
     flat_mode = not args.full
     auto_ground = flat_mode and not args.fixed_pose
+    rot_cw = int(args.rotate)
 
     R, t = cam_pose(args.pitch, args.cam_height)
     src = None
@@ -317,8 +344,13 @@ def main():
         fig.canvas.manager.set_window_title("Terrain Gate LIVE")
 
     sw, sh = src.w, src.h
-    im_rgb = ax0.imshow(np.zeros((sh, sw, 3), dtype=np.uint8))
-    ax0.set_title("RGB scene (annotated)")
+    # Display size after CW rotation (depth/RANSAC stay in camera frame).
+    if rot_cw % 180 == 90:
+        dw, dh = sh, sw
+    else:
+        dw, dh = sw, sh
+    im_rgb = ax0.imshow(np.zeros((dh, dw, 3), dtype=np.uint8))
+    ax0.set_title(f"RGB scene (annotated, rot {rot_cw} CW)")
     ax0.axis("off")
     # corridor footprint on the ground (auto-ground: re-projected per frame)
     corridor_lns = [ax0.plot([], [], color="#2ca02c", lw=1.6, alpha=0.9)[0]
@@ -328,12 +360,14 @@ def main():
         xs = np.linspace(cfg.range_min_m, cfg.range_max_m, 24)
         for i, y in enumerate((-cfg.corridor_half_width_m,
                                cfg.corridor_half_width_m)):
-            uv = proj.uv(np.stack([xs, np.full_like(xs, y),
-                                   np.zeros_like(xs)], 1))
+            uv = _rot_uv(proj.uv(np.stack([xs, np.full_like(xs, y),
+                                           np.zeros_like(xs)], 1)),
+                         sw, sh, rot_cw)
             corridor_lns[i].set_data(uv[:, 0], uv[:, 1])
         for i, x in enumerate((cfg.range_min_m, cfg.range_max_m)):
-            uv = proj.uv(np.array([[x, -cfg.corridor_half_width_m, 0.0],
-                                   [x, cfg.corridor_half_width_m, 0.0]]))
+            uv = _rot_uv(proj.uv(np.array([[x, -cfg.corridor_half_width_m, 0.0],
+                                           [x, cfg.corridor_half_width_m, 0.0]])),
+                         sw, sh, rot_cw)
             corridor_lns[2 + i].set_data(uv[:, 0], uv[:, 1])
 
     draw_corridor()
@@ -343,11 +377,11 @@ def main():
                         bbox=dict(boxstyle="round", fc="crimson", ec="none",
                                   alpha=0.85))
     step_txt.set_visible(False)
-    ax0.set_xlim(0, sw)
-    ax0.set_ylim(sh, 0)
+    ax0.set_xlim(0, dw)
+    ax0.set_ylim(dh, 0)
 
-    im_d = ax1.imshow(np.zeros((sh, sw)), vmin=0.2, vmax=2.5, cmap="turbo")
-    ax1.set_title("depth (m)")
+    im_d = ax1.imshow(np.zeros((dh, dw)), vmin=0.2, vmax=2.5, cmap="turbo")
+    ax1.set_title(f"depth (m, rot {rot_cw} CW)")
     ax1.axis("off")
 
     (ln,) = ax2.plot([], [], "o-", ms=3, lw=1.2, color="tab:blue")
@@ -396,8 +430,8 @@ def main():
             verdict = deb.update(raw)
 
             if rgb is not None:
-                im_rgb.set_data(rgb)
-            im_d.set_data(np.where(np.isfinite(d), d, 0.0))
+                im_rgb.set_data(_rot_img(rgb, rot_cw))
+            im_d.set_data(_rot_img(np.where(np.isfinite(d), d, 0.0), rot_cw))
             if vote.profile_x is not None and vote.profile_z is not None:
                 ln.set_data(vote.profile_x, vote.profile_z * 100.0)
 
@@ -409,8 +443,9 @@ def main():
                     and vote.step_m > cfg.step_wheel_max_m):
                 yy = np.linspace(-cfg.corridor_half_width_m,
                                  cfg.corridor_half_width_m, 12)
-                uv = proj.uv(np.stack([np.full_like(yy, vote.step_dist_m),
-                                       yy, np.zeros_like(yy)], 1))
+                uv = _rot_uv(proj.uv(np.stack(
+                    [np.full_like(yy, vote.step_dist_m),
+                     yy, np.zeros_like(yy)], 1)), sw, sh, rot_cw)
                 step_ln.set_data(uv[:, 0], uv[:, 1])
                 step_ln.set_color(col)
                 u0, v0 = np.nanmean(uv[:, 0]), np.nanmin(uv[:, 1])

@@ -182,11 +182,15 @@ def main() -> None:
     # in-flight "apex event" value comes from vz-crossing + position
     # integration, which drifts badly (log 200745 read 5.8 cm for a real
     # 2.5 cm hop) -- so mark the drift-free TD value at the flight midpoint.
+    hop_t, hop_h, hop_vz_lo = [], [], []
     if all(c in x.columns for c in ("liftoff", "touchdown", "z_apex_actual_m")):
         za = x["z_apex_actual_m"].to_numpy(dtype=float)
+        vz_lo = (
+            x["vz_lo_m_s"].to_numpy(dtype=float)
+            if "vz_lo_m_s" in x.columns else None
+        )
         lo_idx = np.where(x["liftoff"].fillna(0).to_numpy(dtype=float) > 0.5)[0]
         td_idx = np.where(x["touchdown"].fillna(0).to_numpy(dtype=float) > 0.5)[0]
-        hop_t, hop_h = [], []
         for i_lo in lo_idx:
             nxt = td_idx[td_idx > i_lo]
             if len(nxt) == 0:
@@ -198,6 +202,9 @@ def main() -> None:
             if np.isfinite(h_cm):
                 hop_t.append(0.5 * (t[i_lo] + t[i_td]))
                 hop_h.append(h_cm)
+                hop_vz_lo.append(
+                    float(vz_lo[i_lo]) if vz_lo is not None else float("nan")
+                )
         if hop_t:
             axA.plot(hop_t, hop_h, "o", color="crimson", ms=7, zorder=5,
                      label="apex (flight-time, per hop)")
@@ -207,7 +214,26 @@ def main() -> None:
                              color="crimson")
     axA.set_ylabel("Apex height (cm)")
     axA.grid(True, alpha=0.25)
-    axA.legend(ncol=3, fontsize=8, loc="upper right")
+    # Show the measured liftoff vertical speed beside each per-hop apex.
+    # A second axis is required because apex is in cm while vz_LO is in m/s.
+    if hop_t and np.any(np.isfinite(hop_vz_lo)):
+        axAv = axA.twinx()
+        axAv.plot(hop_t, hop_vz_lo, "^--", color="tab:cyan", lw=1.0,
+                  ms=6, zorder=4, label="vz_LO (per hop)")
+        for ta, va in zip(hop_t, hop_vz_lo):
+            if np.isfinite(va):
+                axAv.annotate(f"{va:.2f}", (ta, va),
+                              textcoords="offset points", xytext=(0, -12),
+                              ha="center", fontsize=7, color="teal")
+        axAv.set_ylabel("Liftoff vz_LO (m/s)", color="teal")
+        axAv.tick_params(axis="y", labelcolor="teal")
+        axAv.set_ylim(bottom=0.0)
+        h_a, l_a = axA.get_legend_handles_labels()
+        h_v, l_v = axAv.get_legend_handles_labels()
+        axA.legend(h_a + h_v, l_a + l_v, ncol=4, fontsize=8,
+                   loc="upper right")
+    else:
+        axA.legend(ncol=3, fontsize=8, loc="upper right")
 
     # Algorithm attitude estimate (rpy_hat from R_wb_hat) — this is what
     # attitude PD / fl_tilt / Raibert actually close on. IMU raw rpy is
@@ -221,9 +247,17 @@ def main() -> None:
                  color="tab:blue", lw=0.8, ls=":", alpha=0.7, label="roll_imu")
         ax6.plot(t, np.degrees(x["imu_rpy_pitch"].to_numpy(dtype=float)),
                  color="tab:orange", lw=0.8, ls=":", alpha=0.7, label="pitch_imu")
-    if "fl_tilt_cmd_deg" in x.columns:
+    # Desired roll/pitch from R_des (split tilt cmd); fallback: magnitude only.
+    if "rpy_des_roll" in x.columns and "rpy_des_pitch" in x.columns:
+        ax6.plot(t, np.degrees(x["rpy_des_roll"].to_numpy(dtype=float)),
+                 color="tab:blue", lw=1.2, ls="--", alpha=0.9,
+                 label="roll_cmd")
+        ax6.plot(t, np.degrees(x["rpy_des_pitch"].to_numpy(dtype=float)),
+                 color="tab:orange", lw=1.2, ls="--", alpha=0.9,
+                 label="pitch_cmd")
+    elif "fl_tilt_cmd_deg" in x.columns:
         ax6.plot(t, x["fl_tilt_cmd_deg"], color="tab:green", lw=1.0, ls="--",
-                 alpha=0.8, label="fl_tilt_cmd")
+                 alpha=0.8, label="fl_tilt_cmd (|tilt|)")
     if np.any(apex_mask):
         ax6.plot(t[apex_mask], roll_hat[apex_mask], "o", color="tab:blue",
                  ms=7, zorder=5, label="roll @ apex")
@@ -233,16 +267,49 @@ def main() -> None:
             ax6.axvline(ta, color="crimson", ls=":", lw=0.9, alpha=0.55)
             axA.axvline(ta, color="crimson", ls=":", lw=0.9, alpha=0.55)
     ax6.axhline(0.0, color="gray", ls=":", lw=1.0)
-    ax6.set_ylabel("Attitude estimate (deg)")
+    ax6.set_ylabel("Attitude (deg)")
     ax6.grid(True, alpha=0.25)
     ax6.legend(ncol=3, fontsize=7, loc="upper right")
 
-    # Foot placement: desired (Raibert) vs actual foot position in world XYZ.
-    # Note: foot_b is body FRD; foot_des_w and foot_des_b are logged as well.
+    # Foot placement: desired vs actual, BOTH in world FRD (base→foot).
+    # Log stores actual as foot_b (body); rotate with q_hat → R_wb @ foot_b.
     ax7.set_title("Foot placement: desired vs actual (world XYZ, cm)")
+    foot_b = np.column_stack([
+        x["foot_b0"].to_numpy(dtype=float),
+        x["foot_b1"].to_numpy(dtype=float),
+        x["foot_b2"].to_numpy(dtype=float),
+    ])
+    if all(c in x.columns for c in ("q_hat_w", "q_hat_x", "q_hat_y", "q_hat_z")):
+        qw = x["q_hat_w"].to_numpy(dtype=float)
+        qx = x["q_hat_x"].to_numpy(dtype=float)
+        qy = x["q_hat_y"].to_numpy(dtype=float)
+        qz = x["q_hat_z"].to_numpy(dtype=float)
+        # R_wb from wxyz (same convention as core._quat_to_R_wb)
+        n = np.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+        n = np.maximum(n, 1e-12)
+        w, xq, yq, zq = qw / n, qx / n, qy / n, qz / n
+        # foot_w[i] = R_wb[i] @ foot_b[i]
+        foot_w = np.empty_like(foot_b)
+        foot_w[:, 0] = (
+            (1 - 2 * (yq * yq + zq * zq)) * foot_b[:, 0]
+            + (2 * (xq * yq - zq * w)) * foot_b[:, 1]
+            + (2 * (xq * zq + yq * w)) * foot_b[:, 2]
+        )
+        foot_w[:, 1] = (
+            (2 * (xq * yq + zq * w)) * foot_b[:, 0]
+            + (1 - 2 * (xq * xq + zq * zq)) * foot_b[:, 1]
+            + (2 * (yq * zq - xq * w)) * foot_b[:, 2]
+        )
+        foot_w[:, 2] = (
+            (2 * (xq * zq - yq * w)) * foot_b[:, 0]
+            + (2 * (yq * zq + xq * w)) * foot_b[:, 1]
+            + (1 - 2 * (xq * xq + yq * yq)) * foot_b[:, 2]
+        )
+    else:
+        foot_w = foot_b  # fallback: body ≈ world if no quat
     for i, (comp, c) in enumerate(zip(["x", "y", "z"], colors)):
-        ax7.plot(t, x[f"foot_b{i}"] * 100.0, color=c, lw=1.2,
-                 label=f"foot_{comp} actual (body)")
+        ax7.plot(t, foot_w[:, i] * 100.0, color=c, lw=1.2,
+                 label=f"foot_{comp} actual (world)")
         if f"foot_des_w{i}" in x.columns:
             ax7.plot(t, x[f"foot_des_w{i}"] * 100.0, color=c, lw=1.0,
                      ls="--", alpha=0.75, label=f"foot_{comp} des (world)")

@@ -4,7 +4,7 @@
 #
 # No ModeEConfig gains/limits are overridden. Simulation-only adaptations:
 #   - isolated LCM bus (port 7669, ttl=0; never reaches the Jetson)
-#   - MuJoCo mass/inertia uniformly scaled to current core mass (6.7 kg)
+#   - MuJoCo mass/inertia uniformly scaled to current core mass (5.61 kg)
 #   - floor friction set to current controller mu (0.5)
 #   - pre-release hold/drop to bootstrap the hopping limit cycle
 set -euo pipefail
@@ -28,7 +28,7 @@ LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
 LIBGL_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri \
 python3 -u modee_fake_robot.py \
   --duration-s "$DURATION" \
-  --total-mass 6.7 \
+  --total-mass 5.61 \
   --floor-mu 0.5 \
   --drop-z 0.68 \
   --record-gif "$OUT" \
