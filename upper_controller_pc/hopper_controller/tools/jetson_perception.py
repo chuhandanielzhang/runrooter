@@ -74,6 +74,7 @@ class D435Local:
             cfg.enable_stream(rs.stream.color, W, H, rs.format.rgb8, FPS)
             try:
                 prof = self.pipe.start(cfg)
+                self.fps = int(FPS)
                 print(f"[percep] D435 {W}x{H} @ {FPS} fps", flush=True)
                 break
             except RuntimeError as e:
@@ -81,11 +82,11 @@ class D435Local:
         if prof is None:
             raise SystemExit("no workable depth+color profile")
         self.align = rs.align(rs.stream.depth)
-        # Motion-blur guard (2026-08-08): the D435 COLOR sensor is rolling
-        # shutter with auto-exposure; dim indoor light pushes exposure toward
-        # the full frame period (~66 ms @15 fps) and the tag smears whenever
-        # the base moves. Blur scales with exposure time, so keep AE but
-        # cap it at 10 ms and hold the frame rate (priority=0).
+        # Motion-blur guard: D435 COLOR is rolling shutter; uncapped AE in
+        # dim light can hit ~66 ms @15 fps and smear tags while moving.
+        # 2026-08-09: 10 ms was too dark for 36 mm box tags indoors — raise
+        # the AE ceiling to 20 ms (still << frame period) and keep AE
+        # priority=0 so fps is not traded for more exposure.
         try:
             cs = prof.get_device().first_color_sensor()
             if cs.supports(rs.option.auto_exposure_priority):
@@ -93,19 +94,16 @@ class D435Local:
             # NOTE: supports() misreports auto_exposure_limit as False on
             # some librealsense builds -- just try to set it.
             try:
-                cs.set_option(rs.option.auto_exposure_limit, 10000.0)  # us
-                print("[percep] color AE capped at 10 ms (blur guard)",
+                cs.set_option(rs.option.auto_exposure_limit, 20000.0)  # us
+                print("[percep] color AE capped at 20 ms (brighter indoor)",
                       flush=True)
             except Exception:
-                # Firmware without AE-limit: fixed exposure. 8 ms / gain 90
-                # (earlier blur guard) was too dark indoors -- tag dropped
-                # at ~0.6 m on approach (log 2026-08-08 21:21) while still
-                # centered in frame. 15 ms @ 0.12 m/s -> ~1.8 mm smear,
-                # fine for a 9 cm tag; gain 128 lifts SNR without AE lag.
+                # Firmware without AE-limit: fixed exposure. 20 ms @ gain 160
+                # (~2.4 mm smear at 0.12 m/s) — OK for 36 mm tags when slow.
                 cs.set_option(rs.option.enable_auto_exposure, 0.0)
-                cs.set_option(rs.option.exposure, 150.0)   # 15 ms
-                cs.set_option(rs.option.gain, 128.0)
-                print("[percep] color fixed exposure 15 ms, gain 128 "
+                cs.set_option(rs.option.exposure, 200.0)   # 20 ms
+                cs.set_option(rs.option.gain, 160.0)
+                print("[percep] color fixed exposure 20 ms, gain 160 "
                       "(indoor tag, no AE-limit fw)", flush=True)
         except Exception as e:
             print(f"[percep] exposure cap unavailable ({e})", flush=True)
@@ -127,6 +125,99 @@ class D435Local:
         rgb = (np.asanyarray(c.get_data()) if c
                else np.zeros((self.h, self.w, 3), np.uint8))
         return d, rgb
+
+
+class CamRecorder:
+    """Replayable RGB-D recording, one directory per run, segment-rotated.
+
+    Every frame the perception loop already grabbed is written -- no extra
+    camera work.  Layout (under --record-dir, default logs/cam):
+
+      <stamp>/segNNN/meta.json   intrinsics, depth scale (mm), fps, t0
+      <stamp>/segNNN/color.avi   MJPG (BGR), native fps
+      <stamp>/segNNN/depth.bin   per frame: [f64 t_wall][u32 len][zlib z16 mm]
+      <stamp>/segNNN/ts.csv      frame_idx,t_wall (color/depth share order)
+
+    Replay/export: tools/replay_cam_record.py <segdir>.
+    Segments rotate every --record-seg-min minutes so a power cut only
+    loses the tail of the current segment.
+    """
+
+    def __init__(self, root: Path, src: "D435Local", seg_min: float = 5.0):
+        import zlib  # stdlib; bound as attr so frame() needs no re-import
+        self._zlib = zlib
+        self.src = src
+        self.seg_len_s = float(max(0.5, seg_min * 60.0))
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        self.run_dir = Path(root) / stamp
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.seg_idx = -1
+        self.vw = None
+        self.depth_fp = None
+        self.ts_fp = None
+        self.frame_idx = 0
+        self._open_segment()
+        print(f"[percep] RECORDING -> {self.run_dir}", flush=True)
+
+    def _open_segment(self):
+        self._close_segment()
+        self.seg_idx += 1
+        self.seg_t0 = time.time()
+        seg = self.run_dir / f"seg{self.seg_idx:03d}"
+        seg.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "w": int(self.src.w), "h": int(self.src.h),
+            "fps": int(getattr(self.src, "fps", 15)),
+            "depth_unit": "mm_uint16_zlib",
+            "fx": self.src.fx, "fy": self.src.fy,
+            "cx": self.src.cx, "cy": self.src.cy,
+            "t0_wall": self.seg_t0,
+        }
+        (seg / "meta.json").write_text(json.dumps(meta, indent=1))
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        self.vw = cv2.VideoWriter(
+            str(seg / "color.avi"), fourcc,
+            float(meta["fps"]), (self.src.w, self.src.h),
+        )
+        self.depth_fp = open(seg / "depth.bin", "wb")
+        self.ts_fp = open(seg / "ts.csv", "w")
+        self.ts_fp.write("frame_idx,t_wall\n")
+
+    def _close_segment(self):
+        if self.vw is not None:
+            self.vw.release()
+            self.vw = None
+        for attr in ("depth_fp", "ts_fp"):
+            fp = getattr(self, attr, None)
+            if fp is not None:
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def write(self, d_m: np.ndarray, rgb: np.ndarray, t_wall: float):
+        import struct
+        if self.vw is None:
+            return
+        if (t_wall - self.seg_t0) >= self.seg_len_s:
+            self._open_segment()
+        self.vw.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        d_mm = np.nan_to_num(
+            d_m * 1000.0, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        d_u16 = np.clip(d_mm, 0.0, 65535.0).astype(np.uint16)
+        blob = self._zlib.compress(d_u16.tobytes(), 1)
+        self.depth_fp.write(struct.pack("<dI", float(t_wall), len(blob)))
+        self.depth_fp.write(blob)
+        self.ts_fp.write(f"{self.frame_idx},{t_wall:.6f}\n")
+        self.frame_idx += 1
+        if self.frame_idx % 150 == 0:   # ~10 s at 15 fps
+            self.depth_fp.flush()
+            self.ts_fp.flush()
+
+    def close(self):
+        self._close_segment()
 
 
 class TagDetector:
@@ -482,8 +573,10 @@ def main():
                     metavar=("LEFT", "RIGHT"),
                     help="box-face tag pair, symmetric about the center "
                          "(LEFT/RIGHT as seen facing the box)")
-    ap.add_argument("--box-tag-size", type=float, default=0.09)
-    ap.add_argument("--box-tag-spacing", type=float, default=0.30,
+    # 2026-08-09 A4 打印纸（box_apriltags_id2_id3_a4.pdf）：36 mm tag，
+    # 外缘间隙 60 mm -> 中心距 96 mm。
+    ap.add_argument("--box-tag-size", type=float, default=0.036)
+    ap.add_argument("--box-tag-spacing", type=float, default=0.096,
                     help="center-to-center tag distance on the box face (m)")
     ap.add_argument("--box-min-width-m", type=float, default=0.25,
                     help="plane fallback: min face width to call it a box")
@@ -510,9 +603,36 @@ def main():
         help="low-rate local file fallback (controller reads it if UDP "
              "is down)",
     )
+    # RGB-D recording (2026-08-09 user: every camera frame the upper
+    # session sees must be stored and replayable -- depth AND color).
+    ap.add_argument("--no-record", action="store_true",
+                    help="disable RGB-D recording")
+    ap.add_argument(
+        "--record-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent / "logs" / "cam",
+        help="recording root (one <stamp>/ run dir per start)",
+    )
+    ap.add_argument("--record-seg-min", type=float, default=5.0,
+                    help="segment rotation period (minutes)")
     args = ap.parse_args()
 
     src = D435Local()
+    rec = None
+    if not args.no_record:
+        try:
+            rec = CamRecorder(
+                args.record_dir, src, seg_min=float(args.record_seg_min)
+            )
+            # systemd stop sends SIGTERM: exit through atexit so the AVI
+            # index and the depth/ts buffers are finalized, not truncated.
+            import atexit
+            import signal
+            atexit.register(rec.close)
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        except Exception as e:
+            print(f"[percep] recording DISABLED ({e})", flush=True)
+            rec = None
     T_L_C = load_T_L_C()
     size_by_id = {
         int(args.tag_id): float(args.tag_size),
@@ -550,6 +670,17 @@ def main():
             print(f"[percep] frame timeout ({e})", flush=True)
             continue
         now = time.time()
+        if rec is not None:
+            try:
+                rec.write(d, rgb, now)
+            except Exception as e:
+                print(f"[percep] record write failed ({e}); "
+                      "recording OFF", flush=True)
+                try:
+                    rec.close()
+                except Exception:
+                    pass
+                rec = None
         n += 1
         if now - hz_t0 >= 2.0:
             hz = n / (now - hz_t0)

@@ -1,0 +1,18 @@
+[Unit]
+Description=Hopper Jetson boot bring-up (multicast, CAN, DDS, driver, upper, perception)
+# Run after the usual stack units exist; canable may still be hot-plugging.
+After=network-online.target multi-user.target canable.service
+Wants=network-online.target canable.service
+# Do not hard-fail boot if a USB adapter is late — bringup heals CAN itself.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/jetson_bringup.sh
+# Give USB / Pixhawk a moment after multi-user; bringup also sleeps internally.
+ExecStartPre=/bin/sleep 8
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

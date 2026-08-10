@@ -217,6 +217,20 @@ def render_panel(
             p.line(f"box: {str(box.get('source', '?')).upper()} "
                    f"w={box.get('width_m', 0):.2f} m", GREEN)
             p.line(f"  center {_fmt_vec(box.get('center_L'))}", GRAY)
+            # Working-pose errors from the controller (parallelism check).
+            d_err = (ctrl or {}).get("box_dist_err_m")
+            y_err = (ctrl or {}).get("box_yaw_err_deg")
+            if d_err is not None or y_err is not None:
+                d_s = (f"{float(d_err) * 100:+.1f}cm"
+                       if d_err is not None else "n/a")
+                y_s = (f"{float(y_err):+.1f}deg"
+                       if y_err is not None else "n/a")
+                p.line(f"  dist err {d_s}  yaw err {y_s}", WHITE)
+            wd = (ctrl or {}).get("push_work_dist_m")
+            if wd is not None:
+                p.line(f"  work dist {float(wd):.2f} m (latched)", GRAY)
+            if bool((ctrl or {}).get("box_ready", False)):
+                p.line("  BOX READY -> LT = PUSH", GREEN)
         else:
             p.line("box: none", GRAY)
     elif gait == "MANIPULATION":
@@ -239,6 +253,12 @@ def render_panel(
             p.line(f"  normal {_fmt_vec(cbox.get('normal_in_L'), '')}", GRAY)
         else:
             p.line("box: LOST (wheels stopped)", RED)
+        state = str((ctrl or {}).get("push_state") or "TRACK")
+        st_col = {"TRACK": GREEN, "WAIT": YELLOW}.get(state, RED)
+        p.line(f"state: {state}", st_col)
+        f_n = (ctrl or {}).get("push_f_meas_n")
+        p.line(f"push force: {float(f_n):+.1f} N" if f_n is not None
+               else "push force: n/a", WHITE)
         e = (ctrl or {}).get("push_e_m")
         v = (ctrl or {}).get("push_v_mps")
         p.line(f"contact e: {float(e)*100:+.1f} cm" if e is not None
@@ -248,6 +268,9 @@ def render_panel(
         err = (ctrl or {}).get("manip_err_m")
         p.line(f"leg err: {float(err)*1000:.1f} mm" if err is not None
                else "leg err: n/a", WHITE)
+        wd = (ctrl or {}).get("push_work_dist_m")
+        if wd is not None:
+            p.line(f"work dist: {float(wd):.2f} m (latched)", GRAY)
         p.line("LEFT stick: up=push fwd, x=steer box", GRAY, 0.5)
         p.line("LT exits to MOBILE", GRAY, 0.5)
     else:

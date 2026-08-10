@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Torque + Fz vs time plot (same style as torque_fz_vs_time_151345.png).
 
+Only plots rows whose gait_mode is hopping or mobile (SAFE / manipulation /
+push / other modes are dropped).
+
 Usage:
     python tools/plot_torque_fz.py            # newest logs/modee_*.csv
     python tools/plot_torque_fz.py <log.csv>  # a specific log
@@ -32,7 +35,23 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     d = pd.read_csv(src)
-    # Window: 200 samples before the first stance to 200 after the last.
+    # Only hopping / mobile (drop SAFE / manipulation / other idle modes).
+    if "gait_mode" in d.columns:
+        gm = d["gait_mode"].astype(str).str.lower()
+        keep = gm.isin(["hopping", "mobile"])
+        n_keep = int(keep.sum())
+        if n_keep == 0:
+            sys.exit(
+                f"no hopping/mobile rows in {src.name} "
+                f"(gait_mode={gm.value_counts().to_dict()})"
+            )
+        d = d.loc[keep].reset_index(drop=True)
+        print(
+            f"filter gait_mode in {{hopping,mobile}}: "
+            f"{n_keep}/{len(keep)} rows"
+        )
+    # Window: 200 samples before the first stance to 200 after the last
+    # (within the hopping/mobile subset). If never in stance, use all kept rows.
     active = d["stance"].fillna(0).astype(bool).to_numpy()
     idx = np.flatnonzero(active)
     lo = max(0, int(idx[0]) - 200) if len(idx) else 0
@@ -40,6 +59,15 @@ def main() -> None:
     x = d.iloc[lo:hi].copy()
     t0 = float(x["t_s"].iloc[0])
     t = x["t_s"].to_numpy() - t0
+    # Break plotted lines across large time gaps left by the gait filter
+    # (e.g. hopping → manipulation → mobile) so matplotlib does not draw
+    # a straight chord across the hole.
+    dt = np.diff(t, prepend=t[0])
+    gap = dt > 0.05  # >50 ms at 500 Hz ≈ dropped segment
+    if np.any(gap):
+        for col in x.columns:
+            if pd.api.types.is_numeric_dtype(x[col]):
+                x.loc[gap, col] = np.nan
 
     fig, (ax1, axF, ax2, ax3, ax4, ax5, ax6, axA, ax7) = plt.subplots(
         9, 1, figsize=(14, 29), sharex=True, constrained_layout=True
@@ -55,7 +83,10 @@ def main() -> None:
     ax1.set_ylim(-11.5, 11.5)
     ax1.grid(True, alpha=0.25)
     ax1.legend(ncol=4, fontsize=8, loc="upper right")
-    ax1.set_title(f"Motor Torque / Prop Force / Attitude — {src.name}")
+    ax1.set_title(
+        f"Motor Torque / Prop Force / Attitude — {src.name} "
+        f"(hopping|mobile only)"
+    )
 
     # Leg XYZ force that maps to joint torque (f_tau_delta / J^T F),
     # plus world-frame contact / reference for stance.
