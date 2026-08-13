@@ -5,24 +5,34 @@ set -o pipefail
 
 need_active(){ systemctl is-active "$1" >/dev/null 2>&1 || systemctl restart "$1"; }
 
-# Multicast MUST hit the wired NIC (boot can put it on lo / WiFi).
-JET_ETH=$(ip -4 addr show | awk '/inet 192\.168\.1\./{print $NF; exit}')
-if [ -n "$JET_ETH" ]; then
-  cur_mc=$(ip route get 239.255.76.67 2>/dev/null | head -1)
-  echo "$cur_mc" | grep -q "dev ${JET_ETH}" || ip route replace 224.0.0.0/4 dev "$JET_ETH"
-  echo "multicast -> $(ip route get 239.255.76.67 2>/dev/null | head -1 | awk '{print $3}')"
+# Multicast: wired eth when the cable has carrier (PC can sniff); else lo so
+# driver/upper/SELECT keep working outdoors with no ethernet.
+if [ -x /usr/local/bin/lcm_multicast_route.sh ]; then
+  /usr/local/bin/lcm_multicast_route.sh || true
+else
+  JET_ETH=$(ip -4 addr show | awk '/inet 192\.168\.1\./{print $NF; exit}')
+  if [ -n "$JET_ETH" ] && [ "$(cat /sys/class/net/${JET_ETH}/carrier 2>/dev/null || echo 0)" = "1" ]; then
+    ip route replace 224.0.0.0/4 dev "$JET_ETH"
+  else
+    ip route replace 224.0.0.0/4 dev lo
+  fi
+  echo "multicast -> $(ip route get 239.255.76.67 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 fi
 
 # Max performance for the 500Hz upper (schedutil cannot hold 2ms).
 nvpmodel -m 2 >/dev/null 2>&1 || true
 jetson_clocks 2>/dev/null || true
 
-need_active canable.service
-if [ -e /dev/canable2 ]; then
-  need_active canable2.service
-  echo "wheel bus: canable2 $(systemctl is-active canable2) (can1)"
+# 2026-08-12: candleLight/gs_usb firmware -- can0/can1 are configured by udev
+# + can*-gsusb.service on enumeration. Just verify/nudge here.
+if [ ! -d /sys/class/net/can0 ] || [ "$(cat /sys/class/net/can0/operstate 2>/dev/null)" = "down" ]; then
+  systemctl start can0-gsusb.service 2>/dev/null || true
+fi
+if [ -d /sys/class/net/can1 ]; then
+  [ "$(cat /sys/class/net/can1/operstate 2>/dev/null)" = "down" ] && systemctl start can1-gsusb.service 2>/dev/null
+  echo "wheel bus: can1 $(cat /sys/class/net/can1/operstate 2>/dev/null)"
 else
-  echo "wheel bus: /dev/canable2 absent (hop-only)"
+  echo "wheel bus: can1 absent (hop-only)"
 fi
 
 systemctl enable --now jetson-power.service >/dev/null 2>&1 || true
@@ -62,17 +72,21 @@ fi
 systemctl restart hopper-driver.service
 sleep 3
 
-# CAN silent -> one canable reset (bus-off recovery).
+# SELECT/Back watcher: 1x start / 2x stop hopper-upper (independent of upper).
+systemctl enable hopper-gamepad-upper.service >/dev/null 2>&1 || true
+systemctl restart hopper-gamepad-upper.service 2>/dev/null || true
+
+# CAN silent -> one can0 reset (bus-off recovery).
 r1=$(cat /sys/class/net/can0/statistics/rx_packets 2>/dev/null||echo 0); sleep 1
 r2=$(cat /sys/class/net/can0/statistics/rx_packets 2>/dev/null||echo 0)
 if [ "$((r2-r1))" -le 0 ]; then
-  echo "CAN silent -> reset canable + hopper-driver"
-  systemctl restart canable.service && sleep 2 && systemctl restart hopper-driver.service && sleep 2
+  echo "CAN silent -> reset can0 + hopper-driver"
+  systemctl restart can0-gsusb.service && sleep 2 && systemctl restart hopper-driver.service && sleep 2
   r1=$(cat /sys/class/net/can0/statistics/rx_packets 2>/dev/null||echo 0); sleep 1
   r2=$(cat /sys/class/net/can0/statistics/rx_packets 2>/dev/null||echo 0)
 fi
 
-if [ -e /dev/canable2 ]; then
+if [ -d /sys/class/net/can1 ]; then
   w1=$(cat /sys/class/net/can1/statistics/rx_packets 2>/dev/null||echo 0); sleep 1
   w2=$(cat /sys/class/net/can1/statistics/rx_packets 2>/dev/null||echo 0)
   if [ "$((w2-w1))" -gt 0 ]; then
@@ -102,4 +116,4 @@ fi
 systemctl start hopper-upper.service
 echo "upper: hopper-upper started"
 
-echo "SERVICES canable=$(systemctl is-active canable) canable2=$(systemctl is-active canable2 2>/dev/null || echo n/a) driver=$(systemctl is-active hopper-driver) upper=$(systemctl is-active hopper-upper) perception=$(systemctl is-active hopper-perception 2>/dev/null || echo n/a) xrce=$(systemctl is-active xrce-agent) dds=$(systemctl is-active px4-dds-bridge 2>/dev/null || echo stopped) CAN_RX_DELTA=$((r2-r1))"
+echo "SERVICES can0=$(cat /sys/class/net/can0/operstate 2>/dev/null || echo n/a) can1=$(cat /sys/class/net/can1/operstate 2>/dev/null || echo n/a) driver=$(systemctl is-active hopper-driver) upper=$(systemctl is-active hopper-upper) gamepad=$(systemctl is-active hopper-gamepad-upper 2>/dev/null || echo n/a) perception=$(systemctl is-active hopper-perception 2>/dev/null || echo n/a) xrce=$(systemctl is-active xrce-agent) dds=$(systemctl is-active px4-dds-bridge 2>/dev/null || echo stopped) CAN_RX_DELTA=$((r2-r1))"

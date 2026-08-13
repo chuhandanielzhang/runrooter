@@ -43,6 +43,7 @@ import json
 import socket
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cv2
@@ -148,7 +149,11 @@ class CamRecorder:
         self._zlib = zlib
         self.src = src
         self.seg_len_s = float(max(0.5, seg_min * 60.0))
-        stamp = time.strftime("%Y%m%d_%H%M%S")
+        # Always Asia/Shanghai (Beijing), independent of process TZ
+        # (2026-08-12 user: "log要记录着北京时间").
+        stamp = datetime.now(timezone(timedelta(hours=8))).strftime(
+            "%Y%m%d_%H%M%S"
+        )
         self.run_dir = Path(root) / stamp
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.seg_idx = -1

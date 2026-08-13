@@ -1,0 +1,10 @@
+[Unit]
+Description=gs_usb wheel bus setup: rename to can1 + 1Mbit up (RM M2006, hot-plug)
+# Pulled by 99-canable.rules (ENV{SYSTEMD_WANTS}) whenever the wheel-bus
+# candleLight adapter (re)appears. Purely hot-plug: nothing waits on this at
+# boot, so a missing wheel adapter can never deadlock hopper-driver again.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/can_gsusb_setup.sh 0067005F3945501620303651 can1 1000000

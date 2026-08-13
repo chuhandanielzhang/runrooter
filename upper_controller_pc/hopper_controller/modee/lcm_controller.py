@@ -70,15 +70,15 @@ class ModeELCMConfig:
     # HOPPING foot-clearance knob (teleop): LEFT stick deflect + release.
     # Writes core.cfg.foot_clearance_target_m (active height when
     # foot_clearance_control_enable). Presets on return-to-neutral:
-    #   down -> 0.02 m, left -> 0.03 m, right -> 0.08 m, up -> 0.20 m.
+    #   down -> 0.02 m, left -> 0.03 m, right -> 0.01 m, up -> 0.20 m.
     hop_height_stick_enable: bool = True
     hop_height_stick_trigger: float = 0.70
     hop_height_stick_release: float = 0.20
-    hop_height_stick_up_m: float = 0.20
+    hop_height_stick_up_m: float = 0.05
     hop_height_stick_down_m: float = 0.02
     hop_height_stick_left_m: float = 0.03
-    hop_height_stick_right_m: float = 0.08
-    hop_height_min_m: float = 0.02
+    hop_height_stick_right_m: float = 0.04
+    hop_height_min_m: float = 0.01
     hop_height_max_m: float = 0.20
     # ---- LiDAR patrol (hopper_nav_cmd_lcmt from lidar_perception/patrol.py) ----
     # SELECT toggles patrol; while engaged the nav velocity replaces the stick.
@@ -94,10 +94,10 @@ class ModeELCMConfig:
     # - tau_out_scale: multiply final motor torques by this factor before sending (e.g. 0.1 for bring-up)
     # - tau_out_max_nm: absolute per-joint max torque sent to hardware (Nm); applied after scaling
     tau_out_scale: float = 1.0
-    # 2026-08-02: 30 -> 9 = the real motor limit.  ModeECore now caps at
-    # 9 Nm internally (proportional + prop residual), so this output-side
-    # limiter is a pure backstop that should never bind.
-    tau_out_max_nm: float | None = 9
+    # 2026-08-11 (user): hopping 不要 output tau 限制；tau 限幅只用于
+    # P4 摆腿到 l0（switch_rb_tau_max_nm）。None = pass-through.
+    # Was 9 as a backstop after ModeECore's internal 9 Nm model.
+    tau_out_max_nm: float | None = None
     # SAFE flag:
     # - If triggered, we request hopper_driver to enter DAMP (same as pressing B),
     #   and pause the Python controller loop for a few seconds.
@@ -118,7 +118,7 @@ class ModeELCMConfig:
     safe_q_min_switch: float = -1.0472    # -60 deg (SAFE guard only, in LT/P4 modes)
     # Enabled MOBILE + RT (2026-08-10 21:00):
     #   - P4: world-vertical foot, align short (0.35) then extend/hold at
-    #     switch_rb_leg_len_m (= normal leg_l0 0.455).
+    #     switch_rb_leg_len_m (= normal leg_l0 0.45).
     #   - after switch_rb_pushdelay_s: enter HOPPING / flight phase.
     #     RM +11.5 -> 0 and prop base 1600 run in parallel; from then on
     #     it is normal hopping (same l0 / height / velocity law, no
@@ -126,30 +126,38 @@ class ModeELCMConfig:
     switch_rb_align_leg_len_m: float = 0.35
     switch_rb_align_tol_m: float = 0.015
     switch_rb_align_timeout_s: float = 1.0
-    # P4 hold length = normal hop l0 so the standing launch has no length step.
-    switch_rb_leg_len_m: float = 0.455
-    switch_rb_tau_max_nm: float = 2.0       # RT leg torque cap (Nm)
+    # P4 hold length.  2026-08-11 15:19 (user): 保持腿 / 第一跳腿长 0.43；
+    # 正常跳跃原长仍是 core.leg_l0_m=0.455（第一跳 real TD+LO 后恢复）。
+    switch_rb_leg_len_m: float = 0.43
+    # Temporary leg_l0 for the FIRST hopping stance after RT/P4. Restored
+    # after a real TD then LO (or B abort) — not the fake LO at P4 handoff.
+    switch_rb_first_hop_l0_m: float = 0.43
+    # ONLY intentional soft tau cap: P4 摆腿到 l0 (align + hold).
+    # Hopping has no output/core soft tau limit (2026-08-11 user).
+    switch_rb_tau_max_nm: float = 2.0       # RT/P4 leg placement torque cap (Nm)
     # AK60 motor-internal velocity damping during RT/P4 leg placement.
     # Sent through the MIT kd field, using the driver's high-rate velocity;
     # this supplements the Cartesian damping already present in tau_ff.
     switch_rb_ak60_damp_kd: float = 0.3
-    switch_rb_pushdelay_s: float = 1.0      # hold at 0.455 this long, then HOPPING
-    # Legacy (UNUSED): special first-hop l0 retired.
-    switch_rb_first_hop_l0_m: float = 0.52
-    # Legacy (UNUSED): first-hop flight AK60 kd override.
-    switch_rt_first_hop_flight_ak60_kd: float = 0.2
+    switch_rb_pushdelay_s: float = 1.0      # hold at 0.43 this long, then HOPPING
     # Temporary foot_clearance while entering HOPPING from MOBILE (RT).
-    # Disabled (N=0): keep whatever clearance knob is already set.
+    # 2026-08-11 14:36 (user): 一二跳目标; 14:39: 0.07 -> 0.05.
     switch_rt_hop_height_m: float = 0.05
-    switch_rt_hop_height_n: int = 0
+    switch_rt_hop_height_n: int = 2
     # Prop baseline during P4 hold (us).
     switch_rb_prop_base_pwm_us: float = 1200.0
-    # ModeE collective base once HOPPING starts (RM unfold window).
-    hop_prop_base_pwm_us: float = 1600.0
-    hop_prop_base_timeout_s: float = 4.0
-    # TEMP: RT path legs-only bring-up. When True, RT never arms props and never
-    # drives RM (+11.5->0). Flip back to False once the P4 leg hold looks good.
-    rt_leg_only_no_prop_rm: bool = False
+    # ModeE collective base once HOPPING starts (RM unfold / first-hop window).
+    # History: 1400 -> 1600 -> 1800 (2026-08-11); 2026-08-12 (user): 1700.
+    hop_prop_base_pwm_us: float = 1700.0
+    # Hard per-motor floor while the prop-base window is open
+    # (2026-08-12 user: "最低只能 1600"). Collective stays at
+    # hop_prop_base_pwm_us; attitude may still raise individual arms above
+    # this, but none may drop below it.
+    hop_prop_base_pwm_min_us: float = 1600.0
+    # Window closes on first real hop LO (after a TD), or this timeout --
+    # whichever first. 2026-08-12 (user): 2.0 -> 1.0 s; no longer gated on
+    # RM unfold done.
+    hop_prop_base_timeout_s: float = 1.0
     # ---- LT (HOPPING -> MOBILE) stand-and-fold ----
     # 2026-08-10 22:19 (user):
     #   1) next compression (TD) -> RM starts folding 0 -> +11.5
@@ -157,9 +165,8 @@ class ModeELCMConfig:
     #   3) at that stance's liftoff -> props OFF + P4-style stand hold
     #      at switch_lt_leg_len_m; MOBILE when RM reaches mobile pose
     #      (or switch_lt_timeout_s).
-    switch_lt_stand: bool = True
     # HOPPING->MOBILE stand length (independent of RT/P4 switch_rb_leg_len_m).
-    switch_lt_leg_len_m: float = 0.458
+    switch_lt_leg_len_m: float = 0.45
     # Torque cap while the leg carries the robot.  RT/P4 uses 1 Nm since
     # the wheels carry the weight there; holding ~72 N at 0.47 m needs
     # ~5 Nm, so 6 gives margin without unlocking hop-level forces.
@@ -212,17 +219,6 @@ class ModeELCMConfig:
     # Rate limit for the target length ramp 0.448 -> 0.55 (m/s).  A step
     # target kicked the body (18:06/18:35 logs); ~1 s ramp lifts smoothly.
     switch_rt_stand_extend_rate_mps: float = 0.1
-    # Legacy flat-PWM stand prop (retired).  RT-STAND now opens the ModeE
-    # hop_prop_base_pwm_us (=1600) window so props balance attitude around
-    # the collective base like a normal stance.  P4 place still uses
-    # switch_rb_prop_base_pwm_us (1200).
-    switch_rt_stand_prop_pwm_us: float = 1600.0
-    # Legacy 7/24 loaded-stand params (kp 4000 / FF): retired, kept for
-    # rollback only; the stand branch no longer reads them.
-    switch_rt_stand_kp_z_n_m: float = 4000.0
-    switch_rt_stand_kd_z_n_s_m: float = 60.0
-    switch_rt_stand_weight_ff: bool = True
-    switch_rt_stand_ff_ramp_s: float = 0.5
     # AK60 motor-internal velocity damping during the stand (LT stand
     # holds the full body weight cleanly at 2.0).
     switch_rt_stand_ak60_kd: float = 2.0
@@ -263,10 +259,16 @@ class ModeELCMConfig:
     # - Setting this > 0 helps reduce flight-phase jitter/oscillation, because it dissipates energy using
     #   the motor's own high-rate velocity estimate (not the Python/Lcm qd).
     # - Applied per-phase (FLIGHT vs STANCE) so you can add a small amount in stance too.
-    ak60_flight_damp_kd: float = 0.2
+    ak60_flight_damp_kd: float = 0.3
     # 2026-07-19 stance anti-jitter: small motor-side damping using the
     # driver's own high-rate velocity (much cleaner than the ~230 Hz LCM qd).
+    # Restored to yesterday push (a12f736 / outdoor1): 0.1.
     ak60_stance_damp_kd: float = 0.1
+    # 2026-08-11 (user): 第一跳 damp -- extra AK60 stance damping for
+    # the FIRST hopping stance only (n_flights_done < 1: the landing right
+    # after the mobile->hopping switch, arms still unfolding).  Normal hops
+    # go back to ak60_stance_damp_kd.
+    ak60_first_hop_stance_damp_kd: float = 0.2
 
     # ===== Command shaping / demo mode =====
     # To keep the hop process smooth, we rate-limit the commanded desired velocity.
@@ -640,8 +642,6 @@ class ModeELCMController:
         # User "hard stop" latch (maps to gamepad `point` button; user calls it "I").
         self._zero_vel_hold = False
         self._last_point = False
-        # RB one-shot big jump trigger (execute at next touchdown).
-        self._last_rb = False
         # User request: pressing Y should enable the "hard hold" until we ENTER STANCE once.
         # This is useful when the robot is being held in the air: it prevents IMU drift from moving the foot target.
         self._y_hold_until_stance = False
@@ -665,11 +665,13 @@ class ModeELCMController:
         # returning the foot to world vertical. It then advances to the
         # switch_rb_leg_len_m final hold.
         self._rb_p4_aligning: bool = False
-        # (legacy name kept) unused for liftoff-window; prop floor is gated by
-        # rm_stage==2 below. Cleared on B / MOBILE entry.
+        # Prop-base window (collective 1700 + PWM floor 1600): open at
+        # MOBILE->HOPPING handoff; close on first real hop LO (after a TD)
+        # or hop_prop_base_timeout_s -- whichever first.
         self._hop_prop_base_active: bool = False
         self._hop_prop_base_t0: float | None = None
-        self._hop_prop_base_liftoff_count: int = 0
+        self._hop_prop_base_saw_td: bool = False
+        self._hop_prop_base_liftoff_count: int = 0  # legacy counter (unused)
         # Explicit mechanical configuration. HOPPING is the backward-compatible
         # startup state. MOBILE and MANIPULATION share the deployed appendage
         # geometry; only their active actuator changes (wheels vs leg).
@@ -821,17 +823,17 @@ class ModeELCMController:
         # RT armed flag: set when P4 hands off to HOPPING; RM +11.5->0 starts
         # only at the next liftoff (push end), not during the push itself.
         self._rm_rt_pending: bool = False
-        # RT first-hop l0 override: original leg_l0_m saved here while the
-        # first post-RT push runs with switch_rb_first_hop_l0_m; restored at
-        # the first liftoff (or on B abort).
-        self._rt_l0_restore: float | None = None
-        # Armed at RT->HOPPING handoff; while set, FLIGHT uses
-        # switch_rt_first_hop_flight_ak60_kd. Cleared on the next TD.
-        self._rt_first_hop_flight_damp: bool = False
         # Temporary hop_height override across gait switches. Saved value is
         # restored after RT's first N hops or when LT stand begins / B abort.
         self._hop_height_restore: float | None = None
         self._rt_hop_height_remaining: int = 0
+        # RT first-hop l0 override: original leg_l0_m saved here while the
+        # first post-RT stance runs with switch_rb_first_hop_l0_m; restored
+        # at that liftoff (or B abort).
+        self._rt_l0_restore: float | None = None
+        # Do NOT restore on the fake LO right after P4 handoff (still
+        # planted → stance→flight edge). Wait for a real TD first.
+        self._rt_first_hop_l0_saw_td: bool = False
         # Saved (prop_base_thrust_ratio, prop_stance_base_thrust_ratio) while
         # the RT prop-base window overrides them (see hop_prop_base_pwm_us).
         self._prop_ratio_restore: tuple | None = None
@@ -840,9 +842,9 @@ class ModeELCMController:
         self._rm_zero_until: float = 0.0
         self._rm_zero_at_rad: float = 0.0
 
-        # Patrol engage flag (SELECT toggles; stick/B disengages).
+        # Patrol engage flag (stick/B disengages). SELECT (Back) is owned by
+        # services/gamepad_upper_toggle.py: 1x start / 2x stop hopper-upper.
         self._patrol_enable: bool = False
-        self._last_select: bool = False
 
         self.lc.subscribe("hopper_data_lcmt", self._handle_robot_data)
         self.lc.subscribe("hopper_imu_lcmt", self._handle_imu_data)
@@ -1003,23 +1005,15 @@ class ModeELCMController:
                 # LT owns the temporary height for the transition push;
                 # cancel any remaining RT first-hop countdown.
                 self._rt_hop_height_remaining = 0
-                if bool(getattr(self.lcm_cfg, "switch_lt_stand", True)):
-                    print(
-                        "[gait] LT ARMED -> hop_height=%.3f m; on next "
-                        "compression: fold RM 0 -> %.1f; legs finish that "
-                        "hop; at liftoff: props OFF + hold leg %.3f m, "
-                        "then MOBILE"
-                        % (float(self.lcm_cfg.switch_lt_hop_height_m),
-                           float(self.lcm_cfg.rm_mobile_rad),
-                           float(self.lcm_cfg.switch_lt_leg_len_m))
-                    )
-                else:
-                    print(
-                        "[gait] LT ARMED -> on liftoff / airborne at "
-                        "%.3f m: legs/props OFF, RM 0 -> %.1f rad, MOBILE"
-                        % (float(self.lcm_cfg.switch_lt_hop_height_m),
-                           float(self.lcm_cfg.rm_mobile_rad))
-                    )
+                print(
+                    "[gait] LT ARMED -> hop_height=%.3f m; on next "
+                    "compression: fold RM 0 -> %.1f; legs finish that "
+                    "hop; at liftoff: props OFF + hold leg %.3f m, "
+                    "then MOBILE"
+                    % (float(self.lcm_cfg.switch_lt_hop_height_m),
+                       float(self.lcm_cfg.rm_mobile_rad),
+                       float(self.lcm_cfg.switch_lt_leg_len_m))
+                )
         self._mode_last_lb = bool(lt_now)
 
         if bool(rt_now) and (not bool(self._mode_last_rb)):
@@ -1056,21 +1050,18 @@ class ModeELCMController:
                 self._lt_await_lo_stand = False
                 self._rm_stage = 0
                 self._rm_iq_des[:] = 0.0
-                # RT normally forces props ON for P4 + first hop. TEMP leg-only
-                # bring-up: leave props off so only the stand swing PD is visible.
-                if not bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
-                    self._prop_enable = True
+                # RT forces props ON for P4 + first hop.
+                self._prop_enable = True
                 print(
                     "[switch_loop] RT MOBILE -> P4: align L=%.3fm, then "
-                    "extend/hold L=%.3fm (cap %.1fNm)%s for %.1fs, then "
-                    "enter FLIGHT/HOPPING (RM unfold + prop base 1600; "
-                    "normal hopping from there)"
+                    "extend/hold L=%.3fm (cap %.1fNm) + props %.0fus for "
+                    "%.1fs, then enter FLIGHT/HOPPING (RM unfold + prop "
+                    "base 1600; normal hopping from there)"
                     % (
                         float(self.lcm_cfg.switch_rb_align_leg_len_m),
                         float(self.lcm_cfg.switch_rb_leg_len_m),
                         float(self.lcm_cfg.switch_rb_tau_max_nm),
-                        (" + props OFF (leg-only)" if bool(self.lcm_cfg.rt_leg_only_no_prop_rm)
-                         else (" + props %.0fus" % float(self.lcm_cfg.switch_rb_prop_base_pwm_us))),
+                        float(self.lcm_cfg.switch_rb_prop_base_pwm_us),
                         float(self.lcm_cfg.switch_rb_pushdelay_s),
                     )
                 )
@@ -1106,9 +1097,8 @@ class ModeELCMController:
             self._rb_p4_t0 = None
             self._rb_p4_aligning = False
             self._reset_mobile_leg_stow()
-            self._restore_rt_first_hop_l0()
-            self._rt_first_hop_flight_damp = False
             self._restore_hop_height("B abort")
+            self._restore_rt_first_hop_l0()
             self._rm_iq_des = np.zeros(3, dtype=float)
             self._rm_zero_until = 0.0
             if int(self._mode_est) != DAMP:
@@ -1154,15 +1144,6 @@ class ModeELCMController:
         self._mode_last_a = bool(a_now)
         self._mode_last_start = bool(start_now)
 
-    def _restore_rt_first_hop_l0(self) -> None:
-        """Undo the RT first-hop spring + l0 overrides (idempotent)."""
-        self.core.cfg.rt_first_hop_spring_active = False
-        if self._rt_l0_restore is not None:
-            self.core.cfg.leg_l0_m = float(self._rt_l0_restore)
-            self._rt_l0_restore = None
-            print("[switch_loop] first-hop l0 restored -> %.3f m"
-                  % float(self.core.cfg.leg_l0_m))
-
     def _override_hop_height(self, h_m: float, reason: str) -> None:
         """Temporarily force the active height knob; save prior once.
 
@@ -1195,6 +1176,47 @@ class ModeELCMController:
                 % (reason, h_old, h_new, float(self._hop_height_restore))
             )
 
+    def _arm_rt_first_hops(self, reason: str) -> None:
+        """MOBILE->HOPPING first-N hop height override (disabled when N=0)."""
+        n_hops = int(max(0, int(self.lcm_cfg.switch_rt_hop_height_n)))
+        if n_hops <= 0:
+            return
+        self._override_hop_height(
+            float(self.lcm_cfg.switch_rt_hop_height_m),
+            "%s first %d hop(s)" % (reason, n_hops),
+        )
+        self._rt_hop_height_remaining = n_hops
+
+    def _arm_rt_first_hop_l0(self, reason: str) -> None:
+        """Override leg_l0 for RM-unfold flight + first hopping stance."""
+        l0_new = float(self.lcm_cfg.switch_rb_first_hop_l0_m)
+        if self._rt_l0_restore is None:
+            self._rt_l0_restore = float(self.core.cfg.leg_l0_m)
+        l0_old = float(self.core.cfg.leg_l0_m)
+        self.core.cfg.leg_l0_m = l0_new
+        self._rt_first_hop_l0_saw_td = False
+        # Force FLIGHT so P4's planted stance cannot fire a fake LO that
+        # would restore l0 and swing-extend the leg (log 152156: 0.43→0.455
+        # in 20 ms while RM started).
+        self.core._stance = False
+        self.core._td_t = None
+        self.core._lo_t = None
+        print(
+            "[switch_loop] first-hop l0 (%s): %.3f -> %.3f m (restore %.3f); "
+            "force FLIGHT hold"
+            % (reason, l0_old, l0_new, float(self._rt_l0_restore))
+        )
+
+    def _restore_rt_first_hop_l0(self) -> None:
+        """Undo the RT first-hop l0 override (idempotent)."""
+        if self._rt_l0_restore is None:
+            return
+        self.core.cfg.leg_l0_m = float(self._rt_l0_restore)
+        self._rt_l0_restore = None
+        self._rt_first_hop_l0_saw_td = False
+        print("[switch_loop] first-hop l0 restored -> %.3f m"
+              % float(self.core.cfg.leg_l0_m))
+
     def _restore_hop_height(self, reason: str) -> None:
         """Undo a temporary height override (idempotent)."""
         self._rt_hop_height_remaining = 0
@@ -1223,14 +1245,18 @@ class ModeELCMController:
             )
 
     def _open_prop_base_window(self) -> None:
-        """RT prop support as a COLLECTIVE inside ModeE (no PWM clamping).
+        """RT first-hop prop support: collective + PWM floor.
 
         Converts hop_prop_base_pwm_us into total thrust (3*k*(pwm-1000)^2)
         and overrides ModeE's prop_base_thrust_ratio (flight) and
         prop_stance_base_thrust_ratio (stance) so the allocator carries the
-        support while keeping FULL two-sided attitude authority. The old
-        per-motor max(pwm, base) clamp is gone -- it pinned arms at the floor
-        and halved the available moment (01:17 log jitter + pitch runaway).
+        support while keeping FULL two-sided attitude authority. A hard
+        per-motor floor (hop_prop_base_pwm_min_us) is applied in the
+        publish path while the window is open.
+
+        Closes on the first REAL hop liftoff (must see a TD first, so the
+        P4 handoff fake LO cannot kill it) or hop_prop_base_timeout_s,
+        whichever comes first.
         """
         k = float(self.modee_cfg.prop_k_thrust)
         d = max(0.0, float(self.lcm_cfg.hop_prop_base_pwm_us) - 1000.0)
@@ -1247,13 +1273,15 @@ class ModeELCMController:
         )
         self._hop_prop_base_active = True
         self._hop_prop_base_t0 = time.time()
+        self._hop_prop_base_saw_td = False
         print(
             "[prop] base window OPEN: collective %.1f N (%.0f%% weight, "
-            "= %.0f us/arm) via ModeE ratio override (close on RM done "
-            "or %.1fs)"
+            "= %.0f us/arm, floor %.0f us) via ModeE ratio override "
+            "(close on first-hop LO or %.1fs)"
             % (ratio * mg, 100.0 * ratio,
                float(self.lcm_cfg.hop_prop_base_pwm_us),
-               float(getattr(self.lcm_cfg, "hop_prop_base_timeout_s", 4.0)))
+               float(getattr(self.lcm_cfg, "hop_prop_base_pwm_min_us", 1600.0)),
+               float(getattr(self.lcm_cfg, "hop_prop_base_timeout_s", 1.0)))
         )
 
     def _close_prop_base_window(self, reason: str) -> None:
@@ -1261,6 +1289,7 @@ class ModeELCMController:
         was_active = bool(self._hop_prop_base_active)
         self._hop_prop_base_active = False
         self._hop_prop_base_t0 = None
+        self._hop_prop_base_saw_td = False
         if self._prop_ratio_restore is not None:
             base_fl, base_st = self._prop_ratio_restore
             self.core.cfg.prop_base_thrust_ratio = float(base_fl)
@@ -1269,77 +1298,6 @@ class ModeELCMController:
             if was_active:
                 print("[prop] base window CLOSED (%s) -> ModeE prop control"
                       % reason)
-
-    def _enter_hop_from_rb(self) -> None:
-        """LEGACY (unused since 2026-07-24 07:05): spring-takeoff RT handoff.
-
-        Replaced by the RT stand-and-unfold flow (_rt_stand_t0): P4 places
-        the leg, then the leg holds its length uncapped while RM unfolds
-        synchronized, and hopping starts in plain FLIGHT with no first-hop
-        spring / l0 override.  Kept for reference / quick rollback.
-
-        Old behavior: enter HOPPING with one plain spring takeoff.
-
-        RM +11.5 -> 0 is armed here and starts at the next liftoff. The first
-        stance bypasses FB-SLIP and releases a MATLAB-style virtual spring from
-        the static P4 pose to switch_rb_first_hop_l0_m. At liftoff the spring
-        mode and l0 override are cleared; hop 2+ uses normal FB-SLIP.
-
-        TEMP: with rt_leg_only_no_prop_rm, skip prop arming and RM arming."""
-        self._switch_loop = False
-        self._rb_p4_t0 = None
-        self._gait_mode = "hopping"
-        # First-hop simple spring + l0 override (this RT loop's push only).
-        if self._rt_l0_restore is None:
-            self._rt_l0_restore = float(self.core.cfg.leg_l0_m)
-        self.core.cfg.leg_l0_m = float(self.lcm_cfg.switch_rb_first_hop_l0_m)
-        self.core.cfg.rt_first_hop_spring_active = True
-        # The in-flight leg retraction (first-hop l0 -> normal l0) stretches
-        # this hop's flight arc, so its eta measurement is invalid; skip it.
-        self.core._eta_skip_once = True
-        self.core._n_flights_done = 0
-        self.core._flight_dur_prev = 0.0
-        self.core._push_vel_ring[:] = 0.0
-        self.core._push_vel_ring_i = 0
-        self.core._push_vel_ring_cnt = 0
-        self.core._vz_push_ring[:] = 0.0
-        self.core._vz_push_ring_i = 0
-        self.core._vz_push_ring_cnt = 0
-        leg_only = bool(self.lcm_cfg.rt_leg_only_no_prop_rm)
-        # 2026-07-23 21:15 (user): the prop base must cover the WHOLE
-        # transition with no gap -- P4 stand (1200 forced) -> first push ->
-        # flight -> RM unfold -- and release only after RM reaches 0.
-        # Applied as a ModeE collective-ratio override (see
-        # _open_prop_base_window); cleared when the RT RM drive finishes.
-        if not leg_only:
-            self._open_prop_base_window()
-        else:
-            self._close_prop_base_window("leg-only RT")
-        self._hop_prop_base_liftoff_count = 0
-        if not leg_only:
-            self._prop_enable = True
-            self._rm_rt_pending = True
-        else:
-            self._prop_enable = False
-            self._rm_rt_pending = False
-        print(
-            "[switch_loop] ENTER HOPPING: plain spring first takeoff, "
-            "l0=%.3f m k=%.0f N/m%s"
-            % (
-                float(self.lcm_cfg.switch_rb_first_hop_l0_m),
-                float(self.core.cfg.rt_first_hop_spring_k_n_m),
-                " (leg-only: props/RM OFF)"
-                if leg_only
-                else (
-                    "; RM +11.5 -> %.1f armed for next liftoff; "
-                    "prop base %.0fus OPEN now (push+flight) until RM done"
-                    % (
-                        float(self.lcm_cfg.rm_hopping_rad),
-                        float(self.lcm_cfg.hop_prop_base_pwm_us),
-                    )
-                ),
-            )
-        )
 
     def _handle_robot_data(self, channel: str, data: bytes) -> None:
         msg = hopper_data_lcmt.decode(data)
@@ -3778,7 +3736,11 @@ class ModeELCMController:
             os.makedirs(logs_dir, exist_ok=True)
             # One unique file per upper-controller process; mirrored to
             # modee_latest.csv only when the process stops.
-            stamp = time.strftime("%Y%m%d_%H%M%S")
+            # Filename stamp is ALWAYS Asia/Shanghai (Beijing), independent of
+            # process TZ / locale (2026-08-12 user: "log要记录着北京时间").
+            stamp = datetime.now(timezone(timedelta(hours=8))).strftime(
+                "%Y%m%d_%H%M%S"
+            )
             log_name = os.environ.get("MODEE_LOG_NAME", f"modee_{stamp}.csv")
             path = os.path.join(logs_dir, log_name)
             self._log_latest_path = os.path.join(logs_dir, "modee_latest.csv")
@@ -3788,6 +3750,7 @@ class ModeELCMController:
 
             header = [
                 "wall_time_s",
+                "wall_bj",
                 "t_s",
                 "phase",
                 "gait_mode",
@@ -3800,7 +3763,6 @@ class ModeELCMController:
                 "rm_target_rad",
                 "rm_lt_pending",
                 "rm_rt_pending",
-                "rt_first_hop_l0_active",
                 "stance",
                 "compress_active",
                 "push_started",
@@ -4154,6 +4116,9 @@ class ModeELCMController:
             self._log_last_flush_t = float(time.time())
             self._log_rows = 0
             print(f"[log] START -> {path}")
+            # RETENTION (2026-08-12 16:38, user: "改成无限存"): no prune.
+            # Previously kept newest 5 after Jetson hit 177 GB; user wants
+            # all timestamped modee_<stamp>.csv kept. Watch disk manually.
         except Exception as e:
             # Don't kill controller if logging fails.
             self._log_enabled = False
@@ -4267,24 +4232,6 @@ class ModeELCMController:
                 pass
 
         self._last_point = bool(point_now)
-
-    def _handle_big_jump_trigger(self, gamepad_msg) -> None:
-        """
-        RB rising edge:
-        Arm one-shot big jump in core, executed at next stance touchdown.
-        """
-        rb_now = False
-        try:
-            rb_now = bool(getattr(gamepad_msg, "rightBumper", 0)) if gamepad_msg is not None else False
-        except Exception:
-            rb_now = False
-
-        if bool(rb_now) and (not bool(self._last_rb)):
-            try:
-                self.core.user_request_big_jump_next_stance()
-            except Exception:
-                pass
-        self._last_rb = bool(rb_now)
 
     def _safe_status_label(
         self,
@@ -4598,8 +4545,14 @@ class ModeELCMController:
             hop_height_m = float(info.get("hop_height_m", float("nan")))
             mpc_u0 = np.asarray(info.get("mpc_u0", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
 
+            # Readable Beijing wall clock next to unix epoch wall_time_s
+            # (2026-08-12 user: "log要记录着北京时间").
+            wall_bj = datetime.fromtimestamp(
+                float(wall_time_s), tz=timezone(timedelta(hours=8))
+            ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             row = [
                 float(wall_time_s),
+                wall_bj,
                 float(info.get("t", float("nan"))),
                 phase,
                 str(self._gait_mode),
@@ -4612,7 +4565,6 @@ class ModeELCMController:
                 float(self._rm_target),
                 int(bool(self._rm_lt_pending)),
                 int(bool(self._rm_rt_pending)),
-                int(self._rt_l0_restore is not None),
                 stance,
                 compress,
                 push_started,
@@ -5061,9 +5013,6 @@ class ModeELCMController:
                 self._handle_zero_vel_trigger(gamepad_msg)
                 # LEFT stick Y detent: up-release +2 cm, down-release -2 cm.
                 self._handle_hop_height_stick(gamepad_msg)
-                # NOTE: RB is now repurposed as the prop-switch toggle (handled in
-                # _update_mode_est). The old one-shot big-jump RB trigger is disabled.
-                # self._handle_big_jump_trigger(gamepad_msg)
 
                 if (not have_motor) or (not have_imu):
                     # Wait for first packets
@@ -5073,12 +5022,8 @@ class ModeELCMController:
 
                 desired_v_xy = self._compute_desired_v_xy(gamepad_msg)
 
-                # ===== LiDAR patrol (SELECT toggles; stick/B wins back) =====
-                sel_now = bool(getattr(gamepad_msg, "select", 0)) if gamepad_msg is not None else False
-                if sel_now and not self._last_select:
-                    self._patrol_enable = not self._patrol_enable
-                    print(f"[patrol] {'ENGAGED' if self._patrol_enable else 'OFF'} (SELECT)")
-                self._last_select = sel_now
+                # ===== LiDAR patrol (external enable; stick/B wins back) =====
+                # SELECT/Back no longer toggles patrol — see hopper-gamepad-upper.
                 b_now_pat = bool(getattr(gamepad_msg, "b", 0)) if gamepad_msg is not None else False
                 stick_moved = bool(np.any(np.abs(desired_v_xy) > 1e-9))  # already deadzoned
                 if self._patrol_enable and (b_now_pat or stick_moved):
@@ -5159,7 +5104,6 @@ class ModeELCMController:
                     # pause and only re-arm on a deliberate A press (otherwise they spin again).
                     self._prop_enable = False
                     self._close_prop_base_window("SAFE")
-                    self._restore_rt_first_hop_l0()
                     # damping-like joints (in case driver is still in PD/PWMPD)
                     kd = float(self.lcm_cfg.safe_damp_kd)
                     self._publish_hopper_cmd(np.zeros(3, dtype=float), kp_joint=np.zeros(3, dtype=float), kd_joint=np.full(3, kd, dtype=float))
@@ -5204,24 +5148,6 @@ class ModeELCMController:
                     desired_v_xy_w=desired_v_xy,
                 )
 
-                # RT first-hop l0 override ends at the FIRST liftoff: the push
-                # extended to switch_rb_first_hop_l0_m; hop 2 onwards uses the
-                # normal leg_l0_m again. Arm extra flight AK60 kd for this
-                # airborne segment (cleared at the next TD).
-                if (self._rt_l0_restore is not None) and int(info.get("liftoff", 0)) != 0:
-                    self._rt_first_hop_flight_damp = True
-                    self._restore_rt_first_hop_l0()
-                    print(
-                        "[ak60] RT first-hop FLIGHT damp kd=%.2f"
-                        % float(getattr(
-                            self.lcm_cfg,
-                            "switch_rt_first_hop_flight_ak60_kd",
-                            0.4,
-                        ))
-                    )
-                if (bool(self._rt_first_hop_flight_damp)
-                        and int(info.get("touchdown", 0)) != 0):
-                    self._rt_first_hop_flight_damp = False
                 # RT first-N hop_height override: count completed pushes.
                 if (int(self._rt_hop_height_remaining) > 0
                         and int(info.get("liftoff", 0)) != 0):
@@ -5237,6 +5163,15 @@ class ModeELCMController:
                             % (int(self._rt_hop_height_remaining),
                                float(self.core.cfg.hop_height_m))
                         )
+                # First-hop l0 (0.43) stays through RM-unfold FLIGHT hold.
+                # Restore to normal l0 (0.455) only after a REAL touchdown
+                # then liftoff — not the fake LO at P4 handoff (log 152156).
+                if self._rt_l0_restore is not None:
+                    if int(info.get("touchdown", 0)) != 0:
+                        self._rt_first_hop_l0_saw_td = True
+                    if (bool(self._rt_first_hop_l0_saw_td)
+                            and int(info.get("liftoff", 0)) != 0):
+                        self._restore_rt_first_hop_l0()
 
                 # Enabled HOPPING + LT (stand-and-fold), 2026-08-10:
                 #   compression (TD) -> start RM fold (legs keep hopping)
@@ -5246,9 +5181,7 @@ class ModeELCMController:
                 # stance, that stance is left untouched and folding waits for
                 # the following TD.
                 lt_compress = int(info.get("touchdown", 0)) != 0
-                if (bool(self._rm_lt_pending)
-                        and bool(getattr(self.lcm_cfg, "switch_lt_stand", True))
-                        and lt_compress):
+                if bool(self._rm_lt_pending) and lt_compress:
                     self._rm_lt_pending = False
                     self._rm_rt_pending = False
                     self._lt_await_lo_stand = True
@@ -5262,7 +5195,6 @@ class ModeELCMController:
                         % float(self.lcm_cfg.rm_mobile_rad)
                     )
                 elif (bool(self._lt_await_lo_stand)
-                        and bool(getattr(self.lcm_cfg, "switch_lt_stand", True))
                         and int(info.get("liftoff", 0)) != 0):
                     self._lt_await_lo_stand = False
                     self._lt_stand_t0 = time.time()
@@ -5277,44 +5209,18 @@ class ModeELCMController:
                            float(self.lcm_cfg.switch_lt_tau_max_nm),
                            float(self.lcm_cfg.rm_mobile_rad))
                     )
-                # Legacy LT (switch_lt_stand=False): enter MOBILE as soon as
-                # airborne; legs force-free while RM folds.
-                elif (bool(self._rm_lt_pending)
-                        and not bool(getattr(
-                            self.lcm_cfg, "switch_lt_stand", True))
-                        and (
-                        int(info.get("liftoff", 0)) != 0
-                        or int(info.get("stance", 0)) == 0)):
-                    self._rm_lt_pending = False
-                    self._lt_await_lo_stand = False
-                    self._rm_rt_pending = False
-                    self._gait_mode = "mobile"
-                    self._reset_mobile_leg_stow()
-                    self._restore_hop_height("LT -> MOBILE")
-                    self._prop_enable = False
-                    self._close_prop_base_window("LT -> MOBILE")
-                    self._rm_start(
-                        float(self.lcm_cfg.rm_mobile_rad),
-                        "LT job (airborne -> MOBILE)",
-                    )
-                    print(
-                        "[gait] MOBILE: props OFF; leg stows after "
-                        "wheel motion (1 Nm -> damp hold)"
-                    )
                 # RT: after P4 handoff, wait for the first push to finish
                 # (liftoff) before unfolding RM +11.5 -> 0.
-                # TEMP: skipped when rt_leg_only_no_prop_rm (pending never set).
                 elif bool(self._rm_rt_pending) and int(info.get("liftoff", 0)) != 0:
                     self._rm_rt_pending = False
-                    if not bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
-                        self._rm_start(
-                            float(self.lcm_cfg.rm_hopping_rad),
-                            "RT job (push end -> unfold RM)",
-                        )
-                        print(
-                            "[gait] RT: push end -> RM +11.5 -> %.1f rad"
-                            % float(self.lcm_cfg.rm_hopping_rad)
-                        )
+                    self._rm_start(
+                        float(self.lcm_cfg.rm_hopping_rad),
+                        "RT job (push end -> unfold RM)",
+                    )
+                    print(
+                        "[gait] RT: push end -> RM +11.5 -> %.1f rad"
+                        % float(self.lcm_cfg.rm_hopping_rad)
+                    )
 
                 if self._lt_stand_t0 is not None:
                     # LT stand-and-fold: entered at liftoff AFTER RM fold
@@ -5380,22 +5286,27 @@ class ModeELCMController:
                         imu_quat_wxyz=imu_quat,
                     )
                     tau_out_scale_applied = 1.0
-                    if bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
-                        pwm_min = float(self.modee_cfg.pwm_min_us)
-                        pwm_us = np.full(6, pwm_min, dtype=float)
-                        props_active = False
-                        rm_near = False
-                    else:
-                        # Keep ModeE pwm_us from step (base 1600 + attitude).
-                        props_active = True
-                        near_deg = float(getattr(
-                            self.lcm_cfg, "switch_rt_stand_rm_near_deg", 10.0
-                        ))
-                        rm_near = (
-                            int(self._rm_stage) == 2
-                            and self._rm_max_abs_err_rad()
-                            <= float(np.deg2rad(max(0.0, near_deg)))
-                        ) or int(self._rm_stage) != 2
+                    # Keep ModeE pwm_us from step, but enforce the same
+                    # hard per-motor floor used during the hopping RM-unfold
+                    # window (hop_prop_base_pwm_min_us = 1600).
+                    floor = float(getattr(
+                        self.lcm_cfg, "hop_prop_base_pwm_min_us", 1600.0
+                    ))
+                    pwm_us = np.asarray(pwm_us, dtype=float).reshape(6)
+                    for grp in self.modee_cfg.prop_pwm_idx_per_arm:
+                        for idx in grp:
+                            ii = int(idx)
+                            if 0 <= ii < 6:
+                                pwm_us[ii] = max(float(pwm_us[ii]), floor)
+                    props_active = True
+                    near_deg = float(getattr(
+                        self.lcm_cfg, "switch_rt_stand_rm_near_deg", 10.0
+                    ))
+                    rm_near = (
+                        int(self._rm_stage) == 2
+                        and self._rm_max_abs_err_rad()
+                        <= float(np.deg2rad(max(0.0, near_deg)))
+                    ) or int(self._rm_stage) != 2
                     min_s = float(max(0.0, float(getattr(
                         self.lcm_cfg, "switch_rt_stand_min_s", 2.0
                     ))))
@@ -5409,11 +5320,15 @@ class ModeELCMController:
                         # clear cold-start / latch state. No special l0.
                         # RM drive is intentionally LEFT RUNNING so the
                         # arms finish to 0 (or hit rm_drive_timeout).
-                        self._restore_rt_first_hop_l0()
-                        self._rt_first_hop_flight_damp = False
-                        self.core.cfg.rt_first_hop_spring_active = False
                         self.core._n_flights_done = 0
                         self.core._flight_dur_prev = 0.0
+                        # 2026-08-11 12:17: stale _lo_t from the MOBILE
+                        # stance made the first hopping TD count a fake
+                        # flight (T_fl~1.2s in [0.12,1.5]) -> ++ BEFORE
+                        # the first stance, so every first-hop gate
+                        # (<1) was skipped (logs 120626/121233 pinned
+                        # at 42 N). Clear the liftoff clock too.
+                        self.core._lo_t = None
                         if hasattr(self.core, "_stance_dur_prev"):
                             self.core._stance_dur_prev = 0.0
                         self.core._push_vel_ring[:] = 0.0
@@ -5422,17 +5337,12 @@ class ModeELCMController:
                         self.core._vz_push_ring[:] = 0.0
                         self.core._vz_push_ring_i = 0
                         self.core._vz_push_ring_cnt = 0
-                        n_hops = int(max(
-                            0, int(self.lcm_cfg.switch_rt_hop_height_n)
-                        ))
-                        if n_hops > 0:
-                            self._override_hop_height(
-                                float(self.lcm_cfg.switch_rt_hop_height_m),
-                                "RT first %d hop(s)" % n_hops,
-                            )
-                            self._rt_hop_height_remaining = n_hops
-                        if not bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
-                            self._prop_enable = True
+                        # 2026-08-12 (user): first hop after MOBILE->HOPPING
+                        # has no XY initial velocity; hop 2 starts calculating.
+                        self.core._rt_first_lo_zero_xy = True
+                        self._prop_enable = True
+                        self._arm_rt_first_hops("RT-STAND")
+                        self._arm_rt_first_hop_l0("RT-STAND")
                         why = (
                             "TIMEOUT" if timed_out else
                             ("RM within %.0fdeg (slowest); RM continues"
@@ -5452,7 +5362,7 @@ class ModeELCMController:
                     # RT (P4): first retract to the short alignment length
                     # while returning the foot WORLD-vertical. Once aligned
                     # (or timeout), extend and hold at switch_rb_leg_len_m
-                    # (= 0.455 normal l0), then enter FLIGHT/HOPPING with
+                    # (= 0.45 normal l0), then enter FLIGHT/HOPPING with
                     # RM unfold + prop base 1600.
                     q_arr = np.asarray(q, dtype=float).reshape(3)
                     qd_arr = np.asarray(qd, dtype=float).reshape(3)
@@ -5461,27 +5371,40 @@ class ModeELCMController:
                        (self._rb_p4_t0 is not None) and \
                        (now_t - float(self._rb_p4_t0)) >= float(self.lcm_cfg.switch_rb_pushdelay_s):
                         # 2026-08-10 21:40 (user): P4 held at normal l0
-                        # (0.455); enter FLIGHT/HOPPING.  RM unfolds and
-                        # prop base 1600 run in parallel.  From here it is
-                        # normal hopping -- same l0 / height / velocity law,
-                        # no first-hop specials.
+                        # (0.45); enter FLIGHT/HOPPING.  RM unfolds and
+                        # prop base 1600 run in parallel.  First hop is
+                        # normal hopping (no height/spring/kd specials).
                         self._switch_loop = False
                         self._rb_p4_t0 = None
                         self._rb_p4_aligning = False
                         self._gait_mode = "hopping"
-                        # Ensure no leftover special-l0 override (legacy path).
-                        self._restore_rt_first_hop_l0()
-                        self.core.cfg.rt_first_hop_spring_active = False
-                        self.core._rt_first_lo_zero_xy = False
-                        if not bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
-                            self._prop_enable = True
-                            self._open_prop_base_window()
-                            self._rm_start(
-                                float(self.lcm_cfg.rm_hopping_rad),
-                                "RT: unfold RM alongside hopping (flight)",
-                            )
-                        else:
-                            self._close_prop_base_window("leg-only RT")
+                        # 2026-08-12 (user): first hop after MOBILE->HOPPING
+                        # has no XY initial velocity; hop 2 starts calculating.
+                        # (Was False since 2026-08-10; polluted LO latch then
+                        # fed Raibert on hop 1.)
+                        self.core._rt_first_lo_zero_xy = True
+                        self.core._n_flights_done = 0
+                        self.core._flight_dur_prev = 0.0
+                        # 2026-08-11 12:17: clear stale MOBILE liftoff
+                        # clock -- see RT-STAND handoff comment (fake
+                        # flight count skipped all first-hop gates).
+                        self.core._lo_t = None
+                        if hasattr(self.core, "_stance_dur_prev"):
+                            self.core._stance_dur_prev = 0.0
+                        self.core._push_vel_ring[:] = 0.0
+                        self.core._push_vel_ring_i = 0
+                        self.core._push_vel_ring_cnt = 0
+                        self.core._vz_push_ring[:] = 0.0
+                        self.core._vz_push_ring_i = 0
+                        self.core._vz_push_ring_cnt = 0
+                        self._prop_enable = True
+                        self._open_prop_base_window()
+                        self._arm_rt_first_hops("P4")
+                        self._arm_rt_first_hop_l0("P4")
+                        self._rm_start(
+                            float(self.lcm_cfg.rm_hopping_rad),
+                            "RT: unfold RM alongside hopping (flight)",
+                        )
                         print(
                             "[gait] RT -> FLIGHT/HOPPING: hold was L=%.3f m "
                             "(= normal l0), RM +11.5 -> %.1f + prop base "
@@ -5530,18 +5453,14 @@ class ModeELCMController:
                     tau_out_scale_applied = 1.0
                     pwm_min = float(self.modee_cfg.pwm_min_us)
                     pwm_us = np.full(6, pwm_min, dtype=float)
-                    # TEMP leg-only: keep props OFF during P4. Otherwise force
-                    # the upward 1100 us baseline.
-                    if bool(self.lcm_cfg.rt_leg_only_no_prop_rm):
-                        props_active = False
-                    else:
-                        prop_pwm_up = float(self.lcm_cfg.switch_rb_prop_base_pwm_us)
-                        for grp in self.modee_cfg.prop_pwm_idx_per_arm:
-                            for idx in grp:
-                                ii = int(idx)
-                                if 0 <= ii < 6:
-                                    pwm_us[ii] = prop_pwm_up
-                        props_active = True
+                    # Force the upward prop baseline during P4 place.
+                    prop_pwm_up = float(self.lcm_cfg.switch_rb_prop_base_pwm_us)
+                    for grp in self.modee_cfg.prop_pwm_idx_per_arm:
+                        for idx in grp:
+                            ii = int(idx)
+                            if 0 <= ii < 6:
+                                pwm_us[ii] = prop_pwm_up
+                    props_active = True
                 elif self._gait_mode == "manipulation":
                     # Deployed appendages carry the body. Wheels are stopped
                     # below; the released 3-RSR leg tracks a body-frame point
@@ -5661,18 +5580,27 @@ class ModeELCMController:
                     # Normal mode: props follow the A-switch. pwm_us keeps ModeE's real values
                     # (visible in lcm-spy); control_mode tells the bridge whether to spin.
                     props_active = bool(control_enabled and self._prop_enable)
-                    # Prop base window (2026-07-24 01:36 rework): the support
-                    # now rides INSIDE ModeE as a collective-ratio override
-                    # (_open_prop_base_window), so pwm_us here is already the
-                    # allocator's two-sided solution -- no per-motor clamping.
-                    # Close base window when RM unfold leaves drive, or
-                    # when the wall-clock timeout expires (stuck unfold).
+                    # Prop base window: collective rides inside ModeE
+                    # (_open_prop_base_window). Hard per-motor PWM floor
+                    # while open. Closes on first real hop LO (after TD)
+                    # or hop_prop_base_timeout_s -- not on RM unfold done.
                     if bool(self._hop_prop_base_active):
+                        floor = float(getattr(
+                            self.lcm_cfg, "hop_prop_base_pwm_min_us", 1600.0
+                        ))
+                        pwm_us = np.asarray(pwm_us, dtype=float).reshape(6)
+                        for grp in self.modee_cfg.prop_pwm_idx_per_arm:
+                            for idx in grp:
+                                ii = int(idx)
+                                if 0 <= ii < 6:
+                                    pwm_us[ii] = max(float(pwm_us[ii]), floor)
+                        if int(info.get("touchdown", 0)) != 0:
+                            self._hop_prop_base_saw_td = True
                         t0 = self._hop_prop_base_t0
                         timeout_s = float(max(
                             0.0,
                             getattr(
-                                self.lcm_cfg, "hop_prop_base_timeout_s", 4.0
+                                self.lcm_cfg, "hop_prop_base_timeout_s", 1.0
                             ),
                         ))
                         timed_out = (
@@ -5680,16 +5608,16 @@ class ModeELCMController:
                             and t0 is not None
                             and (time.time() - float(t0)) >= timeout_s
                         )
-                        rm_done = (
-                            (not bool(self._rm_rt_pending))
-                            and int(self._rm_stage) != 2
+                        first_hop_done = (
+                            bool(self._hop_prop_base_saw_td)
+                            and int(info.get("liftoff", 0)) != 0
                         )
                         if timed_out:
                             self._close_prop_base_window(
                                 "timeout %.1fs" % timeout_s
                             )
-                        elif rm_done:
-                            self._close_prop_base_window("RM unfold done")
+                        elif first_hop_done:
+                            self._close_prop_base_window("first hop LO")
                 # RM M2006 sequence: refresh _rm_iq_des (rides inside hopper_cmd_lcmt below).
                 self._update_rm()
                 # MOBILE kiwi wheels: drive only in enabled MOBILE once the
@@ -5752,15 +5680,19 @@ class ModeELCMController:
                     kd_use = float(max(0.0, float(getattr(
                         self.lcm_cfg, "switch_rt_stand_ak60_kd", 2.0
                     ))))
-                elif (bool(self._rt_first_hop_flight_damp)
-                        and (not bool(in_stance))):
-                    kd_use = float(max(0.0, float(getattr(
-                        self.lcm_cfg,
-                        "switch_rt_first_hop_flight_ak60_kd",
-                        0.4,
-                    ))))
                 else:
                     kd_use = float(kd_stance if in_stance else kd_flight)
+                    # 第一跳 (n_flights_done<1) 支撑期额外阻尼：
+                    # 切换后首次落地时 RM 臂还在展开，多给点耗散。
+                    if (in_stance and self._gait_mode == "hopping"
+                            and int(getattr(
+                                self.core, "_n_flights_done", 1
+                            )) < 1):
+                        kd_use = float(max(kd_use, float(getattr(
+                            self.lcm_cfg,
+                            "ak60_first_hop_stance_damp_kd",
+                            0.4,
+                        ))))
                 if kd_use > 0.0:
                     self._publish_hopper_cmd(
                         tau_send,

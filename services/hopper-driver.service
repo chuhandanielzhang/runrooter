@@ -1,22 +1,34 @@
 [Unit]
 Description=Hopper leg motor driver (AK60 via CAN)
-After=canable.service
-Requires=canable.service
-# Wheel bus (can1) is OPTIONAL: order after it so DmWheelController::init sees
-# can1 when the adapter is present, but never block hop-only operation on it.
-# 2026-08-02: Wants= REMOVED -- it queued a canable2 start job even with the
-# adapter unplugged, and canable2's BindsTo=dev-canable2.device made that job
-# wait for a device that never appears, deadlocking every hopper-driver
-# (re)start behind the After= ordering (connect_and_start hung at step 2.5/3).
-# canable2 is now pulled by its device unit alone (hot-plug); After= still
-# orders us behind it whenever the adapter IS present.
-After=canable2.service
+# 2026-08-12: canable.service/slcand retired -- adapters now run candleLight
+# (gs_usb) firmware and can0 is configured by udev + can0-gsusb.service the
+# moment the netdev appears. Order after the can0 device unit so first boot
+# sees the legs bus; Wants (not Requires) so a missing adapter degrades to
+# the driver's own "can0 missing" handling instead of blocking forever.
+# canable-watchdog restarts us whenever can0/can1 is re-created (stale
+# CAN_RAW socket / new ifindex).
+Wants=sys-subsystem-net-devices-can0.device
+After=sys-subsystem-net-devices-can0.device can0-gsusb.service can1-gsusb.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/nvidia/Hopper_srbRL
+# 2026-08-11: LCM's udpm constructor fails permanently if the 224/4 multicast
+# route is missing at process start (boot race with hopper-bringup); the driver
+# then runs but spams "LCM instance not initialized" and publishes nothing,
+# which looks like the motors are disconnected. Set the route before starting.
+ExecStartPre=-/usr/local/bin/lcm_multicast_route.sh
 ExecStart=/home/nvidia/Hopper_srbRL/build/hopper_driver
 # Runs as root (CAN access / realtime), same as the old `sudo ./build/hopper_driver`.
+# 2026-08-12: hopper-upper runs FIFO 70 while this driver ran plain TS. During
+# hopping/mobile compute bursts the RT upper starved the driver's 1kHz LCM
+# receive thread >200ms -> "force DAMP (hopper_cmd stale)" -> OFF, legs+wheels
+# dead until PD is re-clicked (3x on 2026-08-12: 14:27:24, 14:28:00, 14:40:15;
+# driver socket had 0 drops -- the packets sat unread in the kernel buffer).
+# The driver is the safety-critical path to the motors and all its threads are
+# timerfd-paced (they cannot hog a core), so it must outrank the upper.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=80
 Restart=on-failure
 RestartSec=2
 

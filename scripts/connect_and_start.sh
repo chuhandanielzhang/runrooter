@@ -64,10 +64,14 @@ rsync -a \
   "${SVC_SRC}/jetson-power.service" "${SVC_SRC}/hopper-driver.service" \
   "${SVC_SRC}/hopper-upper.service" "${SVC_SRC}/hopper-perception.service" \
   "${SVC_SRC}/hopper-bringup.service" "${SVC_SRC}/jetson_bringup.sh" \
+  "${SVC_SRC}/hopper-gamepad-upper.service" "${SVC_SRC}/gamepad_upper_toggle.py" \
+  "${SVC_SRC}/lcm_multicast_route.sh" \
   "nvidia@${JETSON_IP}:/tmp/hopper_svc/" \
   && $SSH 'sudo install -m644 /tmp/hopper_svc/*.service /etc/systemd/system/ \
     && sudo install -m755 /tmp/hopper_svc/jetson_bringup.sh /usr/local/bin/jetson_bringup.sh \
     && sudo install -m755 /tmp/hopper_svc/canable_watchdog.sh /usr/local/bin/canable_watchdog.sh \
+    && sudo install -m755 /tmp/hopper_svc/gamepad_upper_toggle.py /usr/local/bin/gamepad_upper_toggle.py \
+    && sudo install -m755 /tmp/hopper_svc/lcm_multicast_route.sh /usr/local/bin/lcm_multicast_route.sh \
     && sudo install -m644 /tmp/hopper_svc/99-canable.rules /etc/udev/rules.d/ \
     && sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=tty --action=add \
     && sudo systemctl daemon-reload \
@@ -75,8 +79,9 @@ rsync -a \
     && sudo systemctl enable canable-watchdog.service >/dev/null 2>&1 || true \
     && sudo systemctl enable jetson-power.service xrce-agent.service px4-dds-bridge.service >/dev/null 2>&1 || true \
     && sudo systemctl enable hopper-driver.service hopper-upper.service hopper-perception.service >/dev/null 2>&1 || true \
-    && sudo systemctl enable hopper-bringup.service >/dev/null 2>&1 || true \
-    && sudo systemctl restart canable-watchdog.service >/dev/null 2>&1 || true' \
+    && sudo systemctl enable hopper-bringup.service hopper-gamepad-upper.service >/dev/null 2>&1 || true \
+    && sudo systemctl restart canable-watchdog.service >/dev/null 2>&1 || true \
+    && sudo systemctl restart hopper-gamepad-upper.service >/dev/null 2>&1 || true' \
   && ok "services installed; hopper-bringup ENABLED for boot" || bad "service install failed"
 
 # ── 4. force bring-up now (same script boot will run) ──
@@ -113,6 +118,6 @@ Daily PC (plug ethernet):
   connect      :  bash ${HERE}/scripts/connect.sh ${JETSON_IP}
   update upper :  bash ${HERE}/scripts/update_upper.sh ${JETSON_IP}
   fetch logs   :  bash ${HERE}/scripts/fetch_logs.sh [label] ${JETSON_IP}
-Gamepad: X = PD,  A = props on,  B = full stop.
+Gamepad: SELECT/Back 1x=start upper, 2x=stop upper; X=PD, A=props on, B=full stop.
 ==================================================================
 TXT

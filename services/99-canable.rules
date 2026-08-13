@@ -1,17 +1,23 @@
-# CANable2 (slcan firmware, CDC-ACM tty) -> stable name + systemd device unit.
+# CANable2 adapters running candleLight (gs_usb) firmware -> native SocketCAN.
 #
-# Why: /dev/ttyACM* renumbers on every USB re-enumeration, and slcand keeps the
-# DEAD old tty open forever ("can0 up but zero frames"). These rules give each
-# adapter a stable /dev/canable* symlink AND a systemd device unit
-# (dev-canable*.device via SYSTEMD_ALIAS), so canable*.service can use
-# BindsTo=dev-canable*.device: unplug/re-enumerate -> systemd kills the zombie
-# slcand; device back -> the device unit's Wants pulls the service up again.
+# 2026-08-12: slcan/slcand retired. With gs_usb the kernel driver owns the
+# netdev directly: a USB reset (e.g. the tegra-xusb hub reset that froze all
+# 3 AK60s mid-flight on 2026-08-12) simply removes and re-adds the netdev,
+# udev re-triggers the setup unit, and the bus heals in <1s -- no zombie
+# slcand, no deleted-tty state, no 10s watchdog detection lag.
 #
-# TWO adapters since 2026-07-23 (wheel bus added), so matching must be by the
-# UNIQUE serial suffix -- a bare "*CANable2*" pattern made the /dev/canable
-# symlink flip to whichever adapter enumerated last (legs on the wrong bus!).
-#   207D36B73945 -> /dev/canable  (legs AK60/DM4310 bus, can0)
-#   209736B03945 -> /dev/canable2 (DM-H6215 wheel bus,   can1)
-# Replacing an adapter = update the serial here. Install to /etc/udev/rules.d/.
-SUBSYSTEM=="tty", ENV{ID_SERIAL}=="*CANable2*207D36B73945", SYMLINK+="canable", TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/canable"
-SUBSYSTEM=="tty", ENV{ID_SERIAL}=="*CANable2*209736B03945", SYMLINK+="canable2", TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/canable2"
+# Naming is done by can_gsusb_setup.sh (rename with retry), NOT by NAME= here:
+# the kernel hands out can0/can1 in probe order and Tegra's onboard mttcan
+# grabs "can0" at boot, so a one-shot udev rename can collide.
+#
+#   004D00663945501620303651  -> can0 (legs AK60/DM4310 bus,  1Mbit)
+#   0067005F3945501620303651 -> can1 (RM M2006 wheel bus,    1Mbit, hot-plug optional)
+#
+# Tegra onboard mttcan: rename away from "can0" at boot so the legs adapter
+# can own the name (was previously done in canable.service ExecStartPre).
+SUBSYSTEM=="net", ACTION=="add", KERNELS=="c310000.mttcan", NAME="mtt0"
+
+# candleLight netdevs: match by the USB device serial of the parent, tag for
+# systemd and pull the per-bus setup oneshot (rename + bitrate + up).
+SUBSYSTEM=="net", ACTION=="add", SUBSYSTEMS=="usb", ATTRS{serial}=="004D00663945501620303651", TAG+="systemd", ENV{SYSTEMD_WANTS}="can0-gsusb.service"
+SUBSYSTEM=="net", ACTION=="add", SUBSYSTEMS=="usb", ATTRS{serial}=="0067005F3945501620303651", TAG+="systemd", ENV{SYSTEMD_WANTS}="can1-gsusb.service"

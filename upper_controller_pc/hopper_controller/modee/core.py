@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pandas.core.indexes.base import F
+
 """
 ModeE core controller (real-robot version)
 =========================================
@@ -482,8 +484,9 @@ class ModeEConfig:
     #         T_st/2 = 上一跳实测半支撑（冷启动 0.06 s）
     #         kv = flight_kv_frac · l0/(2 v*)
     # 只换落点；stance 力法则不受影响。
-    flight_deadbeat_model: bool = True
-    flight_kv_frac: float = 0.29            # Raibert 用；→ kv≈0.06 s @ h*=4cm
+    # 2026-08-12 (user): 切回 Simulink Raibert，kv_frac 0.29 -> 0.14。
+    flight_deadbeat_model: bool = False
+    flight_kv_frac: float = 0.143            # Raibert；温和多跳收敛
     # 速度 return-map（论文形式，连续调度，无硬分档）:
     #   v⁺ − v_des = β(e) (v⁻ − v_des),   e = ||v⁻ − v_des||
     #   β(e) = β_lo + (β_hi − β_lo) · e/(e + v_β)
@@ -491,20 +494,21 @@ class ModeEConfig:
     # 另加几何下限，使模型请求的 |x_f| 不超过 stepper 工作区，
     # 避免落点顶满后支撑擦地、∫fz dt 塌掉（log 151830 后两跳）：
     #   |x_f|≈|(b−β)/a|·|v| ≤ p_max  ⇒  β ≥ b − a p_max/|v|.
+    # (β 仅闭式 deadbeat 路径使用；Raibert 模式忽略。)
     flight_deadbeat_beta: float = 0.11      # β_lo：小速度及时刹
     # 2026-08-10 (log 160616 hop2): |v|~1.3 → 摆角~26° → 支撑~140 ms
     # 压缩浅、∫fz 塌。抬高 β_hi + 收紧 p_max，大速度更碎步刹，
     # 保住能压深的 stance 时长（支撑变长是落点模型的结果，不是硬拖 LO）。
     flight_deadbeat_beta_hi: float = 0.5   # β_hi：大速度步步刹
     flight_deadbeat_beta_v_mps: float = 0.35  # v_β：软转折 [m/s]
-    flight_stepper_lim_m: float = 0.12      # |foot_xy| 上限（与 β_geo 一致）
+    flight_stepper_lim_m: float = 0.2      # |foot_xy| 上限（与 β_geo 一致）
     swing_kp_xy: float = 60.0
     swing_kd_xy: float = 1.1
     swing_kp_z: float = 1200.0
     swing_kd_z: float = 10.0
     # ---- 飞行姿态（桨调平；exp1 版本 50/8）----
-    flight_kR: float = 70.0
-    flight_kW: float = 9.0
+    flight_kR: float = 60.0
+    flight_kW: float = 8.0
     flight_tau_rp_max: float = 100.0
     # ---- fl_tilt 速度收敛（水平速度 → 桨倾斜；与落点独立）----
     # False = 只调平；True = 用桨矢量刹 v_xy
@@ -514,8 +518,9 @@ class ModeEConfig:
     flight_vel_tilt_slew_dps: float = 180.0
     flight_level_settle_s: float = 0.05     # 落地预算余量 [s]
     # ---- 桨怠速（姿态差动的底座）----
-    # Idle PWM 1200: T≈2.7 N → ratio≈0.0491 @ m=5.61
-    prop_base_thrust_ratio: float = 0.0491
+    # Idle PWM 1400: t_each = k*(400)^2 = 3.600 N, T = 10.800 N.
+    # ratio = T/(m g) @ m=5.61 → 0.1962. 2026-08-12 (user): 1200 -> 1400.
+    prop_base_thrust_ratio: float = 0.1962
     # ---- ★ 桨-腿 PUSH→apex 份额耦合 v3（hop_height 1:1）----
     # 2026-08-06 log 035505 证明全周期份额会卸载压缩：10cm 请求的
     # PUSH 仅 26-40ms、腿 0% 饱和、apex 仅 1-2.5cm。v3 明确窗口：
@@ -1165,8 +1170,16 @@ class ModeEConfig:
     # without a dead zone at liftoff.  (The stance attitude-residual
     # rationale from the HFA experiment is obsolete -- stance props are
     # collective-only under the decoupled contract.)
-    # Match flight idle (PWM 1200 / ratio 0.0491 at m=5.61).
-    prop_stance_base_thrust_ratio: float = 0.0491
+    # Match flight idle (PWM 1400 / ratio 0.1962 at m=5.61).
+    # 2026-08-12 (user): 1200 -> 1400.
+    # 2026-08-12 15:16 (user, "跳高起来有点不稳"): 0.1962 -> 0.35 (~PWM 1520,
+    # stance ONLY -- flight base stays 0.1962). Log 150816: high hops rode the
+    # 9 Nm leg wall 40% of stance (tau_cap_scale down to 0.33), so the leg's
+    # attitude/braking share got scaled away -> pitch to 13/21 deg and v_xy
+    # oscillating 0.2-1.1 m/s. Props now carry ~35% of the weight in stance,
+    # freeing ~2-3 Nm of leg headroom. The g_st coupling below automatically
+    # shrinks the stance springs to match.
+    prop_stance_base_thrust_ratio: float = 0.35
     stance_use_props: bool = True
     # ===== Hybrid leg-prop Z (TA-SLIP, 2026-07-19) =====
     # Props shape EFFECTIVE GRAVITY (continuous, low authority); the leg
@@ -2983,6 +2996,10 @@ class ModeECore:
 
         # ===== 1D MODE: force zero horizontal velocity =====
         if bool(self.cfg.mode_1d):
+            desired_v_xy_w[:] = 0.0
+        # MOBILE->HOPPING first hop (2026-08-12): no XY command until the
+        # first flight has completed (n_flights_done >= 1 => hop 2).
+        elif int(getattr(self, "_n_flights_done", 0)) < 1:
             desired_v_xy_w[:] = 0.0
 
         joint_pos = np.asarray(joint_pos, dtype=float).reshape(3)
@@ -6022,10 +6039,16 @@ class ModeECore:
             step_lim = float(abs(float(self.cfg.flight_stepper_lim_m)))
             v_xy_w = np.array([float(self._v_hat_w[0]), float(self._v_hat_w[1])], dtype=float)
             vdes_xy_w = np.array([float(desired_v_xy_w[0]), float(desired_v_xy_w[1])], dtype=float)
-            # 冷启动：第一跳也参与刹车（用实测 v_xy）；只把摇杆 v_des
-            # 清零，避免冷启动误注入指令速度。
+            # 冷启动 / MOBILE->HOPPING 第一跳 (2026-08-12, user):
+            #   hop 1: 不要有初速度 -- XY 实测与摇杆指令都清零，落点按原地跳。
+            #   hop 2+: 再开始用实测 v_xy 做 Raibert / deadbeat 计算。
+            # (_n_flights_done 在每次 TD 完成后 ++；第一段飞行期间仍是 0。)
             cold_start_db = int(getattr(self, "_n_flights_done", 0)) < 2
-            if float(getattr(self, "_flight_dur_prev", 0.0)) <= 0.0:
+            if int(getattr(self, "_n_flights_done", 0)) < 1:
+                v_xy_w[:] = 0.0
+                vdes_xy_w[:] = 0.0
+            elif float(getattr(self, "_flight_dur_prev", 0.0)) <= 0.0:
+                # 仍无完整飞行时长时至少别让摇杆误注入。
                 vdes_xy_w[:] = 0.0
             # Linear Raibert seed / fallback (always computed for telemetry).
             target_xy_lin = (

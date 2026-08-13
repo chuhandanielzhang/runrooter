@@ -1,0 +1,20 @@
+[Unit]
+Description=Gamepad SELECT (Back): 1x start / 2x stop hopper-upper
+# Needs the driver (publishes gamepad_lcmt). Independent of hopper-upper so
+# SELECT can start the controller when it is offline.
+After=hopper-driver.service
+Wants=hopper-driver.service
+
+[Service]
+Type=simple
+User=nvidia
+# Same user/site-packages as hopper-upper (lcm is under ~/.local).
+Environment=HOME=/home/nvidia
+Environment=PYTHONUSERBASE=/home/nvidia/.local
+WorkingDirectory=/home/nvidia
+ExecStart=/usr/bin/python3 -u /usr/local/bin/gamepad_upper_toggle.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

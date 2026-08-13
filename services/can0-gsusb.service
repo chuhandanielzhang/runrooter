@@ -1,0 +1,13 @@
+[Unit]
+Description=gs_usb legs bus setup: rename to can0 + 1Mbit up (AK60/DM4310)
+# Pulled by 99-canable.rules (ENV{SYSTEMD_WANTS}) every time the candleLight
+# adapter's netdev (re)appears -- boot, hot-plug, or USB-hub reset recovery.
+# Oneshot: gs_usb has no daemon to babysit; the netdev dies with the USB
+# device and this unit simply runs again when it returns.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# usb serial is filled in by the deploy step after flashing candleLight
+# (candleLight derives a different serial string from the chip UID than slcan).
+ExecStart=/usr/local/bin/can_gsusb_setup.sh 004D00663945501620303651 can0 1000000

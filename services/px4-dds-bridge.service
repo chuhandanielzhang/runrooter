@@ -15,6 +15,10 @@ WorkingDirectory=/home/nvidia/Hopper_srbRL/pixhawk
 #   up:   motor_pwm_lcmt -> VehicleCommand DO_SET_ACTUATOR @250Hz (props)
 # The USB MAVLink prop bridge (px4-bridge.service) is retired; USB = debug only.
 # Launcher auto-passes --no-imu when an Lpms (/dev/ttyUSB*) owns hopper_imu_lcmt.
+# 2026-08-11: multicast now defaults to lo (cable-free operation). Set the
+# route before LCM init ("+" = run as root); replaces the old drop-in that
+# waited forever for the route to point at enP8p1s0.
+ExecStartPre=+-/usr/local/bin/lcm_multicast_route.sh
 ExecStart=/bin/bash /home/nvidia/Hopper_srbRL/pixhawk/run_px4_dds_bridge.sh
 Restart=always
 RestartSec=3
