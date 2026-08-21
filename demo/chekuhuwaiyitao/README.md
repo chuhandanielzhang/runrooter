@@ -3,7 +3,7 @@
 Outdoor / 车库外 continuous run. 2026-08-21 18:54 BJ.
 
 Source session: `chekuoutdoor1_20260821_1854BJ`  
-CSV (not in this folder): `lcm_20260821_184629.csv`
+Log: **`chekuhuwaiyitao.csv`** (from `lcm_20260821_184629.csv`, 18:46:29–19:01:50; gap 18:46:56–18:53:27).
 
 Story clip **0:00 = 18:55:25**. The 51 s cut **0:00 = story 1:35 = 18:57:00**.
 
@@ -13,6 +13,7 @@ Use the `.webm` files in GNOME Videos. VLC can play the `.mp4`.
 
 | File | What |
 |---|---|
+| `chekuhuwaiyitao.csv` | LCM log, 18:46:29–19:01:50 BJ |
 | `chekuhuwaiyitao_135-226_bright.webm` | 1:35–2:26, brightened (51 s) |
 | `chekuhuwaiyitao_135-226.mp4` | same window, original |
 | `chekuhuwaiyitao_135-226_leg.png` | joints / RM / wheels for that window |
