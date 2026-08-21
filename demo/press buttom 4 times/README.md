@@ -14,7 +14,7 @@ This folder is the video + figures for that setup. The full LCM CSV is not inclu
 | Press target | red industrial mushroom button, same wall plane |
 | Camera | onboard D435 RGB, 640×480, ~15 Hz |
 
-The tag sits on the wall next to / below the button (Fig. 1). Detecting id=1 gives \(T_{\mathrm{cam}\leftarrow\mathrm{tag}}\). The press point is then
+The tag sits on the wall to the **left** of the button (Fig. 1). Detecting id=1 gives \(T_{\mathrm{cam}\leftarrow\mathrm{tag}}\). The press point is then
 
 \[
 p_{\mathrm{press}}^{\mathrm{tag}}
@@ -62,14 +62,26 @@ The 5 min clip `btn1616_161603-162102_play.mp4` has **0:00 = 16:16:03** (approac
 
 ## 4. Files
 
+The **paper video** is `btn1616_presses_paper.webm` (or `.mp4`). First 4 s is Fig. 1 + Fig. 2; then the 80 s onboard clip.
+
+The overlay on that clip is the **same chain as the live controller**, not a color blob:
+
+1. `pupil_apriltags` on the raw D435 frame (`tag36h11`, id=1, size 90 mm).
+2. `button_apriltag_geometry.button_targets_from_detection` with \(r,d,\ell\) above.
+3. Project FACE / PRE / PRESS with the logged D435 \(K\) (`fx=fy=390.2`).
+4. Rotate 90° CW (side-mounted camera), same as `jetson_perception.py`.
+
+Yellow quad = detected tag corners. Magenta line = rigid offset from tag center to \(p_{\mathrm{face}}\). Red / cyan / green marks = FACE / PRE / PRESS. If the tag is lost the marks disappear (short HOLD only). Do not treat a red-pixel circle as the algorithm.
+
 | File | Use |
 |---|---|
+| `btn1616_presses_paper.webm` | **paper supplementary** (GNOME Videos) |
+| `btn1616_presses_paper.mp4` | same, H.264 (VLC) |
 | `fig_button_apriltag.png` | Fig. 1 — button + tag from D435 |
 | `fig_tag_button_geometry.png` | Fig. 2 — rigid offset |
 | `still_button_tag.jpg` | unlabeled still |
-| `btn1616_presses_161735-161855.mp4` | 80 s H.264 (VLC) |
-| `btn1616_presses_161735-161855_play.mp4` | same, MPEG-4 |
-| `btn1616_presses.webm` | same, for GNOME Videos |
+| `btn1616_presses_161735-161855.mp4` | raw 80 s H.264 |
+| `btn1616_presses.webm` | raw 80 s, no overlay |
 | `btn1616_161603-162102_play.mp4` | 5 min approach + presses |
 | `btn1616_leg_vs_mp4.png` | log aligned to the clips |
 
