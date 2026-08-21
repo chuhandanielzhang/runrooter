@@ -7,7 +7,7 @@ Source: `pull_20260813_0704BJ`
 
 Camera is `cam/20260813_061740/seg001` (**06:22:40–06:26:18**). Depth omitted (420 MB). `color_darkened.avi` is the outdoor-overexposure view.
 
-This is **not** the later 06:39 ~21-hop clip (`logs/sessions/outdoor_20260813_mobile21hop_BJ`, already on GitHub).
+This is **not** the later 06:39 21-hop clip (`demo/cao户外`).
 
 Hop command is 1 cm. First hop **06:23:46**, then mobile **06:23:55**, back to hopping **06:24:06** (5 hops), then **fell at 06:24:12** (`|rpy|` 2.94).
 
