@@ -1,5 +1,6 @@
 #include "rm_wheel_controller.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
@@ -36,6 +37,8 @@ inline void put_be_i16(uint8_t* p, int16_t v) {
 RmWheelController::~RmWheelController() { close_bus(); }
 
 bool RmWheelController::init(const char* ifname) {
+    strncpy(ifname_, ifname, sizeof(ifname_) - 1);
+    ifname_[sizeof(ifname_) - 1] = '\0';
     char cmd[160];
     snprintf(cmd, sizeof(cmd),
              "sudo ip link set %s type can bitrate 1000000 2>/dev/null", ifname);
@@ -80,7 +83,29 @@ bool RmWheelController::init(const char* ifname) {
     send_currents(zero);
     printf("Wheels: 3x RM M2006/C610 (%s, speed-PI current, IDs %d-%d)\n",
            ifname, kFirstEscId, kFirstEscId + kNumWheels - 1);
+    init_logged_ok_ = true;
     return true;
+}
+
+void RmWheelController::try_reinit() {
+    const auto now = std::chrono::steady_clock::now();
+    if (reinit_t_valid_ &&
+        std::chrono::duration<float>(now - last_reinit_t_).count()
+            < kReinitPeriodS) {
+        return;
+    }
+    last_reinit_t_ = now;
+    reinit_t_valid_ = true;
+    // Cheap presence probe first so we don't spawn `sudo ip link` every 2 s
+    // while the adapter is unplugged.
+    if (if_nametoindex(ifname_) == 0) return;
+    for (int i = 0; i < kNumWheels; i++) {
+        online[i] = false;
+        iq_i_[i] = 0.0f;
+    }
+    if (init(ifname_)) {
+        printf("Wheels: %s recovered -- MOBILE wheels back online\n", ifname_);
+    }
 }
 
 void RmWheelController::close_bus() {
@@ -93,7 +118,10 @@ void RmWheelController::close_bus() {
 }
 
 void RmWheelController::update(bool armed, const float* w_des_rad_s) {
-    if (fd_ < 0) return;
+    if (fd_ < 0) {
+        try_reinit();
+        if (fd_ < 0) return;
+    }
     receive();
 
     const auto now = std::chrono::steady_clock::now();
@@ -139,7 +167,18 @@ void RmWheelController::send_currents(const float* iq_a_cmd) {
         put_be_i16(&f.data[2 * i], static_cast<int16_t>(raw));
     }
     // ID 4 slot left at 0 (unused).
-    write(fd_, &f, sizeof(f));
+    if (write(fd_, &f, sizeof(f)) < 0 &&
+        (errno == ENODEV || errno == ENXIO || errno == EBADF)) {
+        // Netdev died or was re-created with a new ifindex (USB drop /
+        // replug): this socket is deaf forever. Drop it; update() rebinds.
+        fprintf(stderr,
+                "WARN: wheel CAN %s vanished (errno %d) -- wheels off, "
+                "will auto-rebind\n", ifname_, errno);
+        close(fd_);
+        fd_ = -1;
+        init_logged_ok_ = false;
+        for (int i = 0; i < kNumWheels; i++) online[i] = false;
+    }
 }
 
 void RmWheelController::receive() {

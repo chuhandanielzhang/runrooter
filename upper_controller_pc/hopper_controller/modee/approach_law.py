@@ -142,8 +142,8 @@ def approach_twist(
     vx = _clip(kp_v * el_x + v_ax * nhx, -v_max, v_max) * scale * dist_scale
     vy = _clip(kp_v * el_y + v_ax * nhy, -v_max, v_max) * scale * dist_scale
 
-    # Yaw: drive tag bearing → yaw_tgt (0 far, slight left near), with a
-    # little wall-normal mix when very close.
+    # Yaw: FAR keeps the tag in FOV; NEAR squares the camera to the wall
+    # (user 2026-08-14: 按按钮要平行于墙面, depth plane supplies n).
     nvx = nhx if n_view_x is None else float(n_view_x)
     nvy = nhy if n_view_y is None else float(n_view_y)
     if float(nvx) * float(btn_vx) + float(nvy) * float(btn_vy) < 0.0:
@@ -152,9 +152,23 @@ def approach_twist(
     if nvh > 1e-9:
         nvx, nvy = nvx / nvh, nvy / nvh
     yaw_n = math.atan2(nvy, nvx)
-    yaw_ref = wrap_pi(
-        yaw_err + (1.0 - beta) * 0.25 * wrap_pi(yaw_n - yaw_err)
+    yaw_ref = wrap_pi(beta * yaw_err + (1.0 - beta) * yaw_n)
+    # Near: do not close distance while the base is still skewed to the
+    # wall (same gate as box approach). Far keeps the old tag-bearing gate.
+    yaw_ok = math.radians(
+        float(getattr(cfg, "mobile_approach_yaw_ok_deg", 8.0))
     )
+    yaw_stop = math.radians(
+        float(getattr(cfg, "mobile_approach_yaw_stop_deg", 22.0))
+    )
+    if beta < 0.85:
+        if abs(yaw_n) >= yaw_stop:
+            adv_scale = 0.0
+        else:
+            adv_scale *= _clip(
+                (yaw_stop - abs(yaw_n)) / max(1e-6, yaw_stop - yaw_ok),
+                0.0, 1.0,
+            )
     w_gain = kp_w * (1.0 + 0.35 * beta)
     wz = _clip(w_gain * yaw_ref, -w_max, w_max) * scale
     if age_s > stale_s:

@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Wall-button pose from a wall AprilTag (tag36h11).
 
-Tag frame (pupil_apriltags / OpenCV): X right on the tag face, Y down,
-Z out of the wall toward the camera.
+Tag frame (pupil_apriltags / OpenCV): X right on the tag *print*,
+Y down, Z out of the wall toward the camera.
 
-Geometry from wall photo (2026-08-08): 90 mm tag id=1, measured in-image
-against tag side length:
-  - button center ≈ 16.5 cm RIGHT of tag center
-  - button center ≈ 2.6 cm DOWN of tag center
-  - button face protrudes 5 cm from the wall (user)
-  - press stroke is 2 cm into the wall (along -Z_tag)
+On this robot the upright preview (camera side-mounted, then 90° CW)
+shows the opposite: tag +X points LEFT, tag +Y points UP
+(screenshot 2026-08-14 02:17: cyan "right" arrow left, green "down"
+arrow up; magenta PRESS sat on +X, away from the red button which is
+to the RIGHT of the tag).
 
-So in tag coordinates:
-  p_face  = (+0.165, +0.026, +0.05)
-  p_press = (+0.165, +0.026, +0.03)
+Wall-right / wall-down as you face the wall therefore use tag -X / -Y.
+2026-08-14 02:27: +3 cm right and +3 cm down from the 16.5/2.6 overlay.
+
+  p_face  = (-0.195, -0.056, +0.05)
+  p_press = (-0.195, -0.056, +0.03)
 """
 from __future__ import annotations
 
@@ -22,9 +23,10 @@ from pathlib import Path
 
 import numpy as np
 
-# Measured from camera photo vs 90 mm tag (2026-08-08).
-DEFAULT_RIGHT_M = 0.165
-DEFAULT_DOWN_M = 0.026
+# Upright-preview wall-right / wall-down (tag +X = screen-left,
+# tag +Y = screen-up). User 02:27: +3 cm right, +3 cm down.
+DEFAULT_RIGHT_M = -0.195
+DEFAULT_DOWN_M = -0.056
 DEFAULT_PROTRUDE_M = 0.05
 DEFAULT_PRESS_M = 0.02
 

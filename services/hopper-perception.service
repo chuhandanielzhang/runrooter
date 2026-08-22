@@ -11,10 +11,10 @@ WorkingDirectory=/home/nvidia/hopper_upper/hopper_controller
 # Perception is vision-heavy but not control-critical: default scheduling,
 # single-threaded BLAS to stay off the hopper-upper cores.
 Environment=OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-# Box tags: A4 sheet box_apriltags_id2_id3_a4.pdf (ID2 left / ID3 right,
-# 36 mm tags, 96 mm center-to-center). Args pinned here so a script-default
+# Box tags: A4 sheet box_apriltags_id2_id3_60mm_a4.pdf (ID2 left / ID3 right,
+# 60 mm tags, 120 mm center-to-center). Args pinned here so a script-default
 # change never silently mis-scales the box pose.
-ExecStart=/usr/bin/python3 -u tools/jetson_perception.py --box-tag-ids 2 3 --box-tag-size 0.036 --box-tag-spacing 0.096
+ExecStart=/usr/bin/python3 -u tools/jetson_perception.py --box-tag-ids 2 3 --box-tag-size 0.060 --box-tag-spacing 0.120
 # Restart is safe here (unlike hopper-upper): perception only publishes
 # detections; a crash must not leave the controller blind for long.
 Restart=on-failure

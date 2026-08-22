@@ -58,6 +58,19 @@ private:
     std::chrono::steady_clock::time_point last_tick_t_;
     bool tick_inited_ = false;
 
+    // Self-heal (2026-08-13): the wheel CANable is on a hub and sometimes
+    // drops off USB / enumerates after the driver starts ("轮子动不了,腿能动").
+    // update() lazily re-opens the bus every kReinitPeriodS once can1 exists
+    // again, and send_currents() detects a dead netdev (ENODEV/ENXIO after a
+    // USB re-enumeration gave can1 a new ifindex) and closes the stale socket
+    // so the retry path can rebind. No hopper-driver restart needed.
+    static constexpr float kReinitPeriodS = 2.0f;
+    char ifname_[16] = "can1";
+    bool init_logged_ok_ = false;    // print bring-up/loss once per transition
+    std::chrono::steady_clock::time_point last_reinit_t_;
+    bool reinit_t_valid_ = false;
+    void try_reinit();
+
     void send_currents(const float* iq_a_cmd);
     void receive();
 };

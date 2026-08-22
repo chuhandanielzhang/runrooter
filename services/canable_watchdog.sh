@@ -26,7 +26,7 @@ WHEEL_SERIAL="0067005F3945501620303651"
 PERIOD=2
 RX_STALL_TRIPS=5        # e) consecutive checks with TX alive, RX frozen
 REENUM_COOLDOWN=30      # e) min seconds between USB re-enumerations
-idx_prev=""; idx2_prev=""
+idx_prev=""
 rx_prev=""; tx_prev=""; stall=0; last_reenum=0
 
 note() { logger -t canable-watchdog "$*"; }
@@ -90,11 +90,12 @@ while sleep "$PERIOD"; do
     #    driver start) -> hopper-driver must rebind. "none" is a real state so
     #    the none->N transition (adapter plugged in later) also triggers;
     #    N->none (adapter gone) does not -- nothing to rebind until it returns.
+    #    can0 (legs) ONLY: since 2026-08-13 RmWheelController self-heals can1
+    #    in-process (lazy rebind + ENODEV detect), so a wheel-adapter replug
+    #    no longer justifies killing the leg driver mid-operation.
     idx=$(cat /sys/class/net/can0/ifindex 2>/dev/null || echo none)
-    idx2=$(cat /sys/class/net/can1/ifindex 2>/dev/null || echo none)
     changed=""
     [ -n "$idx_prev" ]  && [ "$idx" != "none" ]  && [ "$idx" != "$idx_prev" ]   && changed="can0"
-    [ -n "$idx2_prev" ] && [ "$idx2" != "none" ] && [ "$idx2" != "$idx2_prev" ] && changed="${changed:+${changed}+}can1"
     if [ -n "$changed" ]; then
         sleep 1
         if systemctl is-active -q hopper-driver.service; then
@@ -106,5 +107,4 @@ while sleep "$PERIOD"; do
         fi
     fi
     idx_prev="$idx"
-    idx2_prev="$idx2"
 done

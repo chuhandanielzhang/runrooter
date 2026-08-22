@@ -1,0 +1,19 @@
+[Unit]
+Description=Hopper LCM-to-CSV logger (separate process, does not run in hopper-upper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/home/nvidia/hopper_upper/hopper_controller
+Environment=LCM_DEFAULT_URL=udpm://239.255.76.67:7667?ttl=255
+Environment=LCM_CSV_DIR=/home/nvidia/hopper_upper/hopper_controller/logs/lcm_csv
+# Ordinary SCHED_OTHER. Do not use FIFO — this process may block on disk.
+Nice=5
+ExecStart=/usr/bin/python3 -u /home/nvidia/hopper_upper/hopper_controller/tools/lcm_csv_logger.py --hz 200
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import csv
+import atexit
 import json
 import math
 import os
+import queue
 import socket
 import sys
 import time
 import threading
-from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +31,73 @@ from python.wheel_cmd_lcmt import wheel_cmd_lcmt  # type: ignore
 
 from modee.core import ModeECore, ModeEConfig
 from modee.approach_law import approach_twist, dead_reckon_step
+
+
+class _AuxIO:
+    """Single daemon thread for ALL auxiliary I/O of the upper controller.
+
+    PRIMARY vs AUXILIARY (2026-08-20): the 500 Hz control thread must never
+    block on I/O. print() under `python3 -u` is a synchronous write to the
+    journald pipe; when journald stalls (disk contention with the
+    out-of-process LCM CSV logger / camera recorder) the write blocks, the
+    loop freezes, and the driver keeps replaying the LAST published PWM --
+    in flight this looks like radio packet loss (journal 16:19:19: 695 ms
+    PWM freeze right after the LT/B print burst; 16:20:36: 216 ms).
+
+    The control thread therefore only enqueues work here (never blocks);
+    this thread performs the actual print / file write / UDP send. If the
+    queue is full the item is DROPPED and counted -- losing a status line
+    is always better than losing a control tick.
+    """
+
+    def __init__(self, maxsize: int = 512) -> None:
+        self._q: "queue.Queue" = queue.Queue(maxsize=int(maxsize))
+        self.dropped = 0
+        self._thread = threading.Thread(
+            target=self._run, name="aux-io", daemon=True
+        )
+        self._thread.start()
+        # Drain + stop at exit: a daemon thread caught mid-print during
+        # interpreter finalization aborts CPython ("could not acquire lock
+        # for stdout"). The sentinel makes the worker return; join gives it
+        # time to finish the current write.
+        atexit.register(self._shutdown)
+
+    def put(self, item) -> None:
+        """Enqueue a str (printed) or callable (executed). Never blocks."""
+        try:
+            self._q.put_nowait(item)
+        except queue.Full:
+            self.dropped += 1
+
+    def _shutdown(self) -> None:
+        try:
+            self._q.put(None, timeout=0.2)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            try:
+                if callable(item):
+                    item()
+                else:
+                    print(item, flush=True)
+            except Exception:
+                pass
+
+
+_AUX = _AuxIO()
+
+
+def jprint(*args) -> None:
+    """Async print: journal text goes through the aux thread, never the
+    control thread. Drop-in replacement for print() in this module."""
+    _AUX.put(" ".join(str(a) for a in args))
 
 
 def _quat_wxyz_to_R_wb(q_wxyz: np.ndarray) -> np.ndarray:
@@ -65,7 +132,9 @@ class ModeELCMConfig:
     # position loop clamps desiredVel to +-0.15; we have no position loop, so
     # the equivalent is capping the stick/nav v_des at 0.15 (was 0.8).
     # 2026-08-10: 0.4 -> 0.65 (user: 满杆速度).
-    max_cmd_vel: float = 0.65
+    # 2026-08-21: 0.65 -> 0.90 (user: 遥控速度再大点).
+    # 2026-08-21 evening: 0.90 -> 1.20 (user: 再加大遥感速度).
+    max_cmd_vel: float = 1.20
     stick_deadzone: float = 0.10
     # HOPPING foot-clearance knob (teleop): LEFT stick deflect + release.
     # Writes core.cfg.foot_clearance_target_m (active height when
@@ -74,10 +143,10 @@ class ModeELCMConfig:
     hop_height_stick_enable: bool = True
     hop_height_stick_trigger: float = 0.70
     hop_height_stick_release: float = 0.20
-    hop_height_stick_up_m: float = 0.05
+    hop_height_stick_up_m: float = 0.08
     hop_height_stick_down_m: float = 0.02
-    hop_height_stick_left_m: float = 0.03
-    hop_height_stick_right_m: float = 0.04
+    hop_height_stick_left_m: float = 0.05
+    hop_height_stick_right_m: float = 0.06
     hop_height_min_m: float = 0.01
     hop_height_max_m: float = 0.20
     # ---- LiDAR patrol (hopper_nav_cmd_lcmt from lidar_perception/patrol.py) ----
@@ -112,17 +181,18 @@ class ModeELCMConfig:
     # - enabled HOPPING + LT: at the next liftoff, hold switch_lt_leg_len_m
     #   and drive the three folding-arm RM2006s from 0 to +11.5, entering
     #   MOBILE.
-    # - enabled MOBILE + RT: P4 places the foot at normal l0, then enters
-    #   HOPPING (flight phase) with RM unfold + prop base 1600 in parallel.
+    # - enabled MOBILE + LB: box push (needs 60 mm tags id 2/3).
+    #   push_simple=True  -> snap leg to manip_hold_q, sticks drive
+    #                        the base exactly like MOBILE (fwd/strafe/yaw).
+    #   push_simple=False -> auto-align to the working pose, then
+    #                        snap the same hold q and LEFT stick
+    #                        drives the BOX (paper push law).
+    # - enabled MOBILE + LT: already MOBILE, no-op (LT is gait/mobile only).
+    # - enabled MOBILE + RB: AprilTag button (auto-approach then press).
+    # - enabled MOBILE + RT: P4 stand then HOPPING.
     # SAFE q-range guard is relaxed while legs are force-free / in P4:
     safe_q_min_switch: float = -1.0472    # -60 deg (SAFE guard only, in LT/P4 modes)
-    # Enabled MOBILE + RT (2026-08-10 21:00):
-    #   - P4: world-vertical foot, align short (0.35) then extend/hold at
-    #     switch_rb_leg_len_m (= normal leg_l0 0.45).
-    #   - after switch_rb_pushdelay_s: enter HOPPING / flight phase.
-    #     RM +11.5 -> 0 and prop base 1600 run in parallel; from then on
-    #     it is normal hopping (same l0 / height / velocity law, no
-    #     first-hop specials).
+    # P4 stand params (started by enabled MOBILE + RT).
     switch_rb_align_leg_len_m: float = 0.35
     switch_rb_align_tol_m: float = 0.015
     switch_rb_align_timeout_s: float = 1.0
@@ -317,6 +387,9 @@ class ModeELCMConfig:
     # q=0 the PD current is ~0 A (heat ~ i^2, only disturbance transients
     # draw current), and the cap is well under the M2006 continuous rating.
     rm_hopping_hold: bool = True
+    # Same low-cap PD after HOPPING->MOBILE, but on +11.5 so wheel motion
+    # cannot back-drive the folded arms. Same current cap as hopping.
+    rm_mobile_hold: bool = True
     rm_hold_iq_max_a: float = 2.0        # |current| cap for the station hold (A)
 
     # ===== MOBILE: kiwi drive, 3x RM M2006/C610 at 120 deg ================
@@ -350,8 +423,8 @@ class ModeELCMConfig:
     # Stick full scale: RIGHT stick = translation (same axis convention as
     # hopping desired_v_xy), LEFT stick X = yaw rate. Per-wheel speed cap
     # scales the whole twist uniformly so the direction is preserved.
-    mobile_v_max_mps: float = 0.8
-    mobile_wz_max_rad_s: float = 1.5
+    mobile_v_max_mps: float = 1.20
+    mobile_wz_max_rad_s: float = 2.0
     # Output-shaft cap after the M2006 36:1 gearbox. 25 rad/s ~ 239 rpm
     # shaft / ~8600 rpm rotor -- brief peaks ok, sustained driving should
     # stay near continuous rating (drop mobile_v_max_mps if wheels run hot).
@@ -379,7 +452,27 @@ class ModeELCMConfig:
     mobile_leg_y_stick_m: float = 0.10
     mobile_leg_y_rate_mps: float = 0.12
 
-    # ===== MANIPULATION: deployed appendages support the body ==============
+    # ===== MANIPULATION: hold a fixed joint pose (push-box) ==============
+    # 2026-08-13: MOBILE LB needs a fresh 60 mm box tag (id 2 or 3),
+    # then holds this q (AK60 kd, no q_des slew). Wheels stay on the
+    # sticks (fwd + left/right only, no yaw). LT is mobile only. RT is
+    # MOBILE -> HOPPING. Button is RB (id 1).
+    manip_hold_q: tuple = (1.376, 1.378, -0.096)
+    manip_hold_kp: float = 20.0
+    # 0 = snap q_des to manip_hold_q. Motion is damped by AK60 MIT kd
+    # (manip_ak60_kd), not a joint-space rate limit.
+    manip_hold_q_rate_rad_s: float = 0.0
+    # LB double-click window kept for RB β presets (HOPPING only).
+    # Box-hold is LB. Button auto-approach/press is RB (2026-08-14).
+    # LT is hopping <-> mobile only.
+    lb_double_click_s: float = 0.40
+    # RB bumper: 1/2/3 clicks set deadbeat β_lo/β_hi (and turn the
+    # closed-form placement on). Window matches LB.
+    rb_beta_presets: tuple = (
+        (0.11, 0.50),
+        (0.50, 0.50),
+        (0.75, 0.75),
+    )
     # While already deployed, each LT rising edge toggles MOBILE <->
     # MANIPULATION. MOBILE drives the kiwi wheels with the sticks;
     # MANIPULATION stops/holds all wheels. Stick fallback commands the 3-RSR
@@ -392,14 +485,14 @@ class ModeELCMConfig:
     manip_xy_rate_mps: float = 0.10
     manip_leg_len_rate_mps: float = 0.08
     manip_leg_len_min_m: float = 0.25
-    # Carve the outer travel sphere so joint q stays <= manip_q_max
-    # (equal-q at 1.4 -> L≈0.55 m; tilted poses hit q=1.4 earlier, so
-    # Lmax/tilt are cut below the mechanical tip — user 2026-08-08).
-    # Outer sphere: allow the 0.50-0.55 m READY band plus press stroke.
+    # Soft stick-teleop sphere. Real deployed travel is work_* below
+    # (user 2026-08-14). Two-joint-down hold q≈(1.38,1.38,-0.10) is
+    # L=0.476 / r_xy=0.31 / tilt=41 deg — the old q-carve (L_qcap≈0.38)
+    # rejected that pose and reported a fake 21 cm "clip".
     manip_leg_len_max_m: float = 0.58
     manip_q_max: float = 1.4
-    manip_xy_max_m: float = 0.32
-    manip_tilt_max_deg: float = 42.0
+    manip_xy_max_m: float = 0.37
+    manip_tilt_max_deg: float = 65.0
     # Manipulation is intentionally low-authority: move the Cartesian target
     # incrementally like stick teleop, never snap the leg with a stiff servo.
     # User 2026-08-08 23:10: 2 Nm still delivered <1 N at the foot
@@ -413,8 +506,8 @@ class ModeELCMConfig:
     manip_kd_z_n_s_m: float = 18.0
     # AprilTag auto uses Cartesian targets/PD so its wall-normal stroke is not
     # projected onto that sphere (tools/button_apriltag_live.py).
-    # Geometry: button = tag right 16.5 cm, down 2.6 cm, protrude 5 cm,
-    # press 5 cm into the wall (user 2026-08-08 23:07).
+    # Geometry: button = tag right 19.5 cm, down 5.6 cm, protrude 5 cm,
+    # wheels press 5 cm into the wall (user 2026-08-14 02:27 +3cm R/D).
     manip_button_auto_enable: bool = True
     manip_button_setpoint_path: str = "logs/button_setpoint.json"
     manip_button_setpoint_udp_port: int = 5558
@@ -428,26 +521,42 @@ class ModeELCMConfig:
     manip_button_tag_size_m: float = 0.09
     manip_button_acquire_samples: int = 3
     manip_button_acquire_tol_m: float = 0.010
-    # Press stroke into the wall (overrides perception packet press_m).
+    # Hover standoff before FACE (along -n). Must be > arrive so FACE is
+    # not skipped; last motion is then square into the button (user
+    # 2026-08-14 正对按钮再按).
+    manip_button_pre_m: float = 0.03
+    # Press into the wall: wheels creep forward along +n; the foot holds
+    # the FACE hover (user 2026-08-14 轮子往前按). Leg no longer stretches
+    # the unreachable 5 cm stroke (log 01:42 / screenshot 02:22 z dump).
     manip_button_press_m: float = 0.05
+    manip_button_press_v_mps: float = 0.04
     # Stage arrive / hold. Log 23:12: stuck on pre because clamp left a
     # residual > arrive — snap + looser gate (user 2026-08-08 23:13).
     manip_button_arrive_m: float = 0.025
     manip_button_hold_s: float = 0.5
-    # Auto target crawl rate (m/s) — faster hand (2026-08-09: bump).
-    manip_button_rate_mps: float = 0.70
-    # Cartesian PD: higher on press/hold so contact force builds.
-    manip_button_kp_n_m: float = 450.0
-    manip_button_press_kp_n_m: float = 700.0
-    manip_button_kd_n_s_m: float = 3.0
+    # PRE/FACE Cartesian target speed limit.
+    manip_button_rate_mps: float = 2
+    # Log 01:42: mobile 3 Nm sat 87% of PRESS, foot dumped to z=0.451
+    # (floor) and buzzed 19 s. PRE/FACE/PRESS use this cap; 归中 stays
+    # on mobile_leg_tau_max_nm (gentler near the floor).
+    manip_button_tau_max_nm: float = 8.0
+    # Give up a stage that cannot close the last centimetres (envelope
+    # residual / joint stop) instead of grinding. Crawl needs more than
+    # the old 1.2 s snap timeout.
+    manip_button_stage_timeout_s: float = 4.0
+    # Cartesian PD for the button auto path.
+    manip_button_kp_n_m: float = 240.0
+    manip_button_press_kp_n_m: float = 240.0
+    manip_button_kd_n_s_m: float = 4.0
     manip_ak60_kd: float = 2.0
-    # MOBILE -> MANIPULATION first goes "home": straight down under the
-    # body at equal joint angles manip_home_q (FK => ~0.42 m leg length).
+    # MOBILE -> MANIPULATION first does 归中: equal joints at
+    # mobile_leg_center_q (same as MOBILE stow step 1). Then PRE/FACE/
+    # PRESS on the hold-pose XY plane.
     manip_home_q: float = 0.4
     manip_home_arrive_m: float = 0.03
-    # After press/hold/retract: return to MOBILE and reverse away from the
-    # wall along -n (user 2026-08-08 23:47).
-    manip_backup_enable: bool = True
+    # After press/hold: stay in MANIPULATION at the press pose. No retract,
+    # no wheel reverse (user 2026-08-14 按完就停).
+    manip_backup_enable: bool = False
     manip_backup_m: float = 0.30
     manip_backup_v_mps: float = 0.20
 
@@ -464,15 +573,20 @@ class ModeELCMConfig:
     # before kiwi IK.
     mobile_approach_goal_x_m: float = 0.086
     mobile_approach_goal_y_m: float = 0.063
-    # Unique stop band (user 2026-08-08): MOBILE hard-stops radial
-    # advance at r_max; READY / MANIP when ||foot_face_L|| ∈ [r_min, r_max].
+    # Legacy radial band remains dashboard-only. Actual handoff below uses
+    # PRE XY error + workspace clip + wall yaw.
     mobile_ready_r_min_m: float = 0.50
     mobile_ready_r_max_m: float = 0.53
-    # Approach speed (2026-08-09 log 200020: ~14 s was too slow).
-    mobile_approach_kp_v: float = 1.4          # m/s per m of XY error
-    mobile_approach_kp_wz: float = 1.6         # rad/s per rad of yaw error
-    mobile_approach_v_max_mps: float = 0.45
-    mobile_approach_wz_max_rad_s: float = 0.80
+    mobile_ready_lat_m: float = 0.05
+    mobile_ready_xy_m: float = 0.03
+    # Current operator-approved pose leaves FACE about 3 cm beyond Lmax;
+    # the arm reaches its envelope and wheels close the final gap.
+    mobile_ready_clip_m: float = 0.04
+    # Approach speed (user 2026-08-14 对齐和前进太快).
+    mobile_approach_kp_v: float = 0.70         # m/s per m of XY error
+    mobile_approach_kp_wz: float = 0.90         # rad/s per rad of yaw error
+    mobile_approach_v_max_mps: float = 0.22
+    mobile_approach_wz_max_rad_s: float = 0.40
     # Keep driving on the remembered (dead-reckoned) tag pose this long
     # after the detector drops out; then stop and wait for re-capture.
     approach_memory_timeout_s: float = 3.0
@@ -490,10 +604,14 @@ class ModeELCMConfig:
     mobile_approach_blend_far_m: float = 0.85
     mobile_approach_tag_left_deg: float = 6.0
     mobile_approach_bear_gate_deg: float = 18.0
+    # Camera-to-wall yaw (0 = square / parallel). Near approach and READY
+    # both require this; depth-plane normal is preferred over tag PnP.
+    mobile_approach_yaw_ok_deg: float = 8.0
+    mobile_approach_yaw_stop_deg: float = 22.0
     # Far-fast / near-slow on ||pre||_L (translation only).
     mobile_approach_v_far_m: float = 0.90
     mobile_approach_v_near_m: float = 0.50
-    mobile_approach_v_near_scale: float = 0.55
+    mobile_approach_v_near_scale: float = 0.30
     # Approach corridor: forward advance is throttled to zero until the
     # lateral (wall-parallel) error is inside this gate -- translate to
     # the button's normal line first, then drive in square (2026-08-08).
@@ -514,26 +632,60 @@ class ModeELCMConfig:
     drive_calib_rel_path: str = "tools/apriltags_print/calib/T_L_C.json"
     drive_yaw_in_L_deg: float = -32.9
 
-    # ===== PUSH: semi-autonomous box pushing (leg contact + wheels) ========
-    # Entered from MOBILE with LT when no button tag is available but the
-    # perception node reports a box face (two symmetric AprilTags or the
-    # vertical-plane fallback). The leg keeps a low-gain Cartesian contact
-    # on the face; the wheels supply the push. LEFT stick commands the BOX:
-    # up = push forward along the face normal, left/right = steer the box
-    # by offsetting the contact point from the face center (torque about
-    # the box's friction center). LT exits back to MOBILE.
+    # ===== PUSH: box face tags (print box_apriltags_id2_id3_60mm_a4.pdf)
+    # Facing the box: LEFT=ID2, RIGHT=ID3. Black square 60 mm, gap 60 mm
+    # -> center-to-center 120 mm. Perception must use the same size.
+    # True  = simplified: snap manip_hold_q + stick wheels (no auto-align).
+    # False = paper: auto square/center/distance, then snap the same q
+    #         and LEFT stick commands the box (fwd/steer + yaw align).
+    push_simple: bool = True
     push_enable: bool = True
+    push_box_tag_ids: tuple = (2, 3)
+    push_box_tag_size_m: float = 0.060
     push_box_stale_s: float = 1.0              # box packet freshness gate
     push_contact_depth_m: float = 0.02         # press into the face (m)
     push_e_max_m: float = 0.12                 # contact offset cap (m)
-    push_e_rate_mps: float = 0.08              # stick -> contact offset rate
+    # (2026-08-13 log 225152, user: 甩尾不够 左转接右转慢) 0.08 meant a
+    # full left->right e reversal took 3 s at full stick; 0.20 -> 1.2 s.
+    push_e_rate_mps: float = 0.20              # stick -> contact offset rate
     push_v_max_mps: float = 0.25               # max push advance speed
-    push_wz_max_rad_s: float = 0.5
-    push_kp_wz: float = 1.5                    # face-normal yaw alignment
+    # Face-squaring servo: measured p95 yaw rate was only 18 deg/s with
+    # kp 1.5 / cap 0.5 -- too soft to follow the rotating face. Same log.
+    # 0.9 lost the tags at 15 fps color even after the 4 ms exposure cap
+    # (2026-08-13 太快丢视野) -> 0.7 as the camera-limited compromise.
+    push_wz_max_rad_s: float = 0.7
+    push_kp_wz: float = 2.5                    # face-normal yaw alignment
     push_kp_vy: float = 0.8                    # workspace re-centering gain
-    # Stable-pushing curvature cap (Mason/Lynch motion cone): the yaw rate
-    # is limited to kappa_max * |v_push| so the contact does not slip.
+    # (2026-08-13) Motion-cone wz cap REMOVED from the face-squaring servo:
+    # it froze the yaw correction at stick release (log 224304, yaw_err
+    # +69 deg, tags lost). Kept for reference/telemetry only.
     push_kappa_max_1_m: float = 1.5
+    # ---- Contact-force feedback (2026-08-13 user: 甩尾时丢箱子, 加力反馈
+    # 一起推动和摆姿态). F = J^-T tau (foot->environment, leg frame),
+    # decomposed on the face normal (F_n) and face_right (F_t).
+    # 1) Normal-force keeper: admittance on the press depth -- F_n sagging
+    #    below push_f_des_n (face rotating away mid-swing) presses deeper;
+    #    a spike backs off. Nominal: kp 200 N/m x 0.02 m = 4 N.
+    push_f_des_n: float = 5.0
+    push_f_adapt_mps_per_n: float = 0.003      # depth rate per N of F error
+    push_depth_min_m: float = 0.005
+    push_depth_max_m: float = 0.06
+    push_f_lpf_tau_s: float = 0.15             # J^-T tau estimate is noisy
+    # 2) Friction-cone slip guard: |F_t|/F_n above this ratio means the
+    #    foot is about to slide off the face -> freeze further |e| growth
+    #    (force-based motion cone; replaces the removed velocity cone).
+    push_slip_ratio_max: float = 0.8
+    # Wheel twist accel limits (2026-08-13 user: 轮子瞬时太快画面糊).
+    # 0.5 m/s^2 -> full 0.25 m/s in 0.5 s; 2.0 rad/s^2 -> wz_max 0.9 in
+    # 0.45 s. Smooths starts/stops/swings without dulling the response.
+    push_acc_max_mps2: float = 0.5
+    push_wz_acc_max_rad_s2: float = 2.0
+    # PARALLEL FIRST (2026-08-13 user: 第一前提是平行, 不然箱子打到轮子).
+    # Below yaw_ok the push runs at full speed; the advance fades linearly
+    # and STOPS at yaw_stop, and |e| growth is frozen above yaw_ok, until
+    # the tail swing re-squares the camera to the face.
+    push_yaw_ok_deg: float = 8.0
+    push_yaw_stop_deg: float = 18.0
     # Leg force control in PUSH deliberately has NO independent gains: it
     # reuses the wall-button press set (manip_button_kp_n_m /
     # manip_button_kd_n_s_m / manip_button_rate_mps / manip_press_tau_max_nm
@@ -562,7 +714,41 @@ class ModeELCMConfig:
     push_kp_n_m: float = 200.0
     push_kd_n_s_m: float = 4.0
     push_tau_max_nm: float = 3.0
-    push_foot_rate_mps: float = 0.08
+    # Entry is a SNAP onto the face contact (2026-08-13: 摆腿太慢 with
+    # 0.08 + HOME crawl); this rate only shapes the stick-driven e moves.
+    push_foot_rate_mps: float = 0.30
+    # PUSH foot moves ONLY in the horizontal plane z = FK(manip_hold_q).z
+    # (user 2026-08-13). Delta-leg workspace at that height (0.362 m) ends
+    # at xy ~= 0.31 m in every direction (sampled), and the hold pose sits
+    # at xy = 0.3095 -- i.e. on the boundary. Targets past this saturate
+    # and the wheel-strafe servo carries the base instead.
+    push_xy_max_m: float = 0.31
+
+    # ===== Deployed-leg WORK ENVELOPE (2026-08-14, measured on robot) =====
+    # User-defined working range for every deployed-leg Cartesian target
+    # (button / push / manip teleop). In the leg FK frame (+z DOWN):
+    #   TOP     z >= 0.128 m — two-q-down (q0=q1=1.4 unchanged) with
+    #           the third joint at the software limit q2=-1.2
+    #           (FK xyz≈+0.320/-0.185/+0.128, L=0.391, r=0.37).
+    #           Previous 0.176 was log 01:36 (q2≈-0.8); the foot can
+    #           still lift until that third joint hits the zero-side
+    #           stop. Homing FK(0).z=0.354 is the INNER length bound,
+    #           not a z-floor.
+    #   BOTTOM  z <= 0.440 m (foot at wheel-contact floor level),
+    #   REACH   work_len_min (FK(0)≈0.354) <= L <= 0.50 m,
+    #   SWING   horizontal r <= 0.37 m (same two-q family at q2=-1.2).
+    #           Hold-q ring r=0.31 @ z=0.362 sits inside this disk.
+    #   MINUS three wheel disks, 120 deg symmetric about the origin
+    #   (user: 左边右边空间一样). Centers on chassis rays
+    #   (drive-frame 180/60/300: one wheel BACK, two LEFT/RIGHT)
+    #   rotated into L by drive yaw. Keep-out radius work_wheel_keep_m.
+    work_z_top_m: float = 0.128
+    work_z_bottom_m: float = 0.440
+    work_len_min_m: float = 0.354
+    work_len_max_m: float = 0.50
+    work_xy_max_m: float = 0.37
+    work_wheel_center_m: float = 0.17
+    work_wheel_keep_m: float = 0.055
 
 
 class ModeELCMController:
@@ -613,22 +799,11 @@ class ModeELCMController:
             "nav_rx_t": 0.0,
         }
 
-        # CSV logger: auto-starts with the upper controller. Y replaces the
-        # current file (stop + new stamp). B stops the log.
-        self._log_enabled = False
-        self._log_fp = None
-
         # Desired velocity command smoothing (rate limiter)
         self._v_cmd_filt = np.zeros(2, dtype=float)
         # LEFT-stick hop-height detent: "", "up", "down", "left", "right".
         # Height is applied once when the stick returns to neutral.
         self._hop_height_stick_pending: str = ""
-        self._log_writer = None
-        self._log_path = None
-        self._log_latest_path = None
-        self._log_last_flush_t = 0.0
-        self._log_rows = 0
-        self._log_event_marker = ""
 
         # PWM filter (same as Hopper4 for propeller stability)
         # Low-pass filter: smoothed_pwm = alpha * new_pwm + (1-alpha) * prev_pwm
@@ -639,6 +814,8 @@ class ModeELCMController:
         self._last_pwm_pub_t: float | None = None
         self._last_y = False
         self._last_b = False
+        self._last_lb_log = False
+        self._last_rb_log = False
         # User "hard stop" latch (maps to gamepad `point` button; user calls it "I").
         self._zero_vel_hold = False
         self._last_point = False
@@ -659,6 +836,15 @@ class ModeELCMController:
         self._switch_loop: bool = False
         self._mode_last_lb: bool = False
         self._mode_last_rb: bool = False
+        self._mode_last_lb_bumper: bool = False
+        self._lb_click_pending: bool = False
+        self._lb_click_t: float = 0.0
+        self._mode_last_rb_bumper: bool = False
+        self._rb_click_pending: bool = False
+        self._rb_click_n: int = 0
+        self._rb_click_t: float = 0.0
+        # "hold" = push-box q-hold; "button" = AprilTag press sequence.
+        self._manip_kind: str = "hold"
         # RB/RT phase-4 start time (fixed stand, then hop entry).
         self._rb_p4_t0: float | None = None
         # RT/P4 starts by retracting to switch_rb_align_leg_len_m while
@@ -689,6 +875,7 @@ class ModeELCMController:
         self._wheel_pending_cmd = np.zeros(3, dtype=float)
         self._wheel_pending_enable: bool = False
         self._manip_init_pending: bool = False
+        self._manip_hold_q_cmd: np.ndarray | None = None
         self._manip_foot_des_b = np.array(
             [0.0, 0.0, float(self.lcm_cfg.switch_rb_leg_len_m)], dtype=float
         )
@@ -697,10 +884,13 @@ class ModeELCMController:
         self._manip_press_boost: bool = False
         self._manip_press_n_L: np.ndarray | None = None
         self._manip_speed_mps: float = float("nan")
-        # AprilTag button auto-press:
-        # wait_tag|pre|face|press|hold|retract|done
+        # AprilTag button auto-press. Tag acquisition happens only in MOBILE;
+        # MANIPULATION consumes one frozen READY latch.
+        # home|pre|face|press|hold|done|latch_missing
         self._btn_stage: str = "idle"
         self._btn_hold_t0: float | None = None
+        self._btn_stage_t0: float | None = None
+        self._btn_stage_seen: str = ""
         self._btn_last_setpoint: dict | None = None
         self._btn_acquire_samples: list[dict] = []
         self._btn_last_sample_t_wall: float = -1.0
@@ -721,7 +911,7 @@ class ModeELCMController:
             ))
             self._btn_udp_sock.setblocking(False)
         except OSError as exc:
-            print(f"[MANIP] button UDP unavailable: {exc}; using local JSON")
+            jprint(f"[MANIP] button UDP unavailable: {exc}; using local JSON")
             if self._btn_udp_sock is not None:
                 self._btn_udp_sock.close()
             self._btn_udp_sock = None
@@ -749,6 +939,12 @@ class ModeELCMController:
         self._backup_dir_D: tuple[float, float] = (-1.0, 0.0)
         self._backup_remain_m: float = 0.0
         self._backup_dbg_t: float = 0.0
+        # FACE-then-wheel-press: open-loop creep along +n (drive frame).
+        self._press_drive_active: bool = False
+        self._press_dir_D: tuple[float, float] = (1.0, 0.0)
+        self._press_drive_remain_m: float = 0.0
+        self._press_drive_t0: float = 0.0
+        self._press_drive_dbg_t: float = 0.0
         # Yaw of the drive/wheel frame's +X (camera forward) inside the L
         # frame, from the hand-eye calibration (see drive_yaw_in_L_deg).
         dy = math.radians(float(getattr(
@@ -761,12 +957,29 @@ class ModeELCMController:
                 json.loads(calib.read_text())["R"], dtype=float
             ).reshape(3, 3)
             dy = math.atan2(float(R[1, 2]), float(R[0, 2]))
-            print(f"[init] drive yaw in L from T_L_C: "
+            jprint(f"[init] drive yaw in L from T_L_C: "
                   f"{math.degrees(dy):+.1f} deg")
         except Exception as e:
-            print(f"[init] T_L_C unavailable ({e}); drive yaw fallback "
+            jprint(f"[init] T_L_C unavailable ({e}); drive yaw fallback "
                   f"{math.degrees(dy):+.1f} deg")
         self._l2d_cs: tuple = (math.cos(dy), math.sin(dy))
+        # Work envelope: homing length = L_min (q=0 零位, inner bound).
+        # z_top / xy_max = two-q-down with q2 at the -1.2 software stop.
+        try:
+            f0, _ = self.core.fk.forward_kinematics(np.zeros(3))
+            f0 = np.asarray(f0, dtype=float).reshape(3)
+            self.lcm_cfg.work_len_min_m = float(np.linalg.norm(f0))
+            jprint(
+                "[init] work envelope: z "
+                f"{float(self.lcm_cfg.work_z_top_m):.3f}..{float(self.lcm_cfg.work_z_bottom_m):.3f} m, "
+                f"L={float(self.lcm_cfg.work_len_min_m):.3f}..{float(self.lcm_cfg.work_len_max_m):.2f} m, "
+                f"swing r<={float(self.lcm_cfg.work_xy_max_m):.3f} m "
+                f"(fwd-tilt), 3 wheels 120deg at r="
+                f"{float(self.lcm_cfg.work_wheel_center_m):.2f} m "
+                f"keep={float(self.lcm_cfg.work_wheel_keep_m):.3f} m"
+            )
+        except Exception as exc:
+            jprint(f"[init] work envelope L_min fallback ({exc})")
         self._approach_ready_since: float | None = None
         self._approach_last_twist: tuple = (0.0, 0.0, 0.0)
         self._approach_waiting: bool = False
@@ -785,9 +998,17 @@ class ModeELCMController:
         self._box_ready_since: float | None = None
         self._box_dist_err_m: float = float("nan")
         self._box_yaw_err_deg: float = float("nan")
-        # PUSH: optional force estimate for CSV only (no closed loop).
+        # PUSH contact-force feedback: raw F_n for CSV + LPF'd normal /
+        # tangential components driving the depth admittance + slip guard.
         self._push_f_meas_n: float = float("nan")
+        self._push_f_n_lpf: float = float("nan")
+        self._push_f_t_lpf: float = float("nan")
+        self._push_depth_cmd_m: float = 0.02
         self._push_tgt_lpf: np.ndarray | None = None
+        # Foot z (FK frame) locked to FK(manip_hold_q) for the whole PUSH:
+        # the leg moves in that horizontal plane only (user 2026-08-13).
+        self._push_z_hold_m: float | None = None
+        # Button auto: same horizontal plane as simplified push / hold pose.
         # Lightweight state bridge for the camera dashboard (20 Hz JSON).
         self._dashboard_status_last_t: float = 0.0
         self._dashboard_udp_sock = socket.socket(
@@ -823,6 +1044,14 @@ class ModeELCMController:
         # RT armed flag: set when P4 hands off to HOPPING; RM +11.5->0 starts
         # only at the next liftoff (push end), not during the push itself.
         self._rm_rt_pending: bool = False
+        # Launch-time height / l0. Each MOBILE->HOPPING session restores
+        # these so last hopping's stick height or leftover override cannot
+        # leak into the next hopping.
+        self._hop_height_launch_m: float = float(self.core.cfg.hop_height_m)
+        self._foot_clearance_launch_m: float = float(
+            self.core.cfg.foot_clearance_target_m
+        )
+        self._leg_l0_launch_m: float = float(self.core.cfg.leg_l0_m)
         # Temporary hop_height override across gait switches. Saved value is
         # restored after RT's first N hops or when LT stand begins / B abort.
         self._hop_height_restore: float | None = None
@@ -887,19 +1116,65 @@ class ModeELCMController:
         # leftTriggerAnalog, never the LB bumper.
         lt_now = (float(getattr(gamepad_msg, "leftTriggerAnalog", 0.0)) > 0.5) if gamepad_msg is not None else False
         rt_now = (float(getattr(gamepad_msg, "rightTriggerAnalog", 0.0)) > 0.5) if gamepad_msg is not None else False
-        # LB mode intentionally disabled (2026-08-07). The physical bumper is
-        # ignored here; LT owns deployed MOBILE <-> MANIPULATION selection.
-        # lb_bumper_now = bool(getattr(gamepad_msg, "leftBumper", 0))
+        lb_bumper_now = bool(getattr(gamepad_msg, "leftBumper", 0)) if gamepad_msg is not None else False
+        rb_bumper_now = bool(getattr(gamepad_msg, "rightBumper", 0)) if gamepad_msg is not None else False
 
         enabled = int(self._mode_est) in (PD, PWMPD)
 
-        # LT selects MOBILE while disabled; from HOPPING it requests the
-        # existing stand/fold transition. Once appendages are deployed, every
-        # LT rising edge toggles MOBILE <-> MANIPULATION without reconfiguring.
+        # LB bumper: simplified push hold needs only PD + MOBILE.
+        # Box tags are required only by the non-simple auto-align mode.
+        # While already in hold/button, LB exits back to MOBILE.
+        self._flush_lb_click()
+        if bool(lb_bumper_now) and (not bool(self._mode_last_lb_bumper)):
+            if enabled and self._gait_mode in ("manipulation", "push"):
+                self._lb_click_pending = False
+                self._leave_deployed_to_mobile("LB")
+            elif enabled and self._gait_mode == "mobile":
+                self._try_enter_push_hold("LB")
+            elif not enabled:
+                jprint("[gait] LB ignored (press X for PD first, then LB)")
+            else:
+                jprint("[gait] LB ignored (need PD + MOBILE)")
+        self._mode_last_lb_bumper = bool(lb_bumper_now)
+
+        # RB bumper:
+        #   MOBILE / MANIPULATION -> auto-approach then press the wall button
+        #     (the sequence that previously worked).
+        #   HOPPING -> 1/2/3 clicks set β_lo/β_hi (closed-form placement).
+        self._flush_rb_click()
+        if bool(rb_bumper_now) and (not bool(self._mode_last_rb_bumper)):
+            if enabled and self._gait_mode in ("mobile", "manipulation"):
+                self._rb_click_pending = False
+                self._lb_start_button("RB")
+            elif self._gait_mode == "hopping":
+                now_m = time.monotonic()
+                win = float(getattr(self.lcm_cfg, "lb_double_click_s", 0.40))
+                if bool(self._rb_click_pending) and (
+                    now_m - float(self._rb_click_t)
+                ) <= win:
+                    self._rb_click_n = min(3, int(self._rb_click_n) + 1)
+                    self._rb_click_t = now_m
+                    jprint(f"[gait] RB: click {int(self._rb_click_n)}")
+                else:
+                    self._rb_click_pending = True
+                    self._rb_click_n = 1
+                    self._rb_click_t = now_m
+                    jprint("[gait] RB: click 1 (β preset if no more clicks)")
+            elif not enabled:
+                jprint("[gait] RB ignored (press X for PD first, then RB)")
+            else:
+                jprint("[gait] RB ignored (need PD + MOBILE for button)")
+        self._mode_last_rb_bumper = bool(rb_bumper_now)
+
+        # LT is mobile only: select MOBILE while disabled; from HOPPING
+        # request stand/fold; from hold/button leave to MOBILE. Never
+        # starts push-box (that is LB).
         if bool(lt_now) and (not bool(self._mode_last_lb)):
             if not enabled:
                 self._gait_mode = "mobile"
+                self._reset_hop_estimator("LT disabled -> MOBILE")
                 self._manip_init_pending = False
+                self._manip_hold_q_cmd = None
                 self._mobile_tag_samples = []
                 self._mobile_tag_ready_sp = None
                 self._mobile_tag_state = "searching"
@@ -915,77 +1190,16 @@ class ModeELCMController:
                     float(self.lcm_cfg.rm_mobile_rad),
                     "LT disabled: select MOBILE",
                 )
+            elif self._gait_mode in ("manipulation", "push"):
+                self._leave_deployed_to_mobile("LT")
             elif self._gait_mode == "mobile":
-                if bool(self._approach_active):
-                    if (self._approach_kind == "box"
-                            and bool(self._box_ready)):
-                        # Box approach parked in the READY band: LT engages.
-                        self._enter_push()
-                    else:
-                        # LT toggles the auto-approach off (manual again).
-                        self._approach_stop("LT cancel")
-                else:
-                    ready_sp = self._mobile_tag_ready_sp
-                    tag_recent = (
-                        time.monotonic() - float(self._mobile_tag_last_sp_rx)
-                        <= 1.0
-                    )
-                    box_now = (
-                        self._read_box_setpoint()
-                        if bool(getattr(self.lcm_cfg, "push_enable", True))
-                        else None
-                    )
-                    if ready_sp is not None:
-                        # Tag stable AND reachable: manipulate right away.
-                        self._enter_manipulation(ready_sp, source="LT")
-                    elif (bool(getattr(
-                            self.lcm_cfg, "mobile_approach_enable", True))
-                            and tag_recent):
-                        # Tag seen but out of the leg workspace: drive there.
-                        self._approach_start()
-                    elif box_now is not None:
-                        # No button tag but a box face. Inside the READY
-                        # band -> engage now (and latch the measured face
-                        # distance as the working distance); otherwise
-                        # auto-approach until READY, then LT again -> PUSH.
-                        self._store_push_box(box_now)
-                        in_band = self._box_in_ready_band()
-                        if in_band:
-                            self._enter_push()
-                        else:
-                            self._approach_start(kind="box")
-                    else:
-                        print(
-                            "[gait] LT ignored: no tag "
-                            f"({self._mobile_tag_state}) and no box face; "
-                            "stay MOBILE"
-                        )
-            elif self._gait_mode == "push":
-                self._gait_mode = "mobile"
-                self._push_box = None
-                self._push_e_des_m = 0.0
-                self._reset_push_contact_state()
-                self._manip_init_pending = False
-                self._reset_mobile_leg_stow()
-                print("[gait] LT -> MOBILE: leave PUSH, wheels manual")
-            elif self._gait_mode == "manipulation":
-                self._gait_mode = "mobile"
-                self._manip_init_pending = False
-                self._mobile_tag_samples = []
-                self._mobile_tag_ready_sp = None
-                self._mobile_tag_state = "searching"
-                self._reset_mobile_leg_stow()
-                self._reset_manip_button()
-                print(
-                    "[gait] LT -> MOBILE: wheels enabled; leg stows to "
-                    "mobile q after wheel motion (1 Nm -> damp hold)"
-                )
+                jprint("[gait] LT ignored (already MOBILE; LB = push-box)")
             elif self._gait_mode != "hopping":
-                print("[gait] LT ignored (deployed transition active)")
+                jprint("[gait] LT ignored (deployed transition active)")
             elif (bool(self._rm_lt_pending)
                     or bool(self._lt_await_lo_stand)
                     or self._lt_stand_t0 is not None):
-                print("[gait] LT ignored (fold transition already pending/active)")
+                jprint("[gait] LT ignored (fold transition already pending/active)")
             else:
                 # Abort any in-progress RM unfold/drive so LT can arm on
                 # the next compression (touchdown).
@@ -995,7 +1209,7 @@ class ModeELCMController:
                     self._rm_drive_t0 = None
                     self._rm_sync_q0 = None
                     self._rm_iq_des[:] = 0.0
-                    print("[rm] abort drive so LT can arm on compression")
+                    jprint("[rm] abort drive so LT can arm on compression")
                 self._rm_lt_pending = True
                 self._lt_await_lo_stand = False
                 self._override_hop_height(
@@ -1005,7 +1219,7 @@ class ModeELCMController:
                 # LT owns the temporary height for the transition push;
                 # cancel any remaining RT first-hop countdown.
                 self._rt_hop_height_remaining = 0
-                print(
+                jprint(
                     "[gait] LT ARMED -> hop_height=%.3f m; on next "
                     "compression: fold RM 0 -> %.1f; legs finish that "
                     "hop; at liftoff: props OFF + hold leg %.3f m, "
@@ -1017,11 +1231,14 @@ class ModeELCMController:
         self._mode_last_lb = bool(lt_now)
 
         if bool(rt_now) and (not bool(self._mode_last_rb)):
-            # RT selects HOPPING while disabled. While enabled, only MOBILE may
-            # start P4 and the MOBILE->HOPPING transition.
+            # RT selects HOPPING while disabled. While PD is on, MOBILE
+            # RT starts P4 then the MOBILE -> HOPPING transition.
             if not enabled:
                 self._rt_stand_t0 = None
                 self._gait_mode = "hopping"
+                self._reset_hop_estimator(
+                    "RT disabled -> HOPPING", new_session=True
+                )
                 self._reset_mobile_leg_stow()
                 self._switch_loop = False
                 self._rm_lt_pending = False
@@ -1034,13 +1251,14 @@ class ModeELCMController:
                     "RT disabled: select HOPPING",
                 )
             elif self._gait_mode != "mobile":
-                print(
+                jprint(
                     "[gait] RT ignored (leave MANIPULATION with LT first, "
                     "or already HOPPING)"
                 )
             elif bool(self._switch_loop):
-                print("[switch_loop] RT ignored (P4 stand already active)")
+                jprint("[switch_loop] RT ignored (P4 stand already active)")
             else:
+                self._approach_stop("RT -> hopping")
                 self._switch_loop = True
                 self._rb_p4_t0 = time.time()
                 self._rb_p4_aligning = True
@@ -1050,9 +1268,8 @@ class ModeELCMController:
                 self._lt_await_lo_stand = False
                 self._rm_stage = 0
                 self._rm_iq_des[:] = 0.0
-                # RT forces props ON for P4 + first hop.
                 self._prop_enable = True
-                print(
+                jprint(
                     "[switch_loop] RT MOBILE -> P4: align L=%.3fm, then "
                     "extend/hold L=%.3fm (cap %.1fNm) + props %.0fus for "
                     "%.1fs, then enter FLIGHT/HOPPING (RM unfold + prop "
@@ -1078,15 +1295,28 @@ class ModeELCMController:
             if bool(self._backup_active):
                 self._backup_active = False
                 self._backup_remain_m = 0.0
-                print("[backup] OFF (B)")
+                jprint("[backup] OFF (B)")
+            if bool(self._press_drive_active):
+                self._press_drive_active = False
+                self._press_drive_remain_m = 0.0
+                jprint("[manip-btn] wheel press OFF (B)")
+            if (
+                self._gait_mode == "manipulation"
+                and str(getattr(self, "_manip_kind", "")) == "button"
+            ):
+                self._btn_stage = "aborted"
+                self._btn_stage_print = "aborted"
+                self._manip_press_boost = False
+                jprint("[manip-btn] sequence ABORTED (B); no later press")
             if self._gait_mode == "push":
                 # PUSH is an active contact task: B drops back to MOBILE so
                 # a later X re-arm cannot resume pushing unexpectedly.
                 self._gait_mode = "mobile"
                 self._push_box = None
                 self._push_e_des_m = 0.0
+                self._manip_hold_q_cmd = None
                 self._reset_push_contact_state()
-                print("[gait] B: leave PUSH -> MOBILE")
+                jprint("[gait] B: leave PUSH -> MOBILE")
             self._rm_stage = 0
             self._rm_lt_pending = False
             self._rm_rt_pending = False
@@ -1097,6 +1327,8 @@ class ModeELCMController:
             self._rb_p4_t0 = None
             self._rb_p4_aligning = False
             self._reset_mobile_leg_stow()
+            self._lb_click_pending = False
+            self._rb_click_pending = False
             self._restore_hop_height("B abort")
             self._restore_rt_first_hop_l0()
             self._rm_iq_des = np.zeros(3, dtype=float)
@@ -1116,7 +1348,7 @@ class ModeELCMController:
                 control_mode=int(self.lcm_cfg.prop_ctrl_mode_off),
                 force=True,
             )
-            print("[prop] OFF (B) -> legs DAMP + props stop (control_mode=%d)"
+            jprint("[prop] OFF (B) -> legs DAMP + props stop (control_mode=%d)"
                   % int(self.lcm_cfg.prop_ctrl_mode_off))
         elif bool(x_now) and (not bool(self._mode_last_x)) and (int(self._mode_est) != PD):
             self._mode_est = PD
@@ -1125,17 +1357,17 @@ class ModeELCMController:
             if int(self._mode_est) == PD:
                 self._mode_est = PWMPD
                 self._prop_enable = True
-                print(
+                jprint(
                     "[prop] ON (A): PD -> PWMPD (control_mode=%d)"
                     % int(self.lcm_cfg.prop_ctrl_mode_on)
                 )
             elif int(self._mode_est) == PWMPD:
                 self._mode_est = PD
                 self._prop_enable = False
-                print("[prop] OFF (A): PWMPD -> PD")
+                jprint("[prop] OFF (A): PWMPD -> PD")
             else:
                 self._prop_enable = False
-                print("[prop] A ignored: press X first")
+                jprint("[prop] A ignored: press X first")
         elif bool(start_now) and (not bool(self._mode_last_start)) and (int(self._mode_est) == DAMP):
             self._mode_est = OFF
 
@@ -1161,7 +1393,7 @@ class ModeELCMController:
                 )
             h_old = float(self.core.cfg.foot_clearance_target_m)
             self.core.cfg.foot_clearance_target_m = h_new
-            print(
+            jprint(
                 "[foot_clearance] OVERRIDE (%s): %.3f -> %.3f m "
                 "(restore %.3f)"
                 % (reason, h_old, h_new, float(self._hop_height_restore))
@@ -1171,10 +1403,81 @@ class ModeELCMController:
                 self._hop_height_restore = float(self.core.cfg.hop_height_m)
             h_old = float(self.core.cfg.hop_height_m)
             self.core.cfg.hop_height_m = h_new
-            print(
+            jprint(
                 "[hop_height] OVERRIDE (%s): %.3f -> %.3f m (restore %.3f)"
                 % (reason, h_old, h_new, float(self._hop_height_restore))
             )
+
+    def _rm_drive_busy(self) -> bool:
+        """True while RM is mid fold/unfold (stage 2).
+
+        Stage 3 is the 1 s endpoint insurance hold. After HOPPING->MOBILE
+        that hold may overlap the first wheel command -- that is intended.
+        Only the long drive must keep the wheels off.
+        """
+        return int(self._rm_stage) == 2
+
+    def _begin_new_hopping_session(self, reason: str) -> None:
+        """Restore launch knobs so this hopping does not inherit the last.
+
+        Drops leftover RT/LT height and l0 overrides and writes the
+        launch-time hop_height / foot_clearance / l0 back onto cfg.
+        Stick-changed height from the previous hopping is discarded.
+        """
+        self._hop_height_stick_pending = ""
+        self._rt_hop_height_remaining = 0
+        self._hop_height_restore = None
+        self._rt_first_hop_l0_saw_td = False
+        if self._rt_l0_restore is not None:
+            self.core.cfg.leg_l0_m = float(self._leg_l0_launch_m)
+            self._rt_l0_restore = None
+        self.core.cfg.hop_height_m = float(self._hop_height_launch_m)
+        self.core.cfg.foot_clearance_target_m = float(
+            self._foot_clearance_launch_m
+        )
+        jprint(
+            "[gait] new hopping session (%s): clearance=%.3f hop_height=%.3f "
+            "l0=%.3f (launch defaults; last session height/vel discarded)"
+            % (
+                reason,
+                float(self.core.cfg.foot_clearance_target_m),
+                float(self.core.cfg.hop_height_m),
+                float(self.core.cfg.leg_l0_m),
+            )
+        )
+
+    def _reset_hop_estimator(
+        self,
+        reason: str,
+        *,
+        first_lo_zero_xy: bool = False,
+        new_session: bool = False,
+    ) -> None:
+        """Zero hop-cycle velocity (v_hat, flight latch, last-N rings).
+
+        Called when leaving HOPPING for MOBILE so the last hop's residual
+        does not sit in the estimator, and again when re-entering HOPPING
+        because core.step still runs while walking and can rewrite v_hat.
+
+        new_session: every switch TO hopping is a fresh hop bout -- restore
+        launch height/l0, clear trim/E_loss via user_reset, first LO v=0.
+        first_lo_zero_xy: MOBILE->HOPPING first liftoff latches v=0
+        (P4/stand kinematics pollute the last-N ring). Implied by new_session.
+        """
+        if new_session:
+            self._begin_new_hopping_session(reason)
+            first_lo_zero_xy = True
+        try:
+            self.core.user_reset(zero_yaw=False)
+        except Exception:
+            pass
+        self._v_cmd_filt[:] = 0.0
+        if first_lo_zero_xy:
+            self.core._rt_first_lo_zero_xy = True
+        jprint(
+            "[gait] hop estimator cleared (%s): v_hat=0 flight_vel=0%s"
+            % (reason, " first-LO v=0" if first_lo_zero_xy else "")
+        )
 
     def _arm_rt_first_hops(self, reason: str) -> None:
         """MOBILE->HOPPING first-N hop height override (disabled when N=0)."""
@@ -1201,7 +1504,7 @@ class ModeELCMController:
         self.core._stance = False
         self.core._td_t = None
         self.core._lo_t = None
-        print(
+        jprint(
             "[switch_loop] first-hop l0 (%s): %.3f -> %.3f m (restore %.3f); "
             "force FLIGHT hold"
             % (reason, l0_old, l0_new, float(self._rt_l0_restore))
@@ -1214,7 +1517,7 @@ class ModeELCMController:
         self.core.cfg.leg_l0_m = float(self._rt_l0_restore)
         self._rt_l0_restore = None
         self._rt_first_hop_l0_saw_td = False
-        print("[switch_loop] first-hop l0 restored -> %.3f m"
+        jprint("[switch_loop] first-hop l0 restored -> %.3f m"
               % float(self.core.cfg.leg_l0_m))
 
     def _restore_hop_height(self, reason: str) -> None:
@@ -1231,7 +1534,7 @@ class ModeELCMController:
                 self._hop_height_restore
             )
             self._hop_height_restore = None
-            print(
+            jprint(
                 "[foot_clearance] RESTORE (%s): %.3f -> %.3f m"
                 % (reason, h_old, float(self.core.cfg.foot_clearance_target_m))
             )
@@ -1239,7 +1542,7 @@ class ModeELCMController:
             h_old = float(self.core.cfg.hop_height_m)
             self.core.cfg.hop_height_m = float(self._hop_height_restore)
             self._hop_height_restore = None
-            print(
+            jprint(
                 "[hop_height] RESTORE (%s): %.3f -> %.3f m"
                 % (reason, h_old, float(self.core.cfg.hop_height_m))
             )
@@ -1274,7 +1577,7 @@ class ModeELCMController:
         self._hop_prop_base_active = True
         self._hop_prop_base_t0 = time.time()
         self._hop_prop_base_saw_td = False
-        print(
+        jprint(
             "[prop] base window OPEN: collective %.1f N (%.0f%% weight, "
             "= %.0f us/arm, floor %.0f us) via ModeE ratio override "
             "(close on first-hop LO or %.1fs)"
@@ -1296,7 +1599,7 @@ class ModeELCMController:
             self.core.cfg.prop_stance_base_thrust_ratio = float(base_st)
             self._prop_ratio_restore = None
             if was_active:
-                print("[prop] base window CLOSED (%s) -> ModeE prop control"
+                jprint("[prop] base window CLOSED (%s) -> ModeE prop control"
                       % reason)
 
     def _handle_robot_data(self, channel: str, data: bytes) -> None:
@@ -1398,14 +1701,14 @@ class ModeELCMController:
         return v
 
     def _handle_hop_height_stick(self, gamepad_msg) -> None:
-        """Set foot_clearance_target_m when LEFT stick returns to neutral.
+        """Queue foot_clearance_target_m when LEFT stick returns to neutral.
 
-        Armed by a full deflection, applied once on release:
+        Armed by a full deflection, written on release, latched at the
+        next touchdown (pogox does not retune the current stance):
           up -> hop_height_stick_up_m
           down -> hop_height_stick_down_m
           left -> hop_height_stick_left_m
           right -> hop_height_stick_right_m
-        (Active height knob under foot_clearance_control_enable.)
         """
         if not bool(getattr(
             self.lcm_cfg, "hop_height_stick_enable", True
@@ -1468,13 +1771,11 @@ class ModeELCMController:
         h_max = float(max(h_min, float(getattr(
             self.lcm_cfg, "hop_height_max_m", 0.40
         ))))
-        h_old = float(self.core.cfg.foot_clearance_target_m)
         h_new = round(float(np.clip(preset, h_min, h_max)), 3)
+        # Queue only. Pogox latches this at the NEXT touchdown. Do not
+        # print here — journal I/O on the 500 Hz thread stalls the loop
+        # (same class of hitch as in-loop CSV).
         self.core.cfg.foot_clearance_target_m = h_new
-        print(
-            "[foot_clearance] LEFT stick %s-release: %.3f -> %.3f m"
-            % (direction.upper(), h_old, h_new)
-        )
 
     def _reset_mobile_leg_stow(self) -> None:
         """Clear the MOBILE leg approach/hold latch."""
@@ -1533,7 +1834,7 @@ class ModeELCMController:
             self._mobile_leg_phase = "center"
             self._mobile_leg_y_off_m = 0.0
             q_c = float(getattr(self.lcm_cfg, "mobile_leg_center_q", 0.4))
-            print(
+            jprint(
                 "[mobile-leg] wheel motion -> CENTER first "
                 f"(q={q_c:.2f}), then field pose "
                 f"q_des={tuple(float(x) for x in self.lcm_cfg.mobile_leg_q_des)} "
@@ -1600,7 +1901,7 @@ class ModeELCMController:
             err = (q_des - q_now).astype(float)
             if float(np.max(np.abs(err))) <= arrive:
                 self._mobile_leg_phase = "lift"
-                print(
+                jprint(
                     "[mobile-leg] CENTER done (|e|_max="
                     f"{float(np.max(np.abs(err))):.3f} rad) -> LIFT "
                     "to field pose"
@@ -1618,7 +1919,7 @@ class ModeELCMController:
             if float(np.max(np.abs(err))) <= arrive:
                 self._mobile_leg_phase = "hold"
                 self._mobile_leg_holding = True
-                print(
+                jprint(
                     "[mobile-leg] LIFT arrived (|e|_max="
                     f"{float(np.max(np.abs(err))):.3f} rad) -> hold + "
                     "stick±Y with wheels"
@@ -1634,7 +1935,23 @@ class ModeELCMController:
             tau = np.clip(tau, -cap, cap)
         return tau.astype(float)
 
-    def _compute_wheel_cmd(self, gamepad_msg) -> np.ndarray:
+    def _button_center_tau(self, q, qd) -> np.ndarray:
+        """MOBILE first-step 归中: equal-joint PD to mobile_leg_center_q."""
+        q_c = float(getattr(self.lcm_cfg, "mobile_leg_center_q", 0.4))
+        q_des = np.full(3, q_c, dtype=float)
+        q_now = np.asarray(q, dtype=float).reshape(3)
+        qd_now = np.asarray(qd, dtype=float).reshape(3)
+        kp = float(max(0.0, self.lcm_cfg.mobile_leg_kp))
+        kd = float(max(0.0, self.lcm_cfg.mobile_leg_kd_move))
+        cap = float(max(0.0, self.lcm_cfg.mobile_leg_tau_max_nm))
+        tau = kp * (q_des - q_now) - kd * qd_now
+        if cap > 0.0:
+            tau = np.clip(tau, -cap, cap)
+        return tau.astype(float)
+
+    def _compute_wheel_cmd(
+        self, gamepad_msg, *, allow_yaw: bool = True
+    ) -> np.ndarray:
         """MOBILE kiwi-drive IK: sticks -> body twist -> 3 wheel speeds.
 
         Right stick = translation (same axis convention as the hopping
@@ -1660,7 +1977,8 @@ class ModeELCMController:
             # command wz<0 = CCW = turn left (sign fixed 2026-08-08).
             vx = -rs_y * float(self.lcm_cfg.mobile_v_max_mps)
             vy = rs_x * float(self.lcm_cfg.mobile_v_max_mps)
-            wz = ls_x * float(self.lcm_cfg.mobile_wz_max_rad_s)
+            if allow_yaw:
+                wz = ls_x * float(self.lcm_cfg.mobile_wz_max_rad_s)
         return self._kiwi_ik(vx, vy, wz)
 
     def _kiwi_ik(self, vx: float, vy: float, wz: float) -> np.ndarray:
@@ -1737,14 +2055,14 @@ class ModeELCMController:
                 if self._push_work_dist_m is not None
                 else getattr(self.lcm_cfg, "push_approach_dist_m", 0.40)
             )
-            print(
-                "[approach] LT -> BOX APPROACH: square to the face, "
-                f"center on tags, stop at {work:.2f} m; READY then LT "
-                "-> PUSH (stick/B/LT cancels)"
+            jprint(
+                "[approach] LB -> BOX APPROACH: square to the face, "
+                f"center on tags, stop at {work:.2f} m; READY -> auto "
+                "PUSH (stick/B/LB cancels)"
             )
         else:
-            print(
-                "[approach] LT -> AUTO-APPROACH: driving wheels toward tag "
+            jprint(
+                "[approach] RT -> AUTO-APPROACH: driving toward tag "
                 f"({self._mobile_tag_state}); stick/B/LT cancels"
             )
 
@@ -1760,11 +2078,14 @@ class ModeELCMController:
         self._box_ready_since = None
         self._box_ready_exit_since = None
         if reason:
-            print(f"[approach] OFF ({reason})")
+            jprint(f"[approach] OFF ({reason})")
 
     def _manip_home_foot(self) -> np.ndarray:
-        """Straight-down home: equal joints at manip_home_q (≈ q=0.4)."""
-        qh = float(getattr(self.lcm_cfg, "manip_home_q", 0.4))
+        """Straight-down 归中: equal joints at mobile_leg_center_q (≈ 0.4)."""
+        qh = float(getattr(
+            self.lcm_cfg, "mobile_leg_center_q",
+            getattr(self.lcm_cfg, "manip_home_q", 0.4),
+        ))
         try:
             if self.core.fk is not None:
                 foot, _ = self.core.fk.forward_kinematics(
@@ -1778,59 +2099,220 @@ class ModeELCMController:
         # FK fallback: measured L≈0.422 m at q=0.4.
         return np.array([0.0, 0.0, 0.422], dtype=float)
 
+    def _lock_button_z(self, p: np.ndarray) -> np.ndarray:
+        """Keep the detected button height; envelope clamp handles limits."""
+        return np.asarray(p, dtype=float).reshape(3).copy()
+
     def _rebuild_button_press(
         self, sp: dict, *, press_m: float | None = None
     ) -> dict:
-        """Force press stroke to manip_button_press_m (default 5 cm)."""
+        """Build PRE/FACE/PRESS at the detected button height."""
         out = dict(sp)
         n_in = np.asarray(
             out.get("wall_normal_in_L", [1.0, 0.0, 0.0]), dtype=float
         ).reshape(3)
+        n_in[2] = 0.0
         nn = float(np.linalg.norm(n_in))
         if nn > 1e-9:
             n_in = n_in / nn
-        face = np.asarray(out["foot_face_L"], dtype=float).reshape(3)
+        else:
+            n_in = np.array([1.0, 0.0, 0.0], dtype=float)
+        face = self._lock_button_z(out["foot_face_L"])
         pm = float(
             press_m
             if press_m is not None
             else getattr(self.lcm_cfg, "manip_button_press_m", 0.05)
         )
+        pre_m = float(getattr(self.lcm_cfg, "manip_button_pre_m", 0.08))
         out["press_m"] = pm
         out["foot_face_L"] = face.tolist()
-        out["foot_pre_L"] = (face - 0.03 * n_in).tolist()
+        out["foot_pre_L"] = (face - pre_m * n_in).tolist()
         out["foot_press_L"] = (face + pm * n_in).tolist()
         out["wall_normal_in_L"] = n_in.tolist()
         return out
 
-    def _enter_manipulation(self, ready_sp: dict, *, source: str) -> None:
-        """Shared MOBILE -> MANIPULATION entry (LT press or auto-arrival)."""
+    def _button_lat_err_m(self, pre, n_in) -> float:
+        """Wall-parallel distance from button hover to the approach park pose."""
+        gx = float(getattr(self.lcm_cfg, "mobile_approach_goal_x_m", 0.086))
+        gy = float(getattr(self.lcm_cfg, "mobile_approach_goal_y_m", 0.063))
+        nx = float(n_in[0])
+        ny = float(n_in[1])
+        px = float(pre[0])
+        py = float(pre[1])
+        if nx * px + ny * py < 0.0:
+            nx, ny = -nx, -ny
+        nh = math.hypot(nx, ny) or 1.0
+        nhx, nhy = nx / nh, ny / nh
+        ex, ey = px - gx, py - gy
+        e_adv = ex * nhx + ey * nhy
+        return math.hypot(ex - e_adv * nhx, ey - e_adv * nhy)
+
+    def _flush_lb_click(self) -> None:
+        """Clear a leftover LB click window. Hold is LT, not LB."""
+        if not bool(self._lb_click_pending):
+            return
+        win = float(getattr(self.lcm_cfg, "lb_double_click_s", 0.40))
+        if (time.monotonic() - float(self._lb_click_t)) < win:
+            return
+        self._lb_click_pending = False
+
+    def _flush_rb_click(self) -> None:
+        """Apply the pending RB β preset after the multi-click window.
+
+        Only while HOPPING -- MOBILE uses RB for the button approach.
+        """
+        if not bool(self._rb_click_pending):
+            return
+        if self._gait_mode != "hopping":
+            self._rb_click_pending = False
+            return
+        win = float(getattr(self.lcm_cfg, "lb_double_click_s", 0.40))
+        if (time.monotonic() - float(self._rb_click_t)) < win:
+            return
+        n = int(max(1, min(3, int(self._rb_click_n))))
+        self._rb_click_pending = False
+        self._apply_rb_beta_preset(n)
+
+    def _apply_rb_beta_preset(self, n: int) -> None:
+        presets = getattr(
+            self.lcm_cfg, "rb_beta_presets",
+            ((0.11, 0.50), (0.50, 0.50), (0.75, 0.75)),
+        )
+        idx = int(max(1, min(3, int(n)))) - 1
+        try:
+            blo, bhi = presets[idx]
+        except Exception:
+            blo, bhi = (0.11, 0.50)
+        blo = float(blo)
+        bhi = float(bhi)
+        self.core.cfg.flight_deadbeat_model = True
+        self.core.cfg.flight_deadbeat_beta = blo
+        self.core.cfg.flight_deadbeat_beta_hi = bhi
+        jprint(
+            f"[gait] RB x{int(n)} -> deadbeat ON  β_lo={blo:.2f}  "
+            f"β_hi={bhi:.2f}"
+        )
+
+    def _leave_deployed_to_mobile(self, source: str) -> None:
+        self._gait_mode = "mobile"
+        self._manip_kind = "hold"
+        self._manip_init_pending = False
+        self._manip_hold_q_cmd = None
+        self._push_box = None
+        self._push_e_des_m = 0.0
+        self._reset_push_contact_state()
+        self._mobile_tag_samples = []
+        self._mobile_tag_ready_sp = None
+        self._mobile_tag_state = "searching"
+        self._reset_mobile_leg_stow()
+        self._reset_manip_button()
+        self._approach_stop(None)
+        jprint(
+            f"[gait] {source} -> MOBILE: leave deployed; "
+            "leg stows after wheel motion"
+        )
+
+    def _lb_start_button(self, source: str) -> None:
+        """RB: AprilTag button (auto-approach if not yet READY, then press)."""
+        if bool(self._approach_active):
+            self._approach_stop(source)
+        ready_sp = self._mobile_tag_ready_sp
+        tag_recent = (
+            time.monotonic() - float(self._mobile_tag_last_sp_rx) <= 1.0
+        )
+        if ready_sp is not None:
+            self._enter_manipulation(ready_sp, source=source, kind="button")
+        elif bool(getattr(self.lcm_cfg, "mobile_approach_enable", True)) and tag_recent:
+            if self._gait_mode != "mobile":
+                self._leave_deployed_to_mobile(source)
+            self._approach_start()
+            jprint(f"[gait] {source}: tag seen, auto-approach then PRESS")
+        else:
+            jprint(
+                f"[gait] {source} ignored: no tag "
+                f"({self._mobile_tag_state}); stay {self._gait_mode}"
+            )
+
+    def _enter_manipulation(
+        self, ready_sp=None, *, source: str, kind: str = "hold"
+    ) -> None:
+        """MOBILE -> MANIPULATION. kind=hold (q-hold) or button (tag press)."""
         self._approach_stop(None)
         self._backup_active = False
         self._backup_remain_m = 0.0
         self._gait_mode = "manipulation"
-        self._manip_init_pending = True
+        self._manip_kind = "button" if kind == "button" else "hold"
         self._reset_mobile_leg_stow()
         self._reset_manip_button()
-        # Latch the button target, but first recenter the leg straight
-        # down (home @ q≈0.4) before pre/face/press.
-        self._btn_last_setpoint = self._rebuild_button_press(ready_sp)
-        self._btn_stage = "home"
-        self._btn_stage_print = "home"
-        qh = float(getattr(self.lcm_cfg, "manip_home_q", 0.4))
-        pm = float(getattr(self.lcm_cfg, "manip_button_press_m", 0.05))
-        self._manip_press_n_L = np.asarray(
-            self._btn_last_setpoint.get("wall_normal_in_L", [1.0, 0.0, 0.0]),
-            dtype=float,
-        ).reshape(3)
-        nn = float(np.linalg.norm(self._manip_press_n_L))
-        if nn > 1e-9:
-            self._manip_press_n_L /= nn
-        print(
-            f"[gait] {source} -> MANIPULATION: wheels STOP; "
-            f"TAG setpoint LATCHED (open-loop — occlusion OK); "
-            f"HOME -> PRE -> FACE -> PRESS({pm*100:.0f}cm). "
-            f"Keep mode PD (do not press B)."
-        )
+        if self._manip_kind == "hold":
+            self._manip_init_pending = False
+            self._btn_stage = "hold"
+            self._btn_stage_print = "q-hold"
+            qh = tuple(
+                float(x) for x in np.asarray(
+                    getattr(
+                        self.lcm_cfg, "manip_hold_q",
+                        (1.376, 1.378, -0.096),
+                    ),
+                    dtype=float,
+                ).reshape(3)
+            )
+            rate = float(getattr(
+                self.lcm_cfg, "manip_hold_q_rate_rad_s", 0.0
+            ))
+            if rate <= 1e-9:
+                self._manip_hold_q_cmd = np.asarray(qh, dtype=float).reshape(3)
+            else:
+                try:
+                    self._manip_hold_q_cmd = np.asarray(
+                        self.robot_state["q"], dtype=float
+                    ).reshape(3).copy()
+                except Exception:
+                    self._manip_hold_q_cmd = None
+            kd = float(self.lcm_cfg.manip_ak60_kd)
+            jprint(
+                f"[gait] {source} -> PUSH-BOX hold q="
+                f"({qh[0]:+.3f},{qh[1]:+.3f},{qh[2]:+.3f}) rad  "
+                f"{'snap' if rate <= 1e-9 else f'slew {rate:.2f} rad/s'}  "
+                f"kp={float(getattr(self.lcm_cfg, 'manip_hold_kp', 20.0)):.1f} "
+                f"ak60_kd={kd:.1f}; "
+                f"VISION-FREE SIMPLE; wheels same as MOBILE "
+                f"(fwd/strafe + yaw); "
+                f"LB/LT back to MOBILE"
+            )
+            return
+        # Button: HOME then PRE/FACE/PRESS on the latched tag.
+        self._manip_init_pending = True
+        if ready_sp is not None:
+            self._btn_last_setpoint = self._rebuild_button_press(ready_sp)
+            self._btn_stage = "home"
+            self._btn_stage_print = "home"
+            self._manip_press_n_L = np.asarray(
+                self._btn_last_setpoint.get(
+                    "wall_normal_in_L", [1.0, 0.0, 0.0]
+                ),
+                dtype=float,
+            ).reshape(3)
+            nn = float(np.linalg.norm(self._manip_press_n_L))
+            if nn > 1e-9:
+                self._manip_press_n_L /= nn
+            pm = float(getattr(self.lcm_cfg, "manip_button_press_m", 0.05))
+            q_c = float(getattr(self.lcm_cfg, "mobile_leg_center_q", 0.4))
+            jprint(
+                f"[gait] {source} -> BUTTON: 归中(q={q_c:.2f}) -> PRE -> "
+                f"FACE -> ARM PRESS {pm*100:.0f}cm. "
+                f"READY pose frozen; no more tag reads; wheels STOP. "
+                f"swing tau={float(getattr(self.lcm_cfg, 'manip_button_tau_max_nm', 8.0)):.0f}Nm "
+                f"ak60_kd={float(self.lcm_cfg.mobile_leg_ak60_kd_move):.1f}. "
+                f"Keep PD (do not press B)."
+            )
+        else:
+            self._btn_stage = "idle"
+            self._btn_stage_print = "stick"
+            jprint(
+                f"[gait] {source} -> BUTTON stick teleop "
+                "(no READY tag); LT/LB back to MOBILE"
+            )
 
     def _update_mobile_approach(self, gamepad_msg, dt: float) -> np.ndarray | None:
         """Wheel servo toward the button tag. Returns wheel rad/s or None.
@@ -1891,7 +2373,7 @@ class ModeELCMController:
             self._approach_sp = {"pre": pre, "tag": tag, "n_in": n_in}
             if bool(self._approach_waiting):
                 self._approach_waiting = False
-                print("[approach] tag re-captured -> resume")
+                jprint("[approach] tag re-captured -> resume")
         elif self._approach_sp is not None and age <= memory_s:
             # Detector dropout: advance L-frame memory by the L-frame twist.
             vx_l, vy_l, wz_l = self._approach_last_twist
@@ -1907,7 +2389,7 @@ class ModeELCMController:
             # Memory too old: hold position and wait for re-detection.
             if not bool(self._approach_waiting):
                 self._approach_waiting = True
-                print(
+                jprint(
                     "[approach] tag lost > "
                     f"{memory_s:.1f}s -> wheels stop, waiting for tag"
                 )
@@ -1923,10 +2405,18 @@ class ModeELCMController:
             self._mobile_tag_cam_z_m
         ) else float(np.linalg.norm(pre))
 
-        # UNIQUE arrival: READY means ||face||_L ∈ [r_min, r_max] and
-        # workspace OK — stop wheels, enter MANIP after ready_hold_s.
+        # GitHub stop band: READY depends on radial distance only. Clip and
+        # wall yaw are diagnostics; they must not make the base cross r_min.
         r_min = float(getattr(cfg, "mobile_ready_r_min_m", 0.50))
         r_max = float(getattr(cfg, "mobile_ready_r_max_m", 0.53))
+        n_dx, n_dy = self._l2d_xy(float(n_in[0]), float(n_in[1]))
+        pre_dx, pre_dy = self._l2d_xy(float(pre[0]), float(pre[1]))
+        if n_dx * pre_dx + n_dy * pre_dy < 0.0:
+            n_dx, n_dy = -n_dx, -n_dy
+        yaw_wall = math.atan2(n_dy, n_dx)
+        yaw_ok = math.radians(
+            float(getattr(cfg, "mobile_approach_yaw_ok_deg", 8.0))
+        )
         ready_ok = (
             self._mobile_tag_state == "ready"
             and self._mobile_tag_ready_sp is not None
@@ -1936,7 +2426,7 @@ class ModeELCMController:
         if ready_ok:
             if self._approach_ready_since is None:
                 self._approach_ready_since = now_m
-                print(
+                jprint(
                     "[approach] READY -> holding wheels, "
                     f"enter MANIP in "
                     f"{float(getattr(cfg, 'mobile_approach_ready_hold_s', 0.3)):.1f}s"
@@ -1948,8 +2438,10 @@ class ModeELCMController:
                     source=(
                         "approach arrived (READY, "
                         f"pre_L err={arrive_err*100:.1f}cm, "
-                        f"|face|_L={face_r*100:.1f}cm)"
+                        f"|face|_L={face_r*100:.1f}cm, "
+                        f"yaw_wall={math.degrees(yaw_wall):+.1f}deg)"
                     ),
+                    kind="button",
                 )
                 return np.zeros(3, dtype=float)
             # Freeze while confirming READY — no more forward creep.
@@ -1973,10 +2465,9 @@ class ModeELCMController:
             n_view_x=n_dx, n_view_y=n_dy,
             pre_view_x=pre_dx, pre_view_y=pre_dy,
         )
-        # Radial band gate on ||face||_L (log 22:51: crept 0.50→0.43
-        # because the <=r_max branch ran before retreat). Order:
-        #   1) too close (<r_min): retreat along -n
-        #   2) at/inside r_max: kill wall-normal advance; keep lateral only
+        # Hard radial safety gate from the working GitHub controller:
+        # retreat if too close; inside the band remove all wall-normal
+        # advance while still allowing lateral alignment and yaw correction.
         nx, ny = float(n_in[0]), float(n_in[1])
         if nx * float(pre[0]) + ny * float(pre[1]) < 0.0:
             nx, ny = -nx, -ny
@@ -1984,16 +2475,13 @@ class ModeELCMController:
         nhx, nhy = nx / nh, ny / nh
         adv = vx_L * nhx + vy_L * nhy
         if face_r < r_min:
-            # Back out until back in band (was stuck at ~0 with old elif).
             retreat = float(np.clip(0.8 * (r_min - face_r), 0.06, 0.15))
             lat_x, lat_y = vx_L - adv * nhx, vy_L - adv * nhy
             vx_L = lat_x - retreat * nhx
             vy_L = lat_y - retreat * nhy
-        elif face_r <= r_max:
-            # Hard-stop radial creep; lateral/yaw may still center the tag.
-            if adv > 0.0:
-                vx_L -= adv * nhx
-                vy_L -= adv * nhy
+        elif face_r <= r_max and adv > 0.0:
+            vx_L -= adv * nhx
+            vy_L -= adv * nhy
         self._approach_last_twist = (vx_L, vy_L, wz)
         # Wheel IK is in the drive/camera frame.
         vx_D, vy_D = self._l2d_xy(vx_L, vy_L)
@@ -2001,11 +2489,12 @@ class ModeELCMController:
             self._approach_dbg_t = now_m
             bear_tag = math.degrees(math.atan2(tag_dy, tag_dx))
             bear_btn = math.degrees(math.atan2(pre_dy, pre_dx))
-            print(
+            jprint(
                 f"[approach] pre_L=({pre[0]:+.2f},{pre[1]:+.2f}) "
                 f"tag_L=({tag[0]:+.2f},{tag[1]:+.2f}) "
                 f"|face|_L={face_r:.2f}m "
                 f"bear_tag={bear_tag:+.1f}deg bear_btn={bear_btn:+.1f}deg "
+                f"yaw_wall={math.degrees(yaw_wall):+.1f}deg "
                 f"err={arrive_err*100:.1f}cm clip="
                 f"{self._mobile_tag_reach_error_m*100:.1f}cm "
                 f"v_L=({vx_L:+.2f},{vy_L:+.2f}) "
@@ -2014,16 +2503,14 @@ class ModeELCMController:
         return self._kiwi_ik(vx_D, vy_D, wz)
 
     def _reset_manip_button(self) -> None:
-        self._btn_stage = (
-            "wait_tag"
-            if bool(getattr(self.lcm_cfg, "manip_button_auto_enable", False))
-            else "idle"
-        )
+        self._btn_stage = "idle"
         self._btn_hold_t0 = None
         self._btn_last_setpoint = None
         self._btn_acquire_samples = []
         self._btn_last_sample_t_wall = -1.0
         self._btn_stage_print = self._btn_stage
+        self._press_drive_active = False
+        self._press_drive_remain_m = 0.0
 
     def _write_dashboard_status(
         self,
@@ -2042,12 +2529,30 @@ class ModeELCMController:
         foot_actual = np.asarray(
             info.get("foot_vicon", [np.nan, np.nan, np.nan]), dtype=float
         ).reshape(3)
+        mobile_xy_err = float("nan")
+        try:
+            src = (
+                self._approach_sp["pre"]
+                if self._approach_sp is not None
+                else self._mobile_tag_last_sp["foot_pre_L"]
+            )
+            gx = float(getattr(
+                self.lcm_cfg, "mobile_approach_goal_x_m", 0.086
+            ))
+            gy = float(getattr(
+                self.lcm_cfg, "mobile_approach_goal_y_m", 0.063
+            ))
+            mobile_xy_err = math.hypot(
+                float(src[0]) - gx, float(src[1]) - gy
+            )
+        except Exception:
+            pass
         payload = {
             "t_wall": time.time(),
             "gait_mode": str(self._gait_mode),
             "button_stage": str(self._btn_stage),
             "mobile_tag_state": str(self._mobile_tag_state),
-            # Goal: |face|_L in [r_min, r_max]. clip = workspace 差值.
+            # Actual handoff: PRE XY error + workspace clip + wall yaw.
             "mobile_ready_r_min_m": float(
                 getattr(self.lcm_cfg, "mobile_ready_r_min_m", 0.50)
             ),
@@ -2057,6 +2562,12 @@ class ModeELCMController:
             "mobile_tag_reach_error_m": (
                 float(self._mobile_tag_reach_error_m)
                 if np.isfinite(self._mobile_tag_reach_error_m) else None
+            ),
+            "mobile_tag_xy_err_m": (
+                float(mobile_xy_err) if np.isfinite(mobile_xy_err) else None
+            ),
+            "mobile_ready_xy_m": float(
+                getattr(self.lcm_cfg, "mobile_ready_xy_m", 0.03)
             ),
             "mobile_tag_r_err_m": (
                 (
@@ -2151,21 +2662,24 @@ class ModeELCMController:
                 if self._push_box is not None else None
             ),
         }
-        try:
+        # AUXILIARY I/O: serialization, the atomic file write and the UDP
+        # send all happen on the aux thread. A 20 Hz JSON write to eMMC on
+        # the control thread was one of the 500 Hz stall sources.
+        sock = self._dashboard_udp_sock
+        addr = (
+            str(self.lcm_cfg.dashboard_udp_host),
+            int(self.lcm_cfg.dashboard_udp_port),
+        )
+
+        def _flush() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".json.tmp")
             encoded = json.dumps(payload)
             tmp.write_text(encoded)
             tmp.replace(path)
-            self._dashboard_udp_sock.sendto(
-                encoded.encode("utf-8"),
-                (
-                    str(self.lcm_cfg.dashboard_udp_host),
-                    int(self.lcm_cfg.dashboard_udp_port),
-                ),
-            )
-        except Exception:
-            pass
+            sock.sendto(encoded.encode("utf-8"), addr)
+
+        _AUX.put(_flush)
 
     def _read_button_setpoint(self) -> dict | None:
         """Load fresh AprilTag setpoint from PC UDP or local JSON fallback."""
@@ -2237,6 +2751,50 @@ class ModeELCMController:
             if not np.all(np.isfinite(value)):
                 return None
         return data
+
+    def _try_enter_push_hold(self, source: str) -> None:
+        """MOBILE -> box push (60 mm tags id 2/3).
+
+        push_simple: snap manip_hold_q, sticks drive the base.
+        otherwise: auto-align then PUSH (LEFT stick drives the box).
+        """
+        if bool(self._approach_active) and self._approach_kind == "box":
+            self._approach_stop(source)
+            return
+        # Simplified mode is intentionally vision-free: deploy the fixed
+        # hold pose immediately and leave all wheel motion to the sticks.
+        # Previously this check sat after the tag gate, so "simple" LB was
+        # unavailable unless id2/id3 happened to be visible.
+        if bool(getattr(self.lcm_cfg, "push_simple", False)):
+            self._enter_manipulation(source=source, kind="hold")
+            return
+        box = self._read_box_setpoint()
+        if not self._box_has_push_tags(box):
+            ids = getattr(self.lcm_cfg, "push_box_tag_ids", (2, 3))
+            jprint(
+                f"[gait] {source} ignored: need 60 mm box tag "
+                f"id={int(ids[0])} or {int(ids[1])}; stay MOBILE"
+            )
+            return
+        self._store_push_box(box)
+        if self._box_in_ready_band():
+            jprint(f"[gait] {source}: already at working pose -> PUSH")
+            self._enter_push()
+        else:
+            self._approach_start(kind="box")
+
+    def _box_has_push_tags(self, box) -> bool:
+        """True if the perception box packet saw 60 mm box ids (2 and/or 3)."""
+        if not isinstance(box, dict) or not bool(box.get("valid", False)):
+            return False
+        want = {
+            int(x) for x in getattr(self.lcm_cfg, "push_box_tag_ids", (2, 3))
+        }
+        try:
+            seen = {int(x) for x in (box.get("tag_ids_seen") or [])}
+        except Exception:
+            return False
+        return bool(want & seen)
 
     def _read_box_setpoint(self) -> dict | None:
         """Fresh box-face estimate from the perception node ("box" field).
@@ -2343,20 +2901,130 @@ class ModeELCMController:
                 p *= Lmin / max(L2, 1e-9)
             elif L2 > Lmax:
                 p *= Lmax / L2
-        # Extra carve: if the point is still past the q=1.4 ring, pull it
-        # toward the +Z home axis (keeps heading, shortens radius).
-        q_max = float(getattr(self.lcm_cfg, "manip_q_max", 1.4))
-        # Equal-q length at q_max ≈ 0.55 m; allow only a fraction once
-        # tilted (empirical: L * (1 + 0.55*sin(tilt)) ≲ L(q_max)).
-        L_tip = 0.55
-        tilt = math.atan2(float(np.linalg.norm(p[:2])), max(1e-6, float(p[2])))
-        L_qcap = L_tip / max(1.0, 1.0 + 0.7 * math.sin(tilt))
-        L_qcap = min(L_qcap, Lmax)
-        Ln = float(np.linalg.norm(p))
-        if Ln > L_qcap and Ln > 1e-9:
-            p = p * (L_qcap / Ln)
-        _ = q_max  # documented limit; geometric carve enforces it
+        # No tilted q=1.4 radial carve: it rejected two-joint-down hold
+        # (L=0.476) as ~21 cm out of range. Deployed travel is work_*.
         return p.astype(float)
+
+    def _work_wheel_az_L(self) -> tuple:
+        """Wheel-center azimuths in the leg/L frame (rad), 120 deg apart.
+
+        Chassis geometry only: drive-frame wheel azimuths (180/60/300)
+        rotated into L by the calibrated drive yaw. Same number for all
+        three; never per-wheel measurements.
+        """
+        c, s = self._l2d_cs
+        yaw = math.atan2(float(s), float(c))
+        return tuple(
+            math.radians(float(a)) + yaw
+            for a in self.lcm_cfg.wheel_azimuth_deg
+        )
+
+    def _work_wheel_centers_xy(self) -> tuple:
+        """Three wheel hubs in L, common radius, 120 deg apart."""
+        r = float(getattr(self.lcm_cfg, "work_wheel_center_m", 0.17))
+        return tuple(
+            (r * math.cos(az), r * math.sin(az))
+            for az in self._work_wheel_az_L()
+        )
+
+    def _work_r_cap(self, az: float, z: float) -> float:
+        """Max foot xy-radius at this azimuth/height (outer disk minus
+        the three wheel circles). Connected from the origin: a ray that
+        hits a wheel is capped at the inner intersection."""
+        l_max = float(getattr(self.lcm_cfg, "work_len_max_m", 0.50))
+        r_max = math.sqrt(max(0.0, l_max * l_max - float(z) ** 2))
+        xy_max = float(getattr(self.lcm_cfg, "work_xy_max_m", 0.37))
+        if xy_max > 0.0:
+            r_max = min(r_max, xy_max)
+        keep = float(getattr(self.lcm_cfg, "work_wheel_keep_m", 0.055))
+        ca, sa = math.cos(az), math.sin(az)
+        k2 = keep * keep
+        for cx, cy in self._work_wheel_centers_xy():
+            b = ca * cx + sa * cy
+            disc = b * b - (cx * cx + cy * cy - k2)
+            if disc <= 0.0:
+                continue
+            r1 = b - math.sqrt(disc)
+            if 0.0 < r1 < r_max:
+                r_max = r1
+        return r_max
+
+    def _clamp_work_envelope(self, target: np.ndarray) -> np.ndarray:
+        """Deployed-leg WORK ENVELOPE clamp (user-defined 2026-08-14).
+
+        z band [work_z_top, work_z_bottom], L in [work_len_min, work_len_max],
+        horizontal r <= work_xy_max (forward-tilt disk ≈ 0.36 m),
+        minus three identical wheel disks (120 deg, left/right symmetric
+        about drive-forward). Not applied to MOBILE stow.
+        """
+        cfg = self.lcm_cfg
+        z_top = float(getattr(cfg, "work_z_top_m", 0.354))
+        z_bot = float(getattr(cfg, "work_z_bottom_m", 0.440))
+        p = np.asarray(target, dtype=float).reshape(3).copy()
+        if not np.all(np.isfinite(p)):
+            return np.array([0.0, 0.0, z_top], dtype=float)
+        p[2] = float(np.clip(p[2], min(z_top, z_bot), max(z_top, z_bot)))
+        l_min = float(getattr(cfg, "work_len_min_m", 0.354))
+        l_max = float(getattr(cfg, "work_len_max_m", 0.50))
+        L = float(np.linalg.norm(p))
+        if L < 1e-9:
+            return np.array([0.0, 0.0, max(z_top, l_min)], dtype=float)
+        if L < l_min:
+            p = p * (l_min / L)
+            L = l_min
+        elif L > l_max:
+            p = p * (l_max / L)
+            L = l_max
+        p[2] = float(np.clip(p[2], min(z_top, z_bot), max(z_top, z_bot)))
+        xy_max = float(getattr(cfg, "work_xy_max_m", 0.37))
+        r_cap = math.sqrt(max(0.0, l_max * l_max - float(p[2]) ** 2))
+        if xy_max > 0.0:
+            r_cap = min(r_cap, xy_max)
+        keep = float(getattr(cfg, "work_wheel_keep_m", 0.055))
+        r = math.hypot(float(p[0]), float(p[1]))
+        az = math.atan2(float(p[1]), float(p[0]))
+        ca, sa = math.cos(az), math.sin(az)
+        k2 = keep * keep
+        # Only pull back if the foot is actually inside a wheel disk;
+        # side corners (beside a wheel) stay reachable.
+        for cx, cy in self._work_wheel_centers_xy():
+            if math.hypot(float(p[0]) - cx, float(p[1]) - cy) >= keep:
+                continue
+            b = ca * cx + sa * cy
+            disc = b * b - (cx * cx + cy * cy - k2)
+            if disc <= 0.0:
+                continue
+            r1 = b - math.sqrt(disc)
+            if 0.0 < r1 < r_cap:
+                r_cap = r1
+        if r > r_cap and r > 1e-9:
+            p[0] *= r_cap / r
+            p[1] *= r_cap / r
+        return p
+
+    def _clamp_push_foot_plane(self, target: np.ndarray) -> np.ndarray:
+        """PUSH-mode clamp: fixed z = FK(manip_hold_q).z, xy-disc only.
+
+        The generic Cartesian clamp must NOT be used here: its empirical
+        q-carve caps L at ~0.38 m at 40 deg tilt, but the hold pose is
+        L = 0.476 m (q near-limit but valid), so it would drag the foot
+        off the plane and away from the face.
+        """
+        if self._push_z_hold_m is None:
+            return self._clamp_manip_foot_cartesian(target)
+        p = np.asarray(target, dtype=float).reshape(3).copy()
+        z0 = float(self._push_z_hold_m)
+        if not np.all(np.isfinite(p)):
+            return np.array([0.0, 0.0, z0], dtype=float)
+        p[2] = z0
+        xy_max = float(max(
+            0.05, getattr(self.lcm_cfg, "push_xy_max_m", 0.31)
+        ))
+        xy_norm = float(np.linalg.norm(p[:2]))
+        if xy_norm > xy_max:
+            p[:2] *= xy_max / xy_norm
+        # Work envelope on top: z band + length cap + wheel sectors.
+        return self._clamp_work_envelope(p)
 
     def _monitor_mobile_button_target(self) -> None:
         """Pre-acquire a stable/reachable button target while in MOBILE."""
@@ -2382,7 +3050,7 @@ class ModeELCMController:
             ):
                 return
             if self._mobile_tag_state != "searching":
-                print("[mobile-tag] LOST -> searching for tag id=1")
+                jprint("[mobile-tag] LOST -> searching for tag id=1")
             self._mobile_tag_samples = []
             self._mobile_tag_ready_sp = None
             self._mobile_tag_state = "searching"
@@ -2408,7 +3076,7 @@ class ModeELCMController:
         self._mobile_tag_samples = self._mobile_tag_samples[-count:]
         if len(self._mobile_tag_samples) < count:
             if self._mobile_tag_state != "acquiring":
-                print(f"[mobile-tag] DETECTED id=1 -> stabilizing {count} frames")
+                jprint(f"[mobile-tag] DETECTED id=1 -> stabilizing {count} frames")
             self._mobile_tag_state = "acquiring"
             return
 
@@ -2440,22 +3108,18 @@ class ModeELCMController:
             self._mobile_tag_state = "unstable"
             return
         n_in /= n_norm
-        press_m = float(getattr(self.lcm_cfg, "manip_button_press_m", 0.05))
         latched = dict(sp)
         latched["foot_face_L"] = face.tolist()
-        latched["foot_pre_L"] = (face - 0.03 * n_in).tolist()
-        latched["foot_press_L"] = (face + press_m * n_in).tolist()
         latched["wall_normal_in_L"] = n_in.tolist()
-        latched["press_m"] = press_m
+        latched = self._rebuild_button_press(latched)
 
-        # READY = stable + ||face||_L in the stop band. Workspace clip is
-        # reported but does NOT block READY inside the band (log 23:00:
-        # |face|=0.50 m still UNREACHABLE on clip=17 cm while the user
-        # stop band is exactly 0.50-0.53 — manip crawl handles residual).
+        # GitHub behavior: the 0.50-0.53 m radial band is the authoritative
+        # stop/READY condition. Workspace clip remains diagnostic only; making
+        # it a gate caused the base to drive through the stop band to 0.42 m.
         reach_error = 0.0
         for key in ("foot_pre_L", "foot_face_L", "foot_press_L"):
             raw = np.asarray(latched[key], dtype=float).reshape(3)
-            clipped = self._clamp_manip_foot_cartesian(raw)
+            clipped = self._clamp_work_envelope(raw)
             reach_error = max(
                 reach_error, float(np.linalg.norm(clipped - raw))
             )
@@ -2463,7 +3127,7 @@ class ModeELCMController:
         r_face = float(np.linalg.norm(face))
         r_min = float(getattr(self.lcm_cfg, "mobile_ready_r_min_m", 0.50))
         r_max = float(getattr(self.lcm_cfg, "mobile_ready_r_max_m", 0.53))
-        if r_face > r_max or r_face < r_min:
+        if r_face < r_min or r_face > r_max:
             if self._mobile_tag_state != "unreachable":
                 why = []
                 if r_face > r_max:
@@ -2472,7 +3136,7 @@ class ModeELCMController:
                     why.append(f"|face|={r_face:.2f}<r_min={r_min:.2f}")
                 if reach_error > 0.02:
                     why.append(f"clip={reach_error*100:.1f}cm")
-                print(
+                jprint(
                     "[mobile-tag] DETECTED/STABLE id=1 but UNREACHABLE: "
                     + ", ".join(why)
                     + f"; drive MOBILE into {r_min:.2f}-{r_max:.2f} m band"
@@ -2483,12 +3147,12 @@ class ModeELCMController:
 
         self._mobile_tag_ready_sp = latched
         if self._mobile_tag_state != "ready":
-            print(
+            jprint(
                 "[mobile-tag] READY id=1: "
                 f"|face|_L={r_face:.2f} m in [{r_min:.2f},{r_max:.2f}], "
                 f"clip={reach_error*100:.1f}cm (info), "
                 f"spread={spread*1000:.1f}mm "
-                "-> LT / auto-approach enters MANIPULATION"
+                "-> RB / auto-approach enters arm PRESS"
             )
         self._mobile_tag_state = "ready"
 
@@ -2582,9 +3246,8 @@ class ModeELCMController:
         Goal (drive frame): camera square to the box face (yaw -> 0),
         face center on the midline (lat -> 0), face at the working
         distance. When both READY bands hold for push_ready_hold_s the
-        wheels freeze and READY is printed; the operator presses LT again
-        to enter PUSH (unlike the button approach, no auto-entry -- the
-        leg is about to exert force on the environment).
+        wheels freeze and PUSH starts automatically (2026-08-13 user:
+        one LB = align + deploy leg + stick drives the box).
         """
         if not (bool(self._approach_active)
                 and self._approach_kind == "box"):
@@ -2612,14 +3275,14 @@ class ModeELCMController:
             self._store_push_box(box)
             if bool(self._approach_waiting):
                 self._approach_waiting = False
-                print("[approach] box re-captured -> resume")
+                jprint("[approach] box re-captured -> resume")
         age = now_m - float(self._push_box_rx)
         stale_s = float(getattr(cfg, "push_box_stale_s", 1.0))
         memory_s = float(getattr(cfg, "approach_memory_timeout_s", 3.0))
         if self._push_box is None or age > memory_s:
             if not bool(self._approach_waiting):
                 self._approach_waiting = True
-                print(
+                jprint(
                     "[approach] box lost > "
                     f"{memory_s:.1f}s -> wheels stop, waiting for box"
                 )
@@ -2650,15 +3313,16 @@ class ModeELCMController:
             if self._box_ready_since is None:
                 self._box_ready_since = now_m
             if (now_m - self._box_ready_since) >= hold:
-                if not bool(self._box_ready):
-                    self._box_ready = True
-                    print(
-                        "[approach] box READY "
-                        f"(dist err={self._box_dist_err_m * 100:+.1f}cm, "
-                        f"yaw err={self._box_yaw_err_deg:+.1f}deg) "
-                        "-> wheels hold; press LT to PUSH"
-                    )
-            # Freeze while inside the band (confirming or holding READY).
+                self._box_ready = True
+                jprint(
+                    "[approach] box READY "
+                    f"(dist err={self._box_dist_err_m * 100:+.1f}cm, "
+                    f"yaw err={self._box_yaw_err_deg:+.1f}deg) "
+                    "-> auto PUSH (deploy leg; LEFT stick = box)"
+                )
+                self._enter_push()
+                return np.zeros(3, dtype=float)
+            # Freeze while inside the band (confirming READY).
             self._approach_last_twist = (0.0, 0.0, 0.0)
             return np.zeros(3, dtype=float)
 
@@ -2682,7 +3346,7 @@ class ModeELCMController:
                     getattr(cfg, "push_ready_exit_hold_s", 0.6)
                 )
                 if (now_m - self._box_ready_exit_since) >= exit_hold:
-                    print(
+                    jprint(
                         "[approach] box left READY "
                         f"(dist err={d_err * 100:+.1f}cm, "
                         f"yaw err={math.degrees(yaw_err):+.1f}deg) "
@@ -2738,7 +3402,7 @@ class ModeELCMController:
         self._approach_last_twist = (vx, vy, wz)
         if (now_m - self._approach_dbg_t) >= 1.0:
             self._approach_dbg_t = now_m
-            print(
+            jprint(
                 f"[approach] box dist={err['dist']:.2f}m "
                 f"(err={d_err * 100:+.1f}cm) "
                 f"yaw={math.degrees(yaw_err):+.1f}deg "
@@ -2762,20 +3426,42 @@ class ModeELCMController:
 
     def _reset_push_contact_state(self) -> None:
         self._push_f_meas_n = float("nan")
+        self._push_f_n_lpf = float("nan")
+        self._push_f_t_lpf = float("nan")
+        self._push_depth_cmd_m = float(
+            getattr(self.lcm_cfg, "push_contact_depth_m", 0.02)
+        )
         self._push_tgt_lpf = None
         self._push_leg_phase = "home"
 
     def _enter_push(self) -> None:
-        """MOBILE -> PUSH: leg becomes the pusher, wheels keep driving."""
+        """MOBILE -> PUSH: snap foot onto the face, LEFT stick drives box."""
         self._approach_stop(None)
         self._gait_mode = "push"
+        # init_pending=True -> first _update_push_mode tick SNAPs the foot
+        # target straight onto the face contact (no HOME crawl).
         self._manip_init_pending = True
         self._push_e_des_m = 0.0
         self._push_last_twist = (0.0, 0.0, 0.0)
         self._push_waiting = False
         self._reset_push_contact_state()
-        self._push_leg_phase = "home"
+        self._push_leg_phase = "track"
         self._reset_mobile_leg_stow()
+        # Lock the foot height for the whole push: z = FK(manip_hold_q).z
+        # (the simplified-push pose). Targets below only move in xy.
+        try:
+            qh = np.asarray(
+                getattr(
+                    self.lcm_cfg, "manip_hold_q", (1.376, 1.378, -0.096)
+                ),
+                dtype=float,
+            ).reshape(3)
+            foot_h, _ = self.core.fk.forward_kinematics(qh)
+            self._push_z_hold_m = float(
+                np.asarray(foot_h, dtype=float).reshape(3)[2]
+            )
+        except Exception:
+            self._push_z_hold_m = None
         box = self._read_box_setpoint()
         if box is not None:
             self._store_push_box(box)
@@ -2786,15 +3472,46 @@ class ModeELCMController:
             err = self._box_pose_errors()
             if err is not None and np.isfinite(err["dist"]):
                 self._push_work_dist_m = float(err["dist"])
-                print(
+                jprint(
                     "[push] working distance LATCHED at "
                     f"{self._push_work_dist_m:.2f} m (default was "
                     f"{float(getattr(self.lcm_cfg, 'push_approach_dist_m', 0.40)):.2f} m)"
                 )
         src = (self._push_box or {}).get("source", "?")
-        print(
-            "[gait] LT -> PUSH: HOME (center) first, then REACH face "
-            f"(source={src}); LEFT stick = box fwd/steer, LT exits"
+        jprint(
+            "[gait] PUSH: snap foot->face contact + AK60 kd; LEFT stick = "
+            f"box fwd + e-offset steer (source={src}); LB/LT exits"
+        )
+
+    def _apply_push_twist(
+        self,
+        vx: float,
+        vy: float,
+        wz: float,
+        dt: float,
+        control_enabled: bool,
+    ) -> None:
+        """Accel-limited wheel twist for PUSH (2026-08-13: 画面糊).
+
+        Step changes in (vx, vy, wz) shook the camera and blurred the
+        tags; slew each component from the previously commanded twist so
+        starts, stops and tail swings ramp instead of jumping. The slewed
+        value also feeds _push_last_twist, keeping dead reckoning honest.
+        """
+        pvx, pvy, pwz = self._push_last_twist
+        dv = float(max(
+            0.0, getattr(self.lcm_cfg, "push_acc_max_mps2", 0.5)
+        )) * float(max(0.0, dt))
+        dw = float(max(
+            0.0, getattr(self.lcm_cfg, "push_wz_acc_max_rad_s2", 2.0)
+        )) * float(max(0.0, dt))
+        vx = float(np.clip(vx, pvx - dv, pvx + dv))
+        vy = float(np.clip(vy, pvy - dv, pvy + dv))
+        wz = float(np.clip(wz, pwz - dw, pwz + dw))
+        self._push_last_twist = (vx, vy, wz)
+        self._wheel_pending_cmd = self._kiwi_ik(vx, vy, wz)
+        self._wheel_pending_enable = (
+            bool(control_enabled) and not self._rm_drive_busy()
         )
 
     def _update_push_mode(
@@ -2815,30 +3532,42 @@ class ModeELCMController:
              friction center steers the box. The wheel lateral velocity
              re-centers the leg workspace under the commanded contact;
           3. transport      -- LEFT stick Y advances along the face normal;
-             wz keeps the body (camera) square to the face. |wz| is capped
-             by push_kappa_max_1_m * |v| (stable-pushing motion cone).
+             wz ONLY servos the camera square/parallel to the face (never
+             cone-capped). When the e-offset torque rotates the box, this
+             servo swings the tail to follow the rotating face (甩尾).
         """
         cfg = self.lcm_cfg
-        if bool(self._manip_init_pending):
-            # FK-seed the shared Cartesian target once at entry, then
-            # immediately retarget HOME (center) — MOBILE stow is offset.
-            self._update_manip_foot_target(None, q, 0.0)
-            self._manip_foot_des_b = self._clamp_manip_foot_cartesian(
-                self._manip_home_foot()
-            )
-            self._manip_init_pending = False
-            self._push_leg_phase = "home"
-
         box = self._read_box_setpoint()
         now_m = time.monotonic()
         if box is not None:
             self._store_push_box(box)
             if bool(self._push_waiting):
                 self._push_waiting = False
-                print("[push] box re-captured -> resume")
+                jprint("[push] box re-captured -> resume")
+        if bool(self._manip_init_pending):
+            # SNAP the foot target straight onto the face contact point
+            # (no HOME / crawl -- user 2026-08-13: 摆腿太慢). AK60 kd
+            # damps the jump; kp is the soft push PD below.
+            self._manip_init_pending = False
+            self._push_leg_phase = "track"
+            self._push_depth_cmd_m = float(
+                getattr(cfg, "push_contact_depth_m", 0.02)
+            )
+            b0 = self._push_box
+            if b0 is not None:
+                snap_tgt = (
+                    np.asarray(b0["center"], dtype=float).reshape(3)
+                    + self._push_depth_cmd_m
+                    * np.asarray(b0["n_in"], dtype=float).reshape(3)
+                )
+                self._manip_foot_des_b = self._clamp_push_foot_plane(
+                    snap_tgt
+                )
+            else:
+                self._update_manip_foot_target(None, q, 0.0)
+            self._push_tgt_lpf = None
 
         # Stick semantics: LEFT stick commands the BOX, not the base.
-        # During HOME the stick is ignored for transport (leg re-centers).
         ls_x = ls_y = 0.0
         if gamepad_msg is not None:
             try:
@@ -2849,24 +3578,11 @@ class ModeELCMController:
         dz = float(cfg.stick_deadzone)
         ls_x = 0.0 if abs(ls_x) < dz else ls_x
         ls_y = 0.0 if abs(ls_y) < dz else ls_y
-        phase = str(getattr(self, "_push_leg_phase", "track"))
-        if phase == "home":
-            ls_x = ls_y = 0.0
         v_push = -ls_y * float(getattr(cfg, "push_v_max_mps", 0.25))
-        # Steering sign (verified 2026-08-09, FRD z DOWN so +torque about
-        # z = CW from above): stick RIGHT (ls_x > 0) must turn the BOX
-        # right = CW. Contact LEFT of the friction center (offset -e along
-        # face_right, r = (0,-e,0)) with the push force F = (F,0,0) gives
-        # (r x F)_z = +eF > 0 = CW. Hence e_des integrates -ls_x.
-        e_max = float(getattr(cfg, "push_e_max_m", 0.12))
-        e_rate = float(getattr(cfg, "push_e_rate_mps", 0.08))
-        self._push_e_des_m = float(np.clip(
-            self._push_e_des_m + (-ls_x) * e_rate * float(dt),
-            -e_max, e_max,
-        ))
-        self._push_v_last = float(v_push)
 
-        # Telemetry only: F = (J^-T tau) · n_in. No closed-loop action.
+        # ---- Contact-force feedback: F = J^-T tau (foot->environment,
+        # leg frame), split into F_n (into the face) and F_t (along
+        # face_right). LPF'd; feeds the depth admittance + slip guard.
         b_mem = self._push_box
         try:
             tau_meas = np.asarray(
@@ -2877,9 +3593,56 @@ class ModeELCMController:
                 joint_pos=q, tau_meas=tau_meas
             )
             if b_mem is not None and np.all(np.isfinite(f_leg_L)):
-                self._push_f_meas_n = float(np.dot(f_leg_L, b_mem["n_in"]))
+                f_n = float(np.dot(f_leg_L, b_mem["n_in"]))
+                f_t = float(np.dot(f_leg_L, b_mem["right"]))
+                self._push_f_meas_n = f_n
+                lp = max(
+                    1e-3, float(getattr(cfg, "push_f_lpf_tau_s", 0.15))
+                )
+                af = min(1.0, float(max(0.0, dt)) / lp)
+                if not np.isfinite(self._push_f_n_lpf):
+                    self._push_f_n_lpf = f_n
+                    self._push_f_t_lpf = f_t
+                else:
+                    self._push_f_n_lpf += af * (f_n - self._push_f_n_lpf)
+                    self._push_f_t_lpf += af * (f_t - self._push_f_t_lpf)
         except Exception:
             pass
+
+        # Steering sign (verified 2026-08-09, FRD z DOWN so +torque about
+        # z = CW from above): stick RIGHT (ls_x > 0) must turn the BOX
+        # right = CW. Contact LEFT of the friction center (offset -e along
+        # face_right, r = (0,-e,0)) with the push force F = (F,0,0) gives
+        # (r x F)_z = +eF > 0 = CW. Hence e_des integrates -ls_x.
+        e_max = float(getattr(cfg, "push_e_max_m", 0.12))
+        e_rate = float(getattr(cfg, "push_e_rate_mps", 0.08))
+        de = (-ls_x) * e_rate * float(dt)
+        # Force-based motion cone: |F_t|/F_n near the friction limit means
+        # the foot is about to slide off the face -- hold |e|, do not
+        # command more offset torque. Only trips with a firm contact.
+        slip_max = float(getattr(cfg, "push_slip_ratio_max", 0.8))
+        e_grows = abs(self._push_e_des_m + de) > abs(self._push_e_des_m)
+        if (
+            np.isfinite(self._push_f_n_lpf)
+            and self._push_f_n_lpf > 2.0
+            and abs(self._push_f_t_lpf) > slip_max * self._push_f_n_lpf
+            and e_grows
+        ):
+            de = 0.0
+        # PARALLEL FIRST (2026-08-13: 不平行箱角会打到轮子): while the
+        # tail swing has not caught up, do not command MORE box rotation.
+        # (_box_yaw_err_deg is one tick stale here -- fine at 100 Hz.)
+        yaw_ok = float(getattr(cfg, "push_yaw_ok_deg", 8.0))
+        if (
+            e_grows
+            and np.isfinite(self._box_yaw_err_deg)
+            and abs(self._box_yaw_err_deg) > yaw_ok
+        ):
+            de = 0.0
+        self._push_e_des_m = float(np.clip(
+            self._push_e_des_m + de, -e_max, e_max,
+        ))
+        self._push_v_last = float(v_push)
         pose_err = self._box_pose_errors()
         if pose_err is not None:
             self._box_dist_err_m = (
@@ -2902,72 +3665,43 @@ class ModeELCMController:
                 vx_L, vy_L, wz_l, dt,
             )
 
-        # ---- Leg stages: HOME (center) -> REACH (face) -> TRACK --------
-        rate = float(max(1e-3, getattr(cfg, "push_foot_rate_mps", 0.08)))
-        cur = np.asarray(self._manip_foot_des_b, dtype=float).reshape(3)
-        home_arrive = float(getattr(cfg, "manip_home_arrive_m", 0.03))
-        if phase == "home":
-            goal = self._clamp_manip_foot_cartesian(self._manip_home_foot())
-            delta = goal - cur
-            dist = float(np.linalg.norm(delta))
-            step = rate * float(max(0.0, dt))
-            if dist > 1e-6:
-                cur = cur + delta * (min(step, dist) / dist)
-            self._manip_foot_des_b = self._clamp_manip_foot_cartesian(cur)
-            # Hold wheels while re-centering from the MOBILE field pose.
-            self._push_last_twist = (0.0, 0.0, 0.0)
-            self._wheel_pending_cmd = np.zeros(3, dtype=float)
-            self._wheel_pending_enable = bool(control_enabled)
-            if dist <= home_arrive:
-                self._push_leg_phase = "reach"
-                print("[push] HOME done -> REACH face")
-        elif lost:
+        # ---- Wheels: box-stick law; leg tracks the offset contact ------
+        if lost:
             if not bool(self._push_waiting):
                 self._push_waiting = True
-                print(
+                jprint(
                     "[push] box lost > "
                     f"{memory_s:.1f}s -> wheels stop, leg holds contact"
                 )
-            self._push_last_twist = (0.0, 0.0, 0.0)
-            self._wheel_pending_cmd = np.zeros(3, dtype=float)
-            self._wheel_pending_enable = bool(control_enabled)
+            self._apply_push_twist(0.0, 0.0, 0.0, dt, control_enabled)
         else:
             b = self._push_box
             center = b["center"]
             n_in = b["n_in"]
             right = b["right"]
-            # Desired contact point: face center + steer offset + depth.
-            # LPF vision so tag jitter does not chatter the foot PD.
-            depth = float(getattr(cfg, "push_contact_depth_m", 0.02))
+            # ---- Normal-force keeper (甩尾时丢箱子): admittance on the
+            # press depth. F_n sagging under push_f_des_n (face rotating
+            # away mid-swing) presses deeper; a spike backs off.
+            if np.isfinite(self._push_f_n_lpf):
+                gain = float(getattr(cfg, "push_f_adapt_mps_per_n", 0.003))
+                err_f = (
+                    float(getattr(cfg, "push_f_des_n", 5.0))
+                    - self._push_f_n_lpf
+                )
+                self._push_depth_cmd_m = float(np.clip(
+                    self._push_depth_cmd_m
+                    + gain * err_f * float(max(0.0, dt)),
+                    float(getattr(cfg, "push_depth_min_m", 0.005)),
+                    float(getattr(cfg, "push_depth_max_m", 0.06)),
+                ))
             raw_tgt = (
                 center
                 + self._push_e_des_m * right
-                + depth * n_in
+                + self._push_depth_cmd_m * n_in
             )
-            tau_lpf = max(
-                1e-3, float(getattr(cfg, "push_target_lpf_tau_s", 0.25))
-            )
-            a = min(1.0, float(max(0.0, dt)) / tau_lpf)
-            if self._push_tgt_lpf is None:
-                self._push_tgt_lpf = np.asarray(raw_tgt, dtype=float).copy()
-            else:
-                self._push_tgt_lpf = (
-                    (1.0 - a) * self._push_tgt_lpf + a * raw_tgt
-                )
-            goal = self._clamp_manip_foot_cartesian(self._push_tgt_lpf)
-            delta = goal - cur
-            dist = float(np.linalg.norm(delta))
-            step = rate * float(max(0.0, dt))
-            if dist > 1e-6:
-                cur = cur + delta * (min(step, dist) / dist)
-            self._manip_foot_des_b = self._clamp_manip_foot_cartesian(cur)
-            if phase == "reach" and dist <= float(
-                getattr(cfg, "manip_button_arrive_m", 0.025)
-            ):
-                self._push_leg_phase = "track"
-                print("[push] REACH done -> TRACK (stick drives box)")
-
-            # Wheel twist only after HOME; during REACH allow slow align.
+            # z is pinned by _clamp_push_foot_plane below: the foot only
+            # translates in the FK(manip_hold_q).z horizontal plane; the
+            # box tag height never drives the foot up/down.
             ndx, ndy = self._l2d_xy(n_in[0], n_in[1])
             n_h = np.asarray([ndx, ndy])
             n_hn = float(np.linalg.norm(n_h))
@@ -2984,16 +3718,32 @@ class ModeELCMController:
                 n_h = -n_h
             yaw_err = math.atan2(ndy, ndx)
             wz_max = float(getattr(cfg, "push_wz_max_rad_s", 0.5))
-            kappa = float(getattr(cfg, "push_kappa_max_1_m", 1.5))
-            # During REACH: no forward push, only yaw/lat align.
-            v_use = 0.0 if phase == "reach" else v_push
-            wz_ff = float(ls_x) * kappa * abs(v_use)
+            # PARALLEL FIRST: advancing while yaw_err is large drives the
+            # box corner into the wheels. Full speed while squared
+            # (<= yaw_ok), linear fade to a full stop at yaw_stop; the
+            # squaring servo below keeps running at full authority.
+            yaw_ok = math.radians(
+                float(getattr(cfg, "push_yaw_ok_deg", 8.0))
+            )
+            yaw_stop = math.radians(
+                float(getattr(cfg, "push_yaw_stop_deg", 18.0))
+            )
+            par = float(np.clip(
+                (yaw_stop - abs(yaw_err)) / max(1e-6, yaw_stop - yaw_ok),
+                0.0, 1.0,
+            ))
+            v_use = v_push * par
+            # wz ONLY squares the camera to the face -- NEVER capped by
+            # the motion cone. Log 20260813_224304: the old cap
+            # kappa*max(|v|,0.05) froze wz at 0.075 rad/s when the stick
+            # was released, yaw_err ran to +69 deg and the tags dropped
+            # out (user: 摄像头必须平行于箱面). Steering is the LEG's
+            # contact offset e; when the box rotates the face normal
+            # rotates and this servo swings the tail to follow (甩尾).
             wz = float(np.clip(
-                float(getattr(cfg, "push_kp_wz", 1.5)) * yaw_err + wz_ff,
+                float(getattr(cfg, "push_kp_wz", 1.5)) * yaw_err,
                 -wz_max, wz_max,
             ))
-            wz_cap = kappa * max(abs(v_use), 0.05)
-            wz = float(np.clip(wz, -wz_cap, wz_cap))
             _, raw_tgt_dy = self._l2d_xy(raw_tgt[0], raw_tgt[1])
             v_lat = float(np.clip(
                 float(getattr(cfg, "push_kp_vy", 0.8)) * raw_tgt_dy,
@@ -3007,12 +3757,37 @@ class ModeELCMController:
             vy = float(np.clip(
                 v_use * n_h[1] + v_lat * r_h[1], -v_max, v_max
             ))
-            self._push_last_twist = (vx, vy, wz)
-            self._wheel_pending_cmd = self._kiwi_ik(vx, vy, wz)
-            self._wheel_pending_enable = bool(control_enabled)
+            self._apply_push_twist(vx, vy, wz, dt, control_enabled)
 
-        # Leg: soft open-loop Cartesian PD onto the contact pose (no
-        # force feedforward / no re-engage). Geometry unchanged.
+            # ---- Leg: track contact = face center + e*right + depth*n.
+            # THIS is the steering actuator (contact offset e -> torque
+            # about the box friction center). LPF kills tag jitter; the
+            # rate limit only shapes stick-driven moves (entry was a
+            # snap, so no slow deploy).
+            tau_lpf = max(
+                1e-3, float(getattr(cfg, "push_target_lpf_tau_s", 0.25))
+            )
+            a = min(1.0, float(max(0.0, dt)) / tau_lpf)
+            if self._push_tgt_lpf is None:
+                self._push_tgt_lpf = np.asarray(raw_tgt, dtype=float).copy()
+            else:
+                self._push_tgt_lpf = (
+                    (1.0 - a) * self._push_tgt_lpf + a * raw_tgt
+                )
+            goal = self._clamp_push_foot_plane(self._push_tgt_lpf)
+            cur = np.asarray(self._manip_foot_des_b, dtype=float).reshape(3)
+            rate = float(max(
+                1e-3, getattr(cfg, "push_foot_rate_mps", 0.30)
+            ))
+            delta = goal - cur
+            dist = float(np.linalg.norm(delta))
+            step = rate * float(max(0.0, dt))
+            if dist > 1e-6:
+                cur = cur + delta * (min(step, dist) / dist)
+            self._manip_foot_des_b = self._clamp_push_foot_plane(cur)
+
+        # Leg: soft Cartesian PD onto the (offset) contact pose. AK60
+        # MIT kd (manip_ak60_kd) is the velocity damping path.
         tau_send, self._manip_err_m, self._manip_speed_mps = (
             self.core.compute_stand_swing_tau(
                 joint_pos=np.asarray(q, dtype=float).reshape(3),
@@ -3038,8 +3813,8 @@ class ModeELCMController:
         """Run latched open-loop crawl: home -> pre -> face -> press -> hold.
 
         Returns foot_des_b or None if auto path inactive (caller uses stick).
-        Once latched (from MOBILE READY / enter), the setpoint NEVER follows
-        live tag again — hand occlusion during press must not cancel motion.
+        The stable MOBILE target stays latched through PRE/FACE/PRESS so
+        hand occlusion and pose jitter cannot move the goal.
         """
         if not bool(getattr(self.lcm_cfg, "manip_button_auto_enable", False)):
             return None
@@ -3049,88 +3824,26 @@ class ModeELCMController:
         if bool(self._manip_init_pending):
             self._update_manip_foot_target(None, joint_pos, 0.0)
 
-        # Open-loop after latch: do not poll live perception (occlusion).
-        if self._btn_last_setpoint is not None:
-            sp = None  # unused; path below uses the latch only
-        else:
-            sp = self._read_button_setpoint()
+        # Acquisition belongs exclusively to MOBILE. Entering BUTTON always
+        # carries a frozen READY setpoint; never scan again during HOME/PRE/
+        # FACE/PRESS, even if the tag becomes occluded or moves.
         if self._btn_last_setpoint is None:
-            self._btn_stage = "wait_tag"
-            self._btn_stage_print = "wait_tag"
-            if sp is not None:
-                sample_t = float(sp.get("t_wall", 0.0))
-                if sample_t > float(self._btn_last_sample_t_wall) + 1e-6:
-                    self._btn_last_sample_t_wall = sample_t
-                    self._btn_acquire_samples.append(sp)
-
-                count = int(max(
-                    1, getattr(self.lcm_cfg, "manip_button_acquire_samples", 8)
-                ))
-                self._btn_acquire_samples = self._btn_acquire_samples[-count:]
-                if len(self._btn_acquire_samples) >= count:
-                    faces = np.asarray([
-                        s["foot_face_L"] for s in self._btn_acquire_samples
-                    ], dtype=float).reshape(count, 3)
-                    face = np.median(faces, axis=0)
-                    spread = float(np.max(np.linalg.norm(
-                        faces - face.reshape(1, 3), axis=1
-                    )))
-                    tol = float(max(
-                        0.001,
-                        getattr(
-                            self.lcm_cfg, "manip_button_acquire_tol_m", 0.010
-                        ),
-                    ))
-                    if spread <= tol:
-                        normals = np.asarray([
-                            s["wall_normal_in_L"]
-                            for s in self._btn_acquire_samples
-                        ], dtype=float).reshape(count, 3)
-                        n_in = np.median(normals, axis=0)
-                        n_norm = float(np.linalg.norm(n_in))
-                        if n_norm > 1e-6:
-                            n_in = n_in / n_norm
-                            press_m = float(getattr(
-                                self.lcm_cfg, "manip_button_press_m", 0.05
-                            ))
-                            # Rebuild approach and press from one latched face
-                            # and one unit wall normal. This guarantees that
-                            # face->press is perpendicular to the wall.
-                            latched = dict(sp)
-                            latched["foot_face_L"] = face.tolist()
-                            latched["foot_pre_L"] = (
-                                face - 0.03 * n_in
-                            ).tolist()
-                            latched["foot_press_L"] = (
-                                face + press_m * n_in
-                            ).tolist()
-                            latched["wall_normal_in_L"] = n_in.tolist()
-                            latched["press_m"] = press_m
-                            self._btn_last_setpoint = latched
-                            # If we entered without a prior HOME (rare
-                            # wait_tag path), still start from home.
-                            self._btn_stage = "home"
-                            self._btn_hold_t0 = None
-                            print(
-                                "[manip-btn] tag stable -> START: "
-                                f"HOME -> pre -> face -> press({press_m*100:.0f}cm) "
-                                f"(tag_id={sp.get('tag_id')}, "
-                                f"spread={spread*1000:.1f}mm)"
-                            )
-                    else:
-                        # Keep a rolling acquisition window until the target
-                        # is stable; never move toward a noisy pose.
-                        self._btn_acquire_samples = (
-                            self._btn_acquire_samples[-max(1, count - 1):]
-                        )
-
-            if self._btn_last_setpoint is None:
-                return np.asarray(
-                    self._manip_foot_des_b, dtype=float
-                ).reshape(3)
+            if self._btn_stage != "latch_missing":
+                jprint(
+                    "[manip-btn] ERROR: READY latch missing -> STOP; "
+                    "return to MOBILE and acquire again"
+                )
+            self._btn_stage = "latch_missing"
+            self._btn_stage_print = "latch_missing"
+            self._manip_press_boost = False
+            return np.asarray(
+                self._manip_foot_des_b, dtype=float
+            ).reshape(3)
 
         sp = self._btn_last_setpoint
-        # Keep press stroke at the configured depth (still from LATCH only).
+        # Freeze the stable MOBILE latch through PRE/FACE/PRESS. Live updates
+        # drifted the target across the workspace while the arm occluded the
+        # tag (log 02:30: target moved ~35 cm during one attempt).
         sp = self._rebuild_button_press(sp)
         self._btn_last_setpoint = sp
         n_in = np.asarray(
@@ -3141,109 +3854,269 @@ class ModeELCMController:
             n_in = n_in / nn
         self._manip_press_n_L = n_in.copy()
         goals = {
+            # HOME = MOBILE first step 归中 (equal q), NOT the hold-z plane.
             "home": self._manip_home_foot(),
-            "pre": np.asarray(sp["foot_pre_L"], dtype=float).reshape(3),
-            "face": np.asarray(sp["foot_face_L"], dtype=float).reshape(3),
-            "press": np.asarray(sp["foot_press_L"], dtype=float).reshape(3),
+            "pre": self._lock_button_z(sp["foot_pre_L"]),
+            "face": self._lock_button_z(sp["foot_face_L"]),
+            "press": self._lock_button_z(sp["foot_press_L"]),
         }
 
         stage = str(self._btn_stage)
         if stage == "home":
             goal_raw = goals["home"]
-        elif stage in ("press", "hold"):
+        elif stage in ("press", "hold", "done"):
+            # Restore the working GitHub path: the leg performs the 5 cm
+            # wall-normal stroke and then remains at the pressed pose.
             goal_raw = goals["press"]
         elif stage == "face":
             goal_raw = goals["face"]
-        elif stage in ("pre", "retract", "done"):
+        elif stage in ("pre", "retract"):
             goal_raw = goals["pre"]
+        elif stage in ("align_failed", "aborted"):
+            goal_raw = np.asarray(self._manip_foot_des_b, dtype=float).reshape(3)
         else:
             self._btn_stage = "home"
             stage = "home"
             goal_raw = goals["home"]
 
-        # Log 23:10: crawling toward an out-of-workspace pre then
-        # hard-clamping each tick froze the foot (err stuck ~297 mm,
-        # never left pre) → limp press. Crawl toward the CLAMPED goal
-        # for home/pre/face so stages can finish; during press/hold
-        # keep the wall-normal stroke (soft L only) so PD can push.
-        if stage in ("press", "hold"):
+        # PRE/FACE stay in the conservative envelope. PRESS/HOLD restore the
+        # GitHub soft 0.62 m radial cap so the arm, not the wheels, can make
+        # the short contact stroke. Detected button Z is preserved.
+        face_c = self._clamp_work_envelope(goals["face"])
+        pre_c = self._clamp_work_envelope(goals["pre"])
+        if stage == "home":
+            # Joint-space 归中 (MOBILE first step). Cartesian clamp would
+            # not keep the three joints equal.
             goal_cmd = np.asarray(goal_raw, dtype=float).reshape(3).copy()
+            self._manip_press_boost = False
+        elif stage in ("press", "hold", "done"):
+            goal_cmd = np.asarray(goals["press"], dtype=float).reshape(3).copy()
             if float(goal_cmd[2]) < 0.05:
                 goal_cmd[2] = 0.05
-            L = float(np.linalg.norm(goal_cmd))
-            L_soft = 0.62
-            if L > L_soft and L > 1e-9:
-                goal_cmd *= L_soft / L
-            self._manip_press_boost = True
+            length = float(np.linalg.norm(goal_cmd))
+            if length > 0.62 and length > 1e-9:
+                goal_cmd *= 0.62 / length
+            self._manip_press_boost = stage in ("press", "hold")
         else:
-            goal_cmd = self._clamp_manip_foot_cartesian(goal_raw)
+            goal_cmd = pre_c if stage in ("pre", "retract") else face_c
             self._manip_press_boost = False
 
         cur = np.asarray(self._manip_foot_des_b, dtype=float).reshape(3)
-        rate = float(max(1e-3, self.lcm_cfg.manip_button_rate_mps))
-        delta = goal_cmd - cur
-        dist = float(np.linalg.norm(delta))
-        step = rate * float(max(0.0, dt))
-        if dist > 1e-6:
-            cur = cur + delta * (min(step, dist) / dist)
-        if stage in ("press", "hold"):
+        rate = float(getattr(self.lcm_cfg, "manip_button_rate_mps", 0.0))
+        if rate <= 1e-9:
+            # Snap like MOBILE stow (AK60 damping, no crawl).
+            cur = np.asarray(goal_cmd, dtype=float).reshape(3)
+        else:
+            delta = goal_cmd - cur
+            dist = float(np.linalg.norm(delta))
+            step = rate * float(max(0.0, dt))
+            if dist > 1e-6:
+                cur = cur + delta * (min(step, dist) / dist)
+        if stage == "home":
+            self._manip_foot_des_b = cur.astype(float)
+        elif stage in ("press", "hold", "done"):
             self._manip_foot_des_b = cur.astype(float)
         else:
-            self._manip_foot_des_b = self._clamp_manip_foot_cartesian(cur)
+            self._manip_foot_des_b = self._clamp_work_envelope(cur)
 
         arrive = float(max(0.001, self.lcm_cfg.manip_button_arrive_m))
         home_arrive = float(max(
             arrive, getattr(self.lcm_cfg, "manip_home_arrive_m", 0.02)
         ))
-        # Recompute dist to the commanded goal after clamp/snap — the
-        # pre-clamp residual was why pre never advanced (log 23:12).
-        dist = float(np.linalg.norm(
-            goal_cmd - np.asarray(self._manip_foot_des_b, dtype=float).reshape(3)
+        # Stage transitions always use measured FK error. Command residual
+        # falsely reported 38 cm while measured tracking error was 11 mm
+        # (log 02:30), causing timeout-driven presses before alignment.
+        p_now = None
+        try:
+            if self.core.fk is not None:
+                p_now, _ = self.core.fk.forward_kinematics(
+                    np.asarray(joint_pos, dtype=float).reshape(3)
+                )
+                p_now = np.asarray(p_now, dtype=float).reshape(3)
+        except Exception:
+            p_now = None
+        if rate <= 1e-9:
+            if p_now is not None and np.all(np.isfinite(p_now)):
+                dist = float(np.linalg.norm(goal_cmd - p_now))
+            else:
+                dist = float(np.linalg.norm(
+                    goal_cmd - np.asarray(
+                        self._manip_foot_des_b, dtype=float
+                    ).reshape(3)
+                ))
+        else:
+            dist = float(np.linalg.norm(
+                goal_cmd - np.asarray(
+                    self._manip_foot_des_b, dtype=float
+                ).reshape(3)
+            ))
+            gate = home_arrive if stage == "home" else arrive
+            if dist <= gate:
+                self._manip_foot_des_b = np.asarray(
+                    goal_cmd, dtype=float
+                ).reshape(3)
+                dist = 0.0
+        measured_dist = (
+            float(np.linalg.norm(goal_cmd - p_now))
+            if p_now is not None and np.all(np.isfinite(p_now))
+            else float(dist)
+        )
+
+        if stage != str(getattr(self, "_btn_stage_seen", "")):
+            self._btn_stage_t0 = time.time()
+            self._btn_stage_seen = str(stage)
+        timeout_s = float(max(
+            0.2, getattr(self.lcm_cfg, "manip_button_stage_timeout_s", 1.2)
         ))
-        gate = home_arrive if stage == "home" else arrive
-        if dist <= gate:
-            # Snap so the next stage starts from the stage goal, not a
-            # nearby clamp artifact.
-            self._manip_foot_des_b = np.asarray(goal_cmd, dtype=float).reshape(3)
-            dist = 0.0
+        aged = (
+            (time.time() - float(self._btn_stage_t0 or time.time()))
+            >= timeout_s
+        )
 
         pm_cm = float(getattr(self.lcm_cfg, "manip_button_press_m", 0.05)) * 100.0
-        if stage == "home" and dist <= home_arrive:
-            self._btn_stage = "pre"
-            print("[manip-btn] HOME arrived (q≈0.4 down) -> pre")
-        elif stage == "pre" and dist <= arrive:
+        if stage == "home":
+            q_c = float(getattr(self.lcm_cfg, "mobile_leg_center_q", 0.4))
+            q_err = float(np.max(np.abs(
+                np.full(3, q_c, dtype=float)
+                - np.asarray(joint_pos, dtype=float).reshape(3)
+            )))
+            arrive_q = float(getattr(
+                self.lcm_cfg, "mobile_leg_arrive_rad", 0.10
+            ))
+            if q_err <= arrive_q:
+                self._btn_stage = "pre"
+                jprint(
+                    "[manip-btn] CENTER/归中 arrived "
+                    f"(|e|_max={q_err:.3f} rad) -> pre"
+                )
+        elif stage == "pre" and measured_dist <= arrive:
             self._btn_stage = "face"
-            print("[manip-btn] pre arrived -> face")
-        elif stage == "face" and dist <= arrive:
-            self._btn_stage = "press"
-            print(f"[manip-btn] face arrived -> press {pm_cm:.0f} cm")
-        elif stage == "press" and dist <= arrive:
-            self._btn_stage = "hold"
-            self._btn_hold_t0 = time.time()
-            print(
-                "[manip-btn] press arrived -> hold "
-                f"{float(self.lcm_cfg.manip_button_hold_s):.2f}s "
-                f"(boost tau/"
-                f"{float(getattr(self.lcm_cfg, 'manip_press_tau_max_nm', 5.0)):.0f}Nm)"
+            jprint(
+                f"[manip-btn] pre arrived (err={measured_dist*1000:.0f}mm) "
+                "-> FACE (square on button, then press)"
             )
+        elif stage == "face" and measured_dist <= arrive:
+            self._btn_stage = "press"
+            self._press_drive_active = False
+            jprint(
+                f"[manip-btn] face arrived (err={measured_dist*1000:.0f}mm) "
+                f"-> ARM PRESS {pm_cm:.0f} cm (wheels stopped)"
+            )
+        elif stage in ("pre", "face") and aged:
+            self._btn_stage = "align_failed"
+            self._press_drive_active = False
+            self._manip_press_boost = False
+            self._manip_foot_des_b = np.asarray(cur, dtype=float).reshape(3)
+            jprint(
+                f"[manip-btn] {stage} ALIGN FAILED "
+                f"(measured err={measured_dist*1000:.0f}mm) -> STOP; "
+                "no wheel press"
+            )
+        elif stage == "press":
+            # The command crawl reaches the requested stroke even when the
+            # compliant contact prevents measured FK from reaching the target.
+            if dist <= arrive or aged:
+                self._btn_stage = "hold"
+                self._btn_hold_t0 = time.time()
+                jprint(
+                    "[manip-btn] arm press commanded -> hold "
+                    f"{float(self.lcm_cfg.manip_button_hold_s):.2f}s"
+                )
         elif stage == "hold":
             t0 = float(self._btn_hold_t0 or time.time())
             if (time.time() - t0) >= float(self.lcm_cfg.manip_button_hold_s):
-                self._btn_stage = "retract"
+                self._btn_stage = "done"
                 self._manip_press_boost = False
-                print("[manip-btn] hold done -> retract")
-        elif stage == "retract" and dist <= arrive:
+                jprint("[manip-btn] hold done -> STOP (stay at press, no backup)")
+        elif stage == "retract" and (dist <= arrive or aged):
             self._btn_stage = "done"
-            print("[manip-btn] retract done -> backup away from wall")
-            self._start_post_press_backup()
+            jprint("[manip-btn] retract done -> STOP (no backup)")
 
-        self._btn_stage_print = str(self._btn_stage)
+        if bool(self._press_drive_active):
+            self._btn_stage_print = "wheel-press"
+        else:
+            self._btn_stage_print = str(self._btn_stage)
         return np.asarray(self._manip_foot_des_b, dtype=float).reshape(3)
+
+    def _wall_normal_drive_xy(self) -> tuple[float, float]:
+        """Unit wall-inward direction in the drive/wheel frame."""
+        n_L = getattr(self, "_manip_press_n_L", None)
+        if n_L is None and self._btn_last_setpoint is not None:
+            n_L = np.asarray(
+                self._btn_last_setpoint.get(
+                    "wall_normal_in_L", [1.0, 0.0, 0.0]
+                ),
+                dtype=float,
+            ).reshape(3)
+        if n_L is None:
+            n_L = np.array([1.0, 0.0, 0.0], dtype=float)
+        n_L = np.asarray(n_L, dtype=float).reshape(3)
+        nn = float(np.linalg.norm(n_L[:2]))
+        if nn < 1e-9:
+            return 1.0, 0.0
+        n_dx, n_dy = self._l2d_xy(float(n_L[0]), float(n_L[1]))
+        # Detector normal has a 180° ambiguity. Select the hemisphere that
+        # points toward the visible button. Missing this guard produced
+        # drive=(-1,0), i.e. the "press" drove backward (log 02:30).
+        if self._btn_last_setpoint is not None:
+            face = np.asarray(
+                self._btn_last_setpoint.get("foot_face_L", [1.0, 0.0, 0.0]),
+                dtype=float,
+            ).reshape(3)
+            face_dx, face_dy = self._l2d_xy(float(face[0]), float(face[1]))
+            if n_dx * face_dx + n_dy * face_dy < 0.0:
+                n_dx, n_dy = -n_dx, -n_dy
+        nh = math.hypot(n_dx, n_dy) or 1.0
+        return n_dx / nh, n_dy / nh
+
+    def _start_button_wheel_press(self) -> None:
+        """Creep the base into the wall; foot stays on FACE."""
+        pm = float(max(
+            0.02, getattr(self.lcm_cfg, "manip_button_press_m", 0.05)
+        ))
+        n_dx, n_dy = self._wall_normal_drive_xy()
+        self._press_dir_D = (n_dx, n_dy)
+        self._press_drive_remain_m = pm
+        self._press_drive_active = True
+        self._press_drive_t0 = time.monotonic()
+        self._press_drive_dbg_t = 0.0
+        v = float(getattr(self.lcm_cfg, "manip_button_press_v_mps", 0.10))
+        jprint(
+            f"[manip-btn] WHEEL PRESS {pm*100:.0f} cm along "
+            f"drive=({n_dx:+.2f},{n_dy:+.2f}) at {v:.2f} m/s "
+            "(foot holds FACE)"
+        )
+
+    def _update_button_wheel_press(self, dt: float) -> np.ndarray | None:
+        """Open-loop forward creep during PRESS. Returns wheel rad/s or None."""
+        if not bool(self._press_drive_active):
+            return None
+        v = float(max(
+            0.02, getattr(self.lcm_cfg, "manip_button_press_v_mps", 0.10)
+        ))
+        dx, dy = self._press_dir_D
+        self._press_drive_remain_m -= v * float(max(0.0, dt))
+        now = time.monotonic()
+        timed_out = (now - float(self._press_drive_t0 or now)) >= 4.0
+        if (now - float(self._press_drive_dbg_t)) >= 0.3:
+            self._press_drive_dbg_t = now
+            jprint(
+                f"[manip-btn] wheel press remain="
+                f"{max(0.0, self._press_drive_remain_m)*100:.0f} cm "
+                f"drive=({dx:+.2f},{dy:+.2f})"
+            )
+        if self._press_drive_remain_m <= 0.0 or timed_out:
+            self._press_drive_active = False
+            self._press_drive_remain_m = 0.0
+            why = "timeout" if timed_out else "arrived"
+            jprint(f"[manip-btn] wheel press {why}")
+            return np.zeros(3, dtype=float)
+        return self._kiwi_ik(v * float(dx), v * float(dy), 0.0)
 
     def _start_post_press_backup(self) -> None:
         """Leave MANIPULATION and reverse wheels along -n (away from wall)."""
-        if not bool(getattr(self.lcm_cfg, "manip_backup_enable", True)):
-            print("[manip-btn] backup disabled -> stay at done/pre")
+        if not bool(getattr(self.lcm_cfg, "manip_backup_enable", False)):
+            jprint("[manip-btn] backup disabled -> STOP")
             return
         n_L = getattr(self, "_manip_press_n_L", None)
         if n_L is None and self._btn_last_setpoint is not None:
@@ -3270,13 +4143,14 @@ class ModeELCMController:
         self._approach_stop(None)
         self._gait_mode = "mobile"
         self._manip_init_pending = False
+        self._manip_hold_q_cmd = None
         self._manip_press_boost = False
         self._reset_mobile_leg_stow()
         # Keep button state as done; clear latch so a new LT can re-acquire.
         self._btn_stage = "done"
         self._btn_stage_print = "backup"
         self._btn_last_setpoint = None
-        print(
+        jprint(
             f"[gait] PRESS done -> MOBILE BACKUP "
             f"{self._backup_remain_m*100:.0f} cm along "
             f"drive=({self._backup_dir_D[0]:+.2f},{self._backup_dir_D[1]:+.2f})"
@@ -3304,7 +4178,7 @@ class ModeELCMController:
         if any(abs(s) > thr for s in sticks):
             self._backup_active = False
             self._backup_remain_m = 0.0
-            print("[backup] OFF (stick override)")
+            jprint("[backup] OFF (stick override)")
             return None
 
         v = float(max(0.02, getattr(self.lcm_cfg, "manip_backup_v_mps", 0.12)))
@@ -3314,14 +4188,14 @@ class ModeELCMController:
         now = time.monotonic()
         if (now - float(self._backup_dbg_t)) >= 0.5:
             self._backup_dbg_t = now
-            print(
+            jprint(
                 f"[backup] remain={max(0.0, self._backup_remain_m)*100:.0f} cm "
                 f"v_D=({vx:+.2f},{vy:+.2f})"
             )
         if self._backup_remain_m <= 0.0:
             self._backup_active = False
             self._backup_remain_m = 0.0
-            print("[backup] done -> MOBILE manual")
+            jprint("[backup] done -> MOBILE manual")
             return np.zeros(3, dtype=float)
         return self._kiwi_ik(vx, vy, 0.0)
 
@@ -3349,7 +4223,7 @@ class ModeELCMController:
                 if not np.all(np.isfinite(foot_now)):
                     raise ValueError("non-finite FK")
                 self._manip_foot_des_b = foot_now.copy()
-                print(
+                jprint(
                     "[manip] target initialized from FK p_b=[%+.3f,%+.3f,%+.3f] m"
                     % tuple(float(x) for x in foot_now)
                 )
@@ -3358,7 +4232,7 @@ class ModeELCMController:
                     [0.0, 0.0, float(self.lcm_cfg.switch_rb_leg_len_m)],
                     dtype=float,
                 )
-                print("[manip] FK init failed (%s); using vertical target" % exc)
+                jprint("[manip] FK init failed (%s); using vertical target" % exc)
             self._manip_init_pending = False
 
         target = np.asarray(
@@ -3434,12 +4308,18 @@ class ModeELCMController:
         self,
         tau_cmd: np.ndarray,
         *,
+        q_des: np.ndarray | None = None,
         kp_joint: np.ndarray | None = None,
         kd_joint: np.ndarray | None = None,
     ) -> None:
         msg = hopper_cmd_lcmt()
         msg.tau_ff = [float(t) for t in np.asarray(tau_cmd, dtype=float).reshape(3)]
-        msg.q_des = [0.0, 0.0, 0.0]
+        if q_des is None:
+            msg.q_des = [0.0, 0.0, 0.0]
+        else:
+            msg.q_des = [
+                float(x) for x in np.asarray(q_des, dtype=float).reshape(3)
+            ]
         msg.qd_des = [0.0, 0.0, 0.0]
         if kp_joint is None:
             msg.kp_joint = [0.0, 0.0, 0.0]
@@ -3469,7 +4349,7 @@ class ModeELCMController:
         """Label the current RM physical pose without moving it."""
         self._rm_zero_at_rad = float(logical_rad)
         self._rm_zero_until = time.time() + 0.1
-        print(
+        jprint(
             "[rm] %s: current physical pose is now logical q=%+.1f rad (0 A)"
             % (label, self._rm_zero_at_rad)
         )
@@ -3480,7 +4360,7 @@ class ModeELCMController:
         self._rm_sync_q0 = None   # re-latch start poses on the first drive tick
         self._rm_stage = 2
         self._rm_drive_t0 = time.time()
-        print("[rm] %s -> drive to %+.1f rad (kp %.1f kd %.2f cap %.1fA, "
+        jprint("[rm] %s -> drive to %+.1f rad (kp %.1f kd %.2f cap %.1fA, "
               "sync lead %.1f rad, timeout %.1fs)"
               % (label, self._rm_target, float(self.lcm_cfg.rm_kp_a_per_rad),
                  float(self.lcm_cfg.rm_kd_a_per_rad_s),
@@ -3541,7 +4421,7 @@ class ModeELCMController:
             if (now_t - float(self._rm_hold_t0)) >= 0.3:
                 self._rm_stage = 2
                 self._rm_sync_q0 = None   # re-latch start poses for the drive
-                print("[rm] pre-zero done (q=[%+.3f %+.3f %+.3f]) -> drive to %+.1f rad"
+                jprint("[rm] pre-zero done (q=[%+.3f %+.3f %+.3f]) -> drive to %+.1f rad"
                       % (*rm_q, target))
             return
         if int(self._rm_stage) == 2:
@@ -3557,7 +4437,7 @@ class ModeELCMController:
                 self._rm_drive_t0 = None
                 self._rm_sync_q0 = None
                 self._rm_iq_des = np.zeros(3, dtype=float)
-                print(
+                jprint(
                     "[rm] drive TIMEOUT %.1fs: target=%+.1f "
                     "q=[%+.3f %+.3f %+.3f] -> stage 0, current OFF; "
                     "LT transition unblocked"
@@ -3568,7 +4448,7 @@ class ModeELCMController:
                 self._rm_stage = 3
                 self._rm_drive_t0 = None
                 self._rm_hold_t0 = now_t
-                print("[rm] reached %+.1f rad -> hold %.1fs, then re-zero"
+                jprint("[rm] reached %+.1f rad -> hold %.1fs, then re-zero"
                       % (target, float(self.lcm_cfg.rm_hold_s)))
             else:
                 # --- Synchronized drive (2026-07-24 07:05 user: re-enabled;
@@ -3598,7 +4478,7 @@ class ModeELCMController:
                 self._rm_stage = 0
                 self._rm_drive_t0 = None
                 self._rm_iq_des = np.zeros(3, dtype=float)
-                print(
+                jprint(
                     "[rm] endpoint held: q=[%+.3f %+.3f %+.3f] -> idle (0 A)"
                     % tuple(rm_q)
                 )
@@ -3606,23 +4486,38 @@ class ModeELCMController:
         self._rm_iq_des = np.clip(kp * (target - rm_q) - kd * rm_qd, -cap, cap)
 
     def _update_rm_station_hold(self) -> None:
-        """HOPPING station keeping (rm_stage==0 only).
+        """Idle-stage station keeping at the current gait endpoint.
 
-        While gait==hopping AND legs are enabled (PD/PWMPD) AND no fold
-        transition is pending, hold the arms at rm_hopping_rad with a
-        low-cap current PD. At the endpoint the current is ~0 A, so this
-        is thermally free; only hop-impact transients draw current.
+        HOPPING: hold 0 rad so hop impacts cannot back-drive the arms.
+        MOBILE / PUSH / deployed hold: hold +11.5 so wheel motion cannot
+        back-drive the folded arms. Same low-cap current PD as hopping;
+        at the endpoint current is ~0 A, only disturbances draw current.
         """
         PD, PWMPD = 2, 3
-        active = (
+        gait = str(self._gait_mode)
+        hop_ok = (
             bool(getattr(self.lcm_cfg, "rm_hopping_hold", True))
-            and self._gait_mode == "hopping"
-            and int(self._mode_est) in (PD, PWMPD)
+            and gait == "hopping"
             and not bool(self._rm_lt_pending)
             and not bool(self._rm_rt_pending)
             and not bool(self._switch_loop)
+            and self._lt_stand_t0 is None
         )
-        if not active:
+        mobile_ok = (
+            bool(getattr(self.lcm_cfg, "rm_mobile_hold", True))
+            and gait in ("mobile", "push", "manipulation")
+            and self._lt_stand_t0 is None
+            and self._rt_stand_t0 is None
+            and not bool(self._switch_loop)
+        )
+        if hop_ok:
+            target = float(self.lcm_cfg.rm_hopping_rad)
+        elif mobile_ok:
+            target = float(self.lcm_cfg.rm_mobile_rad)
+        else:
+            self._rm_iq_des = np.zeros(3, dtype=float)
+            return
+        if int(self._mode_est) not in (PD, PWMPD):
             self._rm_iq_des = np.zeros(3, dtype=float)
             return
         with self.lock:
@@ -3632,7 +4527,6 @@ class ModeELCMController:
         if rm_online != 7:
             self._rm_iq_des = np.zeros(3, dtype=float)
             return
-        target = float(self.lcm_cfg.rm_hopping_rad)
         kp = float(self.lcm_cfg.rm_kp_a_per_rad)
         kd = float(self.lcm_cfg.rm_kd_a_per_rad_s)
         cap = float(abs(float(getattr(self.lcm_cfg, "rm_hold_iq_max_a", 2.0))))
@@ -3723,452 +4617,7 @@ class ModeELCMController:
                 break
             time.sleep(0.01)
 
-    def _start_log(self) -> None:
-        if bool(self._log_enabled):
-            return
-        try:
-            # Default: a logs/ folder INSIDE robot_runtime (next to this controller), so
-            # everything (code + logs) stays in robot_runtime. Override via MODEE_LOG_DIR.
-            _default_logs = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs"
-            )
-            logs_dir = os.path.expanduser(os.environ.get("MODEE_LOG_DIR", _default_logs))
-            os.makedirs(logs_dir, exist_ok=True)
-            # One unique file per upper-controller process; mirrored to
-            # modee_latest.csv only when the process stops.
-            # Filename stamp is ALWAYS Asia/Shanghai (Beijing), independent of
-            # process TZ / locale (2026-08-12 user: "log要记录着北京时间").
-            stamp = datetime.now(timezone(timedelta(hours=8))).strftime(
-                "%Y%m%d_%H%M%S"
-            )
-            log_name = os.environ.get("MODEE_LOG_NAME", f"modee_{stamp}.csv")
-            path = os.path.join(logs_dir, log_name)
-            self._log_latest_path = os.path.join(logs_dir, "modee_latest.csv")
-
-            fp = open(path, "w", newline="")
-            writer = csv.writer(fp)
-
-            header = [
-                "wall_time_s",
-                "wall_bj",
-                "t_s",
-                "phase",
-                "gait_mode",
-                "driver_mode_est",
-                "switch_loop",
-                "prop_enable",
-                "props_active",
-                "prop_ctrl_mode",
-                "rm_stage",
-                "rm_target_rad",
-                "rm_lt_pending",
-                "rm_rt_pending",
-                "stance",
-                "compress_active",
-                "push_started",
-                "touchdown",
-                "liftoff",
-                "apex",
-                "status",
-                # joints (measured from hopper_data_lcmt)
-                "q0",
-                "q1",
-                "q2",
-                "qd0",
-                "qd1",
-                "qd2",
-                # measured motor torque / Iq (from driver feedback, not command)
-                "tau_meas0",
-                "tau_meas1",
-                "tau_meas2",
-                # filtered joint velocity used by kinematics (CAN qd -> EMA)
-                "qd_kin0",
-                "qd_kin1",
-                "qd_kin2",
-                # commands / mapping
-                # tau* are the torques actually SENT to hardware (after output limiting)
-                "tau0",
-                "tau1",
-                "tau2",
-                # raw torques produced by ModeECore (before output limiting)
-                "tau_raw0",
-                "tau_raw1",
-                "tau_raw2",
-                # output limiter debug
-                "tau_out_scale_applied",
-                "f_tau_delta0",
-                "f_tau_delta1",
-                "f_tau_delta2",
-                "f_contact_w0",
-                "f_contact_w1",
-                "f_contact_w2",
-                # GRF in BODY frame (core computes it; log it directly so plots
-                # never have to reconstruct body force from rpy + world force)
-                "f_contact_b0",
-                "f_contact_b1",
-                "f_contact_b2",
-                "thrust0",
-                "thrust1",
-                "thrust2",
-                "pwm0",
-                "pwm1",
-                "pwm2",
-                "pwm3",
-                "pwm4",
-                "pwm5",
-                # kinematics
-                "foot_vicon0",
-                "foot_vicon1",
-                "foot_vicon2",
-                "foot_b0",
-                "foot_b1",
-                "foot_b2",
-                # foot velocity (body frame, +Z up). Useful for Hopper4-like velocity estimation debugging.
-                "foot_vrel_b0",
-                "foot_vrel_b1",
-                "foot_vrel_b2",
-                "J_inv_det",
-                "J_inv_cond",
-                "A_tau_f_det",
-                "A_tau_f_cond",
-                "foot_des_b0",
-                "foot_des_b1",
-                "foot_des_b2",
-                "foot_des_w0",
-                "foot_des_w1",
-                "foot_des_w2",
-                "p_foot_des_w0",
-                "p_foot_des_w1",
-                "p_foot_des_w2",
-                "leg_len_m",
-                "q_shift_m",
-                "qd_shift_mps",
-                # compression debug
-                "comp_m",
-                "comp_tgt_m",
-                "comp_tgt_act_m",
-                "z_now_m",
-                "s_stance",
-                # state estimate
-                "p_hat_w0",
-                "p_hat_w1",
-                "p_hat_w2",
-                "v_hat_w0",
-                "v_hat_w1",
-                "v_hat_w2",
-                # Debug: base velocity measured from foot kinematics, in WORLD frame
-                "v_meas_foot_w0",
-                "v_meas_foot_w1",
-                "v_meas_foot_w2",
-                "desired_vx_w",
-                "desired_vy_w",
-                # IMU raw (LCM)
-                "imu_quat_w",
-                "imu_quat_x",
-                "imu_quat_y",
-                "imu_quat_z",
-                "imu_gyro_x",
-                "imu_gyro_y",
-                "imu_gyro_z",
-                "imu_acc_x",
-                "imu_acc_y",
-                "imu_acc_z",
-                "imu_rpy_roll",
-                "imu_rpy_pitch",
-                "imu_rpy_yaw",
-                # IMU estimate (ModeE)
-                "q_hat_w",
-                "q_hat_x",
-                "q_hat_y",
-                "q_hat_z",
-                "rpy_hat_roll",
-                "rpy_hat_pitch",
-                "rpy_hat_yaw",
-                # attitude control debug (what QP is trying to realize)
-                "tau_des_w0",
-                "tau_des_w1",
-                "tau_des_w2",
-                "e_R0",
-                "e_R1",
-                "e_R2",
-                "tau_b_stance_des0",
-                "tau_b_stance_des1",
-                "tau_b_stance_des2",
-                "omega_b_used0",
-                "omega_b_used1",
-                "omega_b_used2",
-                # solver debug
-                "slack0",
-                "slack1",
-                "slack2",
-                "slack3",
-                "slack4",
-                "slack5",
-                # wrench debug (net wrench vs allocation)
-                "F_des_w0",
-                "F_des_w1",
-                "F_des_w2",
-                "f_ref_w0",
-                "f_ref_w1",
-                "f_ref_w2",
-                # Mode1 vertical push energy
-                "energy_comp_fz",
-                "vz_up",
-                "energy_gate",
-                # NRC stance law + prop energy supplement
-                "nrc_r",
-                "nrc_r_star",
-                "nrc_f_des",
-                "nrc_h_trim",
-                "mode1_Eloss_j",
-                "fl_ev_xy",
-                "fl_tilt_cmd_deg",
-                "rpy_des_roll",
-                "rpy_des_pitch",
-                "fl_lat_force_n",
-                "prop_energy_fz",
-                "thrust_sum_ref",
-                "thrust_sum",
-                "F_total_w0",
-                "F_total_w1",
-                "F_total_w2",
-                "tau_contact_w0",
-                "tau_contact_w1",
-                "tau_contact_w2",
-                "tau_props_w0",
-                "tau_props_w1",
-                "tau_props_w2",
-                "tau_total_w0",
-                "tau_total_w1",
-                "tau_total_w2",
-                # Stance attitude split (HFA debug): desired, leg target,
-                # leg delivered, prop residual, and utilization.
-                "tau_b_att_des0",
-                "tau_b_att_des1",
-                "tau_b_att_des2",
-                "tau_b_leg_des0",
-                "tau_b_leg_des1",
-                "tau_b_leg_des2",
-                "tau_b_leg_act0",
-                "tau_b_leg_act1",
-                "tau_b_leg_act2",
-                "tau_b_res_des0",
-                "tau_b_res_des1",
-                "tau_b_res_des2",
-                "tau_b_att_des_xy_norm",
-                "tau_b_leg_des_xy_norm",
-                "tau_props_xy_norm",
-                "leg_att_share",
-                "tau_cap_scale",
-                "prop_fz_assist_n",
-                # apex / takeoff debug
-                "z_apex_actual_m",
-                # Calibrated physical hop height (exp1 tape-measure affine).
-                "h_apex_phys_m",
-                "v_to_cmd_m_s",
-                "desired_vz_from_apex_m_s",
-                "hop_height_m",
-                "h_com_flight_m",
-                "h_leg_relative_m",
-                "h_foot_clear_m",
-                "h_com_imu_m",
-                "h_leg_imu_m",
-                "h_foot_clear_imu_m",
-                "v_lo_imu_m_s",
-                "foot_clearance_target_m",
-                "foot_clearance_control_enable",
-                "foot_clearance_com_target_m",
-                "flight_phase_s",
-                "lo_event_q_shift_m",
-                "td_event_q_shift_m",
-                "lo_unload_delay_s",
-                "td_impact_delay_s",
-                "specific_up_mps2",
-                # FB-SLIP: TD-sized constant brake/push forces + plan
-                "fbslip_v_td_m_s",
-                "fbslip_f_brake_n",
-                "fbslip_x_c_plan_m",
-                "fbslip_x_td_m",
-                "fbslip_s_tgt_m",
-                "fbslip_f_push_n",
-                "fbslip_t_bottom_s",
-                "fbslip_sink",
-                "apex_eta",
-                "apex_e_bias",
-                # Apex-to-apex hybrid work controller
-                "height_work_active",
-                "height_apex_energy_j",
-                "height_loss_hat_j",
-                "height_loss_meas_j",
-                "height_loss_ff_j",
-                "height_apex_confidence",
-                "height_work_req_j",
-                "height_work_leg_j",
-                "height_work_prop_j",
-                "height_x_star_m",
-                "height_x_bottom_m",
-                "height_work_extension_m",
-                "height_v_comp_td_mps",
-                "height_compression_k_n_m",
-                "height_ascent",
-                "height_leg_excess_force_n",
-                "height_brake_force_n",
-                "height_prop_push_ratio",
-                "vel_kf_x",
-                "vel_kf_y",
-                "vel_kf_z",
-                "hfb_T_st_s",
-                "hfb_k_dx",
-                "hfb_dx_att_x_m",
-                "hfb_dx_att_y_m",
-                "vz_lo_m_s",
-                # MPC debug
-                "mpc_status",
-                "mpc_u0_fx",
-                "mpc_u0_fy",
-                "mpc_u0_fz",
-                # LCM link health (received rates + last-packet age).
-                # If q freezes / IMU dies, *_age_ms grows while the controller keeps running.
-                "rx_motor_hz",
-                "rx_imu_hz",
-                "motor_age_ms",
-                "imu_age_ms",
-                # RM M2006/C610 motors (Pixhawk CAN, relayed in hopper_data_lcmt)
-                "rm_q0",
-                "rm_q1",
-                "rm_q2",
-                "rm_qd0",
-                "rm_qd1",
-                "rm_qd2",
-                "rm_iq0",
-                "rm_iq1",
-                "rm_iq2",
-                "rm_iq_des0",
-                "rm_iq_des1",
-                "rm_iq_des2",
-                "rm_online",
-                # MANIPULATION / AprilTag button telemetry.
-                "manip_stage",
-                "manip_tag_latched",
-                "manip_tag_id",
-                "manip_tag_age_s",
-                "manip_cmd_x",
-                "manip_cmd_y",
-                "manip_cmd_z",
-                "manip_actual_x",
-                "manip_actual_y",
-                "manip_actual_z",
-                "manip_err_m",
-                "manip_speed_mps",
-                "manip_pre_x",
-                "manip_pre_y",
-                "manip_pre_z",
-                "manip_face_x",
-                "manip_face_y",
-                "manip_face_z",
-                "manip_press_x",
-                "manip_press_y",
-                "manip_press_z",
-                "manip_wall_n_in_x",
-                "manip_wall_n_in_y",
-                "manip_wall_n_in_z",
-                "manip_kp",
-                "manip_outer_kd",
-                "manip_ak60_kd",
-                "manip_tau_max_nm",
-                "manip_target_rate_mps",
-                # MOBILE tag pre-acquisition + auto-approach + PUSH telemetry
-                # (appended at the end so column indices stay stable).
-                "mobile_tag_state",
-                "mobile_tag_cam_z_m",
-                "approach_active",
-                "push_e_m",
-                "push_v_mps",
-                "box_source",
-                "box_cx",
-                "box_cy",
-                "box_cz",
-                "box_nx",
-                "box_ny",
-                "box_nz",
-                "box_width_m",
-                # Operator event marker, e.g. Y@2026-08-09 03:23:12.345 BJ.
-                # Appended to preserve all existing column indices.
-                "operator_event_bj",
-                # Box push (2026-08-09): measured push force (J^-T tau on
-                # the face normal), approach errors, READY, working
-                # distance and de-contact/stall state. Appended last so
-                # earlier column indices stay stable.
-                "push_f_meas_n",
-                "box_dist_err_m",
-                "box_yaw_err_deg",
-                "box_ready",
-                "push_work_dist_m",
-                "push_state",
-            ]
-            writer.writerow(header)
-            fp.flush()
-
-            self._log_fp = fp
-            self._log_writer = writer
-            self._log_path = path
-            self._log_enabled = True
-            self._log_last_flush_t = float(time.time())
-            self._log_rows = 0
-            print(f"[log] START -> {path}")
-            # RETENTION (2026-08-12 16:38, user: "改成无限存"): no prune.
-            # Previously kept newest 5 after Jetson hit 177 GB; user wants
-            # all timestamped modee_<stamp>.csv kept. Watch disk manually.
-        except Exception as e:
-            # Don't kill controller if logging fails.
-            self._log_enabled = False
-            self._log_fp = None
-            self._log_writer = None
-            self._log_path = None
-            print(f"[log] START FAILED: {e}")
-
-    def _stop_log(self) -> None:
-        path = self._log_path
-        rows = int(self._log_rows)
-        if self._log_fp is not None:
-            try:
-                self._log_fp.flush()
-            except Exception:
-                pass
-            try:
-                self._log_fp.close()
-            except Exception:
-                pass
-            latest = getattr(self, "_log_latest_path", None)
-            if path and latest and os.path.isfile(path):
-                try:
-                    import shutil
-                    shutil.copy2(path, latest)
-                except Exception as e:
-                    print(f"[log] copy to modee_latest.csv failed: {e}")
-        self._log_enabled = False
-        self._log_fp = None
-        self._log_writer = None
-        self._log_path = None
-        self._log_last_flush_t = 0.0
-        self._log_rows = 0
-        if path:
-            print(f"[log] STOP -> {path}  ({rows} rows)")
-
-    def _mark_log_event(self, button: str) -> None:
-        """Attach a Beijing-time operator marker to the next CSV sample."""
-        bj = timezone(timedelta(hours=8))
-        stamp = datetime.fromtimestamp(time.time(), tz=bj).strftime(
-            "%Y-%m-%d %H:%M:%S.%f"
-        )[:-3]
-        marker = f"{button}@{stamp} BJ"
-        if self._log_event_marker:
-            self._log_event_marker += f"|{marker}"
-        else:
-            self._log_event_marker = marker
-        print(f"[log] MARK {marker} -> {self._log_path}")
-
-    def _handle_log_trigger(self, gamepad_msg) -> None:
+    def _handle_y_trigger(self, gamepad_msg) -> None:
         y_now = False
         try:
             y_now = bool(getattr(gamepad_msg, "y", 0)) if gamepad_msg is not None else False
@@ -4178,7 +4627,6 @@ class ModeELCMController:
         # Rising edge on Y:
         # - reset controller estimates (v_hat, integrators, etc.)
         # - enable velocity hard-hold until we enter STANCE once
-        # - replace CSV logging (close current file, open a new stamped one)
         if bool(y_now) and (not bool(self._last_y)):
             try:
                 self.core.user_reset(zero_yaw=True)
@@ -4189,25 +4637,7 @@ class ModeELCMController:
                 self.core.user_zero_velocity_hold(True)
             except Exception:
                 pass
-            if bool(self._log_enabled):
-                self._stop_log()
-            self._start_log()
-            self._mark_log_event("Y")
         self._last_y = bool(y_now)
-
-        # B: emergency abort (props/legs) lives elsewhere.  Do NOT stop CSV
-        # logging here -- abort sessions are exactly the ones we need to keep
-        # (2026-08-10: B mid-RT killed the log while the robot was still
-        # stuck in STANCE:PUSH).  Just stamp the rising edge into the CSV.
-        b_now = False
-        try:
-            b_now = bool(getattr(gamepad_msg, "b", 0)) if gamepad_msg is not None else False
-        except Exception:
-            b_now = False
-        if bool(b_now) and (not bool(self._last_b)):
-            if bool(self._log_enabled):
-                self._mark_log_event("B")
-        self._last_b = bool(b_now)
 
     def _handle_zero_vel_trigger(self, gamepad_msg) -> None:
         """
@@ -4318,6 +4748,15 @@ class ModeELCMController:
             getattr(self, "_vdes_last", np.zeros(2)), dtype=float
         ).reshape(2)
         line += f" vdes={vd[0]:+.2f}/{vd[1]:+.2f} m/s"
+        if self._gait_mode == "hopping":
+            if bool(getattr(self.core.cfg, "flight_deadbeat_model", False)):
+                line += (
+                    " β="
+                    f"{float(self.core.cfg.flight_deadbeat_beta):.2f}/"
+                    f"{float(self.core.cfg.flight_deadbeat_beta_hi):.2f}"
+                )
+            else:
+                line += " β=off(Raibert)"
         if self._gait_mode == "mobile":
             w = np.asarray(
                 getattr(self, "_wheel_last_cmd", np.zeros(3)), dtype=float
@@ -4359,7 +4798,7 @@ class ModeELCMController:
                         line += " approach=WAIT"
                     elif (self._approach_kind == "box"
                             and bool(self._box_ready)):
-                        line += " approach=READY->LT=PUSH"
+                        line += " approach=READY->PUSH"
                     elif self._approach_kind == "box":
                         line += " approach=BOX-SERVO"
                     elif tag_st == "READY":
@@ -4402,9 +4841,14 @@ class ModeELCMController:
                 f"{self._push_f_meas_n:+.1f}N"
                 if np.isfinite(self._push_f_meas_n) else "--"
             )
+            ft_str = (
+                f"{self._push_f_t_lpf:+.1f}N"
+                if np.isfinite(self._push_f_t_lpf) else "--"
+            )
             line += (
                 f" push[{src}|{state} age={age:.1f}s]"
-                f" F={f_str}"
+                f" F={f_str}/Ft={ft_str}"
+                f" depth={self._push_depth_cmd_m * 100:.1f}cm"
                 f" e={self._push_e_des_m * 100:+.1f}cm"
                 f" v={self._push_v_last:+.2f}m/s"
                 f" foot={p[0]:+.3f}/{p[1]:+.3f}/{p[2]:+.3f} m"
@@ -4412,555 +4856,41 @@ class ModeELCMController:
                 f" wheels[{en}]={w[0]:+.1f}/{w[1]:+.1f}/{w[2]:+.1f} rad/s"
             )
         elif self._gait_mode == "manipulation":
-            p = np.asarray(self._manip_foot_des_b, dtype=float).reshape(3)
-            btn = str(getattr(self, "_btn_stage_print", "") or "")
-            line += (
-                f" manip_p={p[0]:+.3f}/{p[1]:+.3f}/{p[2]:+.3f} m"
-                f" L={np.linalg.norm(p):.3f}"
-                f" err={self._manip_err_m*1000:.1f} mm"
-            )
-            if btn:
-                line += f" btn={btn}"
-        return line
-
-    def _log_step(
-        self,
-        *,
-        wall_time_s: float,
-        q: np.ndarray,
-        qd: np.ndarray,
-        imu_quat: np.ndarray,
-        imu_gyro: np.ndarray,
-        imu_acc: np.ndarray,
-        imu_rpy: np.ndarray,
-        desired_v_xy: np.ndarray,
-        tau_cmd: np.ndarray,
-        tau_raw: np.ndarray,
-        tau_out_scale_applied: float,
-        pwm_us: np.ndarray,
-        info: dict,
-        props_active: bool = False,
-        prop_ctrl_mode: int = 1,
-    ) -> None:
-        if (not bool(self._log_enabled)) or (self._log_writer is None) or (self._log_fp is None):
-            return
-        try:
-            stance = int(info.get("stance", 0))
-            compress = int(info.get("compress_active", info.get("compress", 0)))
-            push_started = int(info.get("push_started", 0))
-            touchdown = int(info.get("touchdown", 0))
-            liftoff = int(info.get("liftoff", 0))
-            apex = int(info.get("apex", 0))
-            status = str(info.get("status", ""))
-
-            if stance:
-                phase = "STANCE:COMP" if int(info.get("compress", 0)) else "STANCE:PUSH"
+            kind = str(getattr(self, "_manip_kind", "hold"))
+            if kind == "hold":
+                qh = np.asarray(
+                    getattr(
+                        self.lcm_cfg, "manip_hold_q",
+                        (1.376, 1.378, -0.096),
+                    ),
+                    dtype=float,
+                ).reshape(3)
+                err = (
+                    float(self._manip_err_m)
+                    if np.isfinite(self._manip_err_m) else float("nan")
+                )
+                line += (
+                    f" HOLD q_des={qh[0]:+.3f}/{qh[1]:+.3f}/{qh[2]:+.3f}"
+                    f" q_err={err:.3f} rad"
+                    f" kp={float(getattr(self.lcm_cfg, 'manip_hold_kp', 20.0)):.0f}"
+                    f" kd={float(self.lcm_cfg.manip_ak60_kd):.1f}"
+                )
             else:
-                phase = "FLIGHT"
-
-            tau_meas = np.asarray(
-                self.robot_state.get("tau", [np.nan, np.nan, np.nan]), dtype=float
-            ).reshape(3)
-
-            f_tau_delta = np.asarray(info.get("f_tau_delta", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            f_contact_w = np.asarray(info.get("f_contact_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            f_contact_b = np.asarray(info.get("f_contact_b", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            thrusts_arm = np.asarray(info.get("thrusts_arm", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            pwm_us = np.asarray(pwm_us, dtype=float).reshape(6)
-
-            foot_vicon = np.asarray(info.get("foot_vicon", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            foot_b = np.asarray(info.get("foot_b", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            qd_kin = np.asarray(info.get("qd_kin", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            foot_vrel_b = np.asarray(info.get("foot_vrel_b", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            J_inv_det = float(info.get("J_inv_det", float("nan")))
-            J_inv_cond = float(info.get("J_inv_cond", float("nan")))
-            A_tau_f_det = float(info.get("A_tau_f_det", float("nan")))
-            A_tau_f_cond = float(info.get("A_tau_f_cond", float("nan")))
-            foot_des_b = np.asarray(info.get("foot_des_b", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            foot_des_w = np.asarray(info.get("foot_des_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            p_foot_des_w = np.asarray(info.get("p_foot_des_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-
-            leg_len = float(np.linalg.norm(foot_vicon)) if np.all(np.isfinite(foot_vicon)) else float("nan")
-            q_shift = float(info.get("q_shift_equiv", float("nan")))
-            qd_shift = float(info.get("qd_shift_equiv", float("nan")))
-
-            comp_m = float(info.get("comp_m", float("nan")))
-            comp_tgt_m = float(info.get("comp_tgt_m", float("nan")))
-            comp_tgt_act_m = float(info.get("comp_tgt_act_m", float("nan")))
-            z_now_m = float(info.get("z_now_m", float("nan")))
-            s_stance = float(info.get("s_stance", float("nan")))
-
-            p_hat_w = np.asarray(info.get("p_hat_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            v_hat_w = np.asarray(info.get("v_hat_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            v_meas_foot_w = np.asarray(info.get("v_meas_foot_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-
-            q_hat = np.asarray(info.get("q_hat_wxyz", [np.nan, np.nan, np.nan, np.nan]), dtype=float).reshape(4)
-            rpy_hat = np.asarray(info.get("rpy_hat", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-
-            slack = np.asarray(info.get("slack", [np.nan] * 6), dtype=float).reshape(6)
-            tau_des_w = np.asarray(info.get("tau_des_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            e_R = np.asarray(info.get("e_R", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            tau_b_stance_des = np.asarray(
-                info.get("tau_b_stance_des", [np.nan, np.nan, np.nan]), dtype=float
-            ).reshape(3)
-            omega_b_used = np.asarray(info.get("omega_b_used", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            F_des_w = np.asarray(info.get("F_des_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            f_ref_w = np.asarray(info.get("f_ref_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            energy_comp_fz = float(info.get("energy_comp_fz", float("nan")))
-            # Log the exact core signals; do not reconstruct the gate from vz.
-            # CASE PUSH is physical leg extension (qd_shift > 0), while vz_up
-            # remains useful for the SRB vertical-energy calculation.
-            vz_up = float(info.get(
-                "vz_up",
-                -v_hat_w[2] if np.isfinite(float(v_hat_w[2])) else float("nan"),
-            ))
-            energy_gate = int(info.get("energy_gate", 0))
-            nrc_r = float(info.get("nrc_r", float("nan")))
-            nrc_r_star = float(info.get("nrc_r_star", float("nan")))
-            nrc_f_des = float(info.get("nrc_f_des", float("nan")))
-            nrc_h_trim = float(info.get("nrc_h_trim", float("nan")))
-            mode1_Eloss_j = float(info.get("mode1_Eloss_j", float("nan")))
-            fl_ev_xy = float(info.get("fl_ev_xy", float("nan")))
-            fl_tilt_cmd_deg = float(info.get("fl_tilt_cmd_deg", float("nan")))
-            rpy_des = np.asarray(
-                info.get("rpy_des", [np.nan, np.nan, np.nan]), dtype=float
-            ).reshape(3)
-            fl_lat_force_n = float(info.get("fl_lat_force_n", float("nan")))
-            prop_energy_fz = float(info.get("prop_energy_fz", float("nan")))
-            thrust_sum_ref = float(info.get("thrust_sum_ref", float("nan")))
-            thrust_sum = float(info.get("thrust_sum", float("nan")))
-            F_total_w = np.asarray(info.get("F_total_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            tau_contact_w = np.asarray(info.get("tau_contact_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            tau_props_w = np.asarray(info.get("tau_props_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            tau_total_w = np.asarray(info.get("tau_total_w", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
-            # RM M2006 state snapshot (arrays are replaced atomically in the LCM
-            # handler, so a lock-free read here is safe).
-            rm_q = np.asarray(self.robot_state["rm_q"], dtype=float).reshape(3)
-            rm_qd = np.asarray(self.robot_state["rm_qd"], dtype=float).reshape(3)
-            rm_iq = np.asarray(self.robot_state["rm_iq"], dtype=float).reshape(3)
-            rm_online = int(self.robot_state["rm_online"])
-            z_apex_actual_m = float(info.get("z_apex_actual_m", float("nan")))
-            v_to_cmd_m_s = float(info.get("v_to_cmd_m_s", float("nan")))
-            desired_vz_from_apex_m_s = float(info.get("desired_vz_from_apex_m_s", float("nan")))
-            hop_height_m = float(info.get("hop_height_m", float("nan")))
-            mpc_u0 = np.asarray(info.get("mpc_u0", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
-
-            # Readable Beijing wall clock next to unix epoch wall_time_s
-            # (2026-08-12 user: "log要记录着北京时间").
-            wall_bj = datetime.fromtimestamp(
-                float(wall_time_s), tz=timezone(timedelta(hours=8))
-            ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            row = [
-                float(wall_time_s),
-                wall_bj,
-                float(info.get("t", float("nan"))),
-                phase,
-                str(self._gait_mode),
-                int(self._mode_est),
-                int(bool(self._switch_loop)),
-                int(bool(self._prop_enable)),
-                int(bool(props_active)),
-                int(prop_ctrl_mode),
-                int(self._rm_stage),
-                float(self._rm_target),
-                int(bool(self._rm_lt_pending)),
-                int(bool(self._rm_rt_pending)),
-                stance,
-                compress,
-                push_started,
-                touchdown,
-                liftoff,
-                apex,
-                status,
-                float(q[0]),
-                float(q[1]),
-                float(q[2]),
-                float(qd[0]),
-                float(qd[1]),
-                float(qd[2]),
-                float(tau_meas[0]),
-                float(tau_meas[1]),
-                float(tau_meas[2]),
-                float(qd_kin[0]),
-                float(qd_kin[1]),
-                float(qd_kin[2]),
-                float(tau_cmd[0]),
-                float(tau_cmd[1]),
-                float(tau_cmd[2]),
-                float(tau_raw[0]),
-                float(tau_raw[1]),
-                float(tau_raw[2]),
-                float(tau_out_scale_applied),
-                float(f_tau_delta[0]),
-                float(f_tau_delta[1]),
-                float(f_tau_delta[2]),
-                float(f_contact_w[0]),
-                float(f_contact_w[1]),
-                float(f_contact_w[2]),
-                float(f_contact_b[0]),
-                float(f_contact_b[1]),
-                float(f_contact_b[2]),
-                float(thrusts_arm[0]),
-                float(thrusts_arm[1]),
-                float(thrusts_arm[2]),
-                float(pwm_us[0]),
-                float(pwm_us[1]),
-                float(pwm_us[2]),
-                float(pwm_us[3]),
-                float(pwm_us[4]),
-                float(pwm_us[5]),
-                float(foot_vicon[0]),
-                float(foot_vicon[1]),
-                float(foot_vicon[2]),
-                float(foot_b[0]),
-                float(foot_b[1]),
-                float(foot_b[2]),
-                float(foot_vrel_b[0]),
-                float(foot_vrel_b[1]),
-                float(foot_vrel_b[2]),
-                float(J_inv_det),
-                float(J_inv_cond),
-                float(A_tau_f_det),
-                float(A_tau_f_cond),
-                float(foot_des_b[0]),
-                float(foot_des_b[1]),
-                float(foot_des_b[2]),
-                float(foot_des_w[0]),
-                float(foot_des_w[1]),
-                float(foot_des_w[2]),
-                float(p_foot_des_w[0]),
-                float(p_foot_des_w[1]),
-                float(p_foot_des_w[2]),
-                float(leg_len),
-                float(q_shift),
-                float(qd_shift),
-                float(comp_m),
-                float(comp_tgt_m),
-                float(comp_tgt_act_m),
-                float(z_now_m),
-                float(s_stance),
-                float(p_hat_w[0]),
-                float(p_hat_w[1]),
-                float(p_hat_w[2]),
-                float(v_hat_w[0]),
-                float(v_hat_w[1]),
-                float(v_hat_w[2]),
-                float(v_meas_foot_w[0]),
-                float(v_meas_foot_w[1]),
-                float(v_meas_foot_w[2]),
-                float(desired_v_xy[0]),
-                float(desired_v_xy[1]),
-                float(imu_quat[0]),
-                float(imu_quat[1]),
-                float(imu_quat[2]),
-                float(imu_quat[3]),
-                float(imu_gyro[0]),
-                float(imu_gyro[1]),
-                float(imu_gyro[2]),
-                float(imu_acc[0]),
-                float(imu_acc[1]),
-                float(imu_acc[2]),
-                float(imu_rpy[0]),
-                float(imu_rpy[1]),
-                float(imu_rpy[2]),
-                float(q_hat[0]),
-                float(q_hat[1]),
-                float(q_hat[2]),
-                float(q_hat[3]),
-                float(rpy_hat[0]),
-                float(rpy_hat[1]),
-                float(rpy_hat[2]),
-                float(tau_des_w[0]),
-                float(tau_des_w[1]),
-                float(tau_des_w[2]),
-                float(e_R[0]),
-                float(e_R[1]),
-                float(e_R[2]),
-                float(tau_b_stance_des[0]),
-                float(tau_b_stance_des[1]),
-                float(tau_b_stance_des[2]),
-                float(omega_b_used[0]),
-                float(omega_b_used[1]),
-                float(omega_b_used[2]),
-                float(slack[0]),
-                float(slack[1]),
-                float(slack[2]),
-                float(slack[3]),
-                float(slack[4]),
-                float(slack[5]),
-                float(F_des_w[0]),
-                float(F_des_w[1]),
-                float(F_des_w[2]),
-                float(f_ref_w[0]),
-                float(f_ref_w[1]),
-                float(f_ref_w[2]),
-                float(energy_comp_fz),
-                float(vz_up),
-                int(energy_gate),
-                float(nrc_r),
-                float(nrc_r_star),
-                float(nrc_f_des),
-                float(nrc_h_trim),
-                float(mode1_Eloss_j),
-                float(fl_ev_xy),
-                float(fl_tilt_cmd_deg),
-                float(rpy_des[0]),
-                float(rpy_des[1]),
-                float(fl_lat_force_n),
-                float(prop_energy_fz),
-                float(thrust_sum_ref),
-                float(thrust_sum),
-                float(F_total_w[0]),
-                float(F_total_w[1]),
-                float(F_total_w[2]),
-                float(tau_contact_w[0]),
-                float(tau_contact_w[1]),
-                float(tau_contact_w[2]),
-                float(tau_props_w[0]),
-                float(tau_props_w[1]),
-                float(tau_props_w[2]),
-                float(tau_total_w[0]),
-                float(tau_total_w[1]),
-                float(tau_total_w[2]),
-                # Stance attitude split debug (full body-frame vectors).
-                float(info.get("tau_b_att_des0", float("nan"))),
-                float(info.get("tau_b_att_des1", float("nan"))),
-                float(info.get("tau_b_att_des2", float("nan"))),
-                float(info.get("tau_b_leg_des0", float("nan"))),
-                float(info.get("tau_b_leg_des1", float("nan"))),
-                float(info.get("tau_b_leg_des2", float("nan"))),
-                float(info.get("tau_b_leg_act0", float("nan"))),
-                float(info.get("tau_b_leg_act1", float("nan"))),
-                float(info.get("tau_b_leg_act2", float("nan"))),
-                float(info.get("tau_b_res_des0", float("nan"))),
-                float(info.get("tau_b_res_des1", float("nan"))),
-                float(info.get("tau_b_res_des2", float("nan"))),
-                float(info.get("tau_b_att_des_xy_norm", float("nan"))),
-                float(info.get("tau_b_leg_des_xy_norm", float("nan"))),
-                float(info.get("tau_props_xy_norm", float("nan"))),
-                float(info.get("leg_att_share", float("nan"))),
-                float(info.get("tau_cap_scale", float("nan"))),
-                float(info.get("prop_fz_assist_n", float("nan"))),
-                float(z_apex_actual_m),
-                float(info.get("h_apex_phys_m", float("nan"))),
-                float(v_to_cmd_m_s),
-                float(desired_vz_from_apex_m_s),
-                float(hop_height_m),
-                float(info.get("h_com_flight_m", float("nan"))),
-                float(info.get("h_leg_relative_m", float("nan"))),
-                float(info.get("h_foot_clear_m", float("nan"))),
-                float(info.get("h_com_imu_m", float("nan"))),
-                float(info.get("h_leg_imu_m", float("nan"))),
-                float(info.get("h_foot_clear_imu_m", float("nan"))),
-                float(info.get("v_lo_imu_m_s", float("nan"))),
-                float(info.get("foot_clearance_target_m", 0.05)),
-                int(info.get("foot_clearance_control_enable", 0)),
-                float(info.get("foot_clearance_com_target_m", float("nan"))),
-                float(info.get("flight_phase_s", float("nan"))),
-                float(info.get("lo_event_q_shift_m", float("nan"))),
-                float(info.get("td_event_q_shift_m", float("nan"))),
-                float(info.get("lo_unload_delay_s", float("nan"))),
-                float(info.get("td_impact_delay_s", float("nan"))),
-                float(info.get("specific_up_mps2", float("nan"))),
-                float(info.get("fbslip_v_td_m_s", float("nan"))),
-                float(info.get("fbslip_f_brake_n", float("nan"))),
-                float(info.get("fbslip_x_c_plan_m", float("nan"))),
-                float(info.get("fbslip_x_td_m", float("nan"))),
-                float(info.get("fbslip_s_tgt_m", float("nan"))),
-                float(info.get("fbslip_f_push_n", float("nan"))),
-                float(info.get("fbslip_t_bottom_s", float("nan"))),
-                float(info.get("fbslip_sink", 0)),
-                float(info.get("apex_eta", 1.0)),
-                float(info.get("apex_e_bias", 0.0)),
-                int(info.get("height_work_active", 0)),
-                float(info.get("height_apex_energy_j", float("nan"))),
-                float(info.get("height_loss_hat_j", float("nan"))),
-                float(info.get("height_loss_meas_j", float("nan"))),
-                float(info.get("height_loss_ff_j", float("nan"))),
-                float(info.get("height_apex_confidence", float("nan"))),
-                float(info.get("height_work_req_j", float("nan"))),
-                float(info.get("height_work_leg_j", float("nan"))),
-                float(info.get("height_work_prop_j", float("nan"))),
-                float(info.get("height_x_star_m", float("nan"))),
-                float(info.get("height_x_bottom_m", float("nan"))),
-                float(info.get(
-                    "height_work_extension_m", float("nan")
-                )),
-                float(info.get("height_v_comp_td_mps", float("nan"))),
-                float(info.get(
-                    "height_compression_k_n_m", float("nan")
-                )),
-                int(info.get("height_ascent", 0)),
-                float(info.get(
-                    "height_leg_excess_force_n", float("nan")
-                )),
-                float(info.get("height_brake_force_n", float("nan"))),
-                float(info.get(
-                    "height_prop_push_ratio", float("nan")
-                )),
-                float(info.get("vel_kf_x", float("nan"))),
-                float(info.get("vel_kf_y", float("nan"))),
-                float(info.get("vel_kf_z", float("nan"))),
-                float(info.get("hfb_T_st_s", float("nan"))),
-                float(info.get("hfb_k_dx", float("nan"))),
-                float(info.get("hfb_dx_att_x_m", float("nan"))),
-                float(info.get("hfb_dx_att_y_m", float("nan"))),
-                float(info.get("vz_lo_m_s", float("nan"))),
-                # MPC debug
-                str(info.get("mpc_status", "")),
-                float(mpc_u0[0]),
-                float(mpc_u0[1]),
-                float(mpc_u0[2]),
-                # LCM link health
-                float(self._rx_motor_hz),
-                float(self._rx_imu_hz),
-                float(max(0.0, (wall_time_s - float(self._rx_motor_last_t)) * 1e3) if self._rx_motor_last_t > 0.0 else float("nan")),
-                float(max(0.0, (wall_time_s - float(self._rx_imu_last_t)) * 1e3) if self._rx_imu_last_t > 0.0 else float("nan")),
-                float(rm_q[0]),
-                float(rm_q[1]),
-                float(rm_q[2]),
-                float(rm_qd[0]),
-                float(rm_qd[1]),
-                float(rm_qd[2]),
-                float(rm_iq[0]),
-                float(rm_iq[1]),
-                float(rm_iq[2]),
-                float(self._rm_iq_des[0]),
-                float(self._rm_iq_des[1]),
-                float(self._rm_iq_des[2]),
-                int(rm_online),
-                # MANIPULATION / button auto state.
-                str(self._btn_stage),
-                int(self._btn_last_setpoint is not None),
-                int(
-                    self._btn_last_setpoint.get("tag_id", -1)
-                    if self._btn_last_setpoint is not None else -1
-                ),
-                float(
-                    max(
-                        0.0,
-                        wall_time_s
-                        - float(self._btn_last_setpoint.get("t_wall", 0.0)),
-                    )
-                    if self._btn_last_setpoint is not None else float("nan")
-                ),
-                float(self._manip_foot_des_b[0]),
-                float(self._manip_foot_des_b[1]),
-                float(self._manip_foot_des_b[2]),
-                float(foot_vicon[0]),
-                float(foot_vicon[1]),
-                float(foot_vicon[2]),
-                float(self._manip_err_m),
-                float(self._manip_speed_mps),
-                *[
-                    float(x) for x in (
-                        self._btn_last_setpoint.get(
-                            "foot_pre_L", [np.nan, np.nan, np.nan]
-                        )
-                        if self._btn_last_setpoint is not None
-                        else [np.nan, np.nan, np.nan]
-                    )
-                ],
-                *[
-                    float(x) for x in (
-                        self._btn_last_setpoint.get(
-                            "foot_face_L", [np.nan, np.nan, np.nan]
-                        )
-                        if self._btn_last_setpoint is not None
-                        else [np.nan, np.nan, np.nan]
-                    )
-                ],
-                *[
-                    float(x) for x in (
-                        self._btn_last_setpoint.get(
-                            "foot_press_L", [np.nan, np.nan, np.nan]
-                        )
-                        if self._btn_last_setpoint is not None
-                        else [np.nan, np.nan, np.nan]
-                    )
-                ],
-                *[
-                    float(x) for x in (
-                        self._btn_last_setpoint.get(
-                            "wall_normal_in_L", [np.nan, np.nan, np.nan]
-                        )
-                        if self._btn_last_setpoint is not None
-                        else [np.nan, np.nan, np.nan]
-                    )
-                ],
-                float(self.lcm_cfg.manip_button_kp_n_m),
-                float(self.lcm_cfg.manip_button_kd_n_s_m),
-                float(self.lcm_cfg.manip_ak60_kd),
-                float(self.lcm_cfg.manip_tau_max_nm),
-                float(self.lcm_cfg.manip_button_rate_mps),
-                str(self._mobile_tag_state),
-                float(self._mobile_tag_cam_z_m),
-                int(bool(self._approach_active)),
-                float(self._push_e_des_m),
-                float(self._push_v_last),
-                str(
-                    self._push_box.get("source", "")
-                    if self._push_box is not None else ""
-                ),
-                *[
-                    float(x) for x in (
-                        np.asarray(
-                            self._push_box["center"], dtype=float
-                        ).reshape(3)
-                        if self._push_box is not None
-                        else [np.nan, np.nan, np.nan]
-                    )
-                ],
-                *[
-                    float(x) for x in (
-                        np.asarray(
-                            self._push_box["n_in"], dtype=float
-                        ).reshape(3)
-                        if self._push_box is not None
-                        else [np.nan, np.nan, np.nan]
-                    )
-                ],
-                float(
-                    self._push_box.get("width_m", float("nan"))
-                    if self._push_box is not None else float("nan")
-                ),
-                str(self._log_event_marker),
-                float(self._push_f_meas_n),
-                float(self._box_dist_err_m),
-                float(self._box_yaw_err_deg),
-                int(bool(self._box_ready)),
-                float(
-                    self._push_work_dist_m
-                    if self._push_work_dist_m is not None
-                    else float("nan")
-                ),
-                self._push_state_str(),
-            ]
-            self._log_writer.writerow(row)
-            self._log_rows += 1
-            self._log_event_marker = ""
-
-            # Periodic flush to reduce data loss without killing performance.
-            # 2026-07-23: 0.25 -> 0.05 s; a hard kill was losing the last
-            # quarter second right when the interesting event happened.
-            t_now = float(time.time())
-            if (t_now - float(self._log_last_flush_t)) >= 0.05:
-                self._log_fp.flush()
-                self._log_last_flush_t = t_now
-        except Exception:
-            # Never crash controller due to logging issues
-            pass
+                p = np.asarray(self._manip_foot_des_b, dtype=float).reshape(3)
+                btn = str(getattr(self, "_btn_stage_print", "") or "")
+                line += (
+                    f" BUTTON p={p[0]:+.3f}/{p[1]:+.3f}/{p[2]:+.3f} m"
+                    f" L={np.linalg.norm(p):.3f}"
+                    f" err={self._manip_err_m*1000:.1f} mm"
+                )
+                if btn:
+                    line += f" btn={btn}"
+        return line
 
     def run_controller(self) -> None:
         dt = float(self.modee_cfg.dt)
         next_t = time.time()
         last_print = 0.0
-
-        # Start CSV logging as soon as the upper loop runs (not on gamepad Y).
-        try:
-            self._start_log()
-        except Exception as e:
-            print(f"[log] auto-start failed: {e}")
 
         try:
             while self.running:
@@ -5007,11 +4937,12 @@ class ModeELCMController:
                         rx_walltime=odom_rx_t,
                     )
 
-                # Y key logging trigger works even before we have all packets
-                self._handle_log_trigger(gamepad_msg)
+                # Y resets controller estimates and enables the temporary
+                # velocity hold; it no longer controls CSV logging.
+                self._handle_y_trigger(gamepad_msg)
                 # User "I"/point hard-stop (also works even before we have all packets)
                 self._handle_zero_vel_trigger(gamepad_msg)
-                # LEFT stick Y detent: up-release +2 cm, down-release -2 cm.
+                # LEFT stick detent: queue foot_clearance for the next TD.
                 self._handle_hop_height_stick(gamepad_msg)
 
                 if (not have_motor) or (not have_imu):
@@ -5028,7 +4959,7 @@ class ModeELCMController:
                 stick_moved = bool(np.any(np.abs(desired_v_xy) > 1e-9))  # already deadzoned
                 if self._patrol_enable and (b_now_pat or stick_moved):
                     self._patrol_enable = False
-                    print(f"[patrol] OFF ({'B' if b_now_pat else 'stick override'})")
+                    jprint(f"[patrol] OFF ({'B' if b_now_pat else 'stick override'})")
                 if self._patrol_enable:
                     nav_fresh = (now - nav_rx_t) < float(getattr(self.lcm_cfg, "nav_cmd_stale_s", 0.3))
                     if nav_fresh and (nav_active == 1):
@@ -5111,12 +5042,7 @@ class ModeELCMController:
                     # Update our mode estimate to DAMP to prevent repeated SAFE triggers while the operator recovers.
                     self._mode_est = 1  # DAMP
                     self._safe_last_t = float(time.time())
-                    print(f"[SAFE] TRIGGERED: {'; '.join(reason)} -> DAMP (pause {pause_s:.0f}s)")
-                    # This tick skips _log_step (continue below); leave a
-                    # marker so the SAFE event and its reason land in the
-                    # CSV on the first row after the pause.
-                    self._mark_log_event("SAFE:" + ";".join(reason))
-
+                    jprint(f"[SAFE] TRIGGERED: {'; '.join(reason)} -> DAMP (pause {pause_s:.0f}s)")
                     # pause controller loop (do NOT backlog-catchup)
                     if pause_s > 0.0:
                         time.sleep(pause_s)
@@ -5157,7 +5083,7 @@ class ModeELCMController:
                     if int(self._rt_hop_height_remaining) <= 0:
                         self._restore_hop_height("RT first hops done")
                     else:
-                        print(
+                        jprint(
                             "[hop_height] RT override remaining %d hop(s) "
                             "at %.3f m"
                             % (int(self._rt_hop_height_remaining),
@@ -5189,7 +5115,7 @@ class ModeELCMController:
                         float(self.lcm_cfg.rm_mobile_rad),
                         "LT job (compression -> fold RM)",
                     )
-                    print(
+                    jprint(
                         "[gait] LT compression -> RM 0 -> %.1f rad; "
                         "legs finish this hop; props OFF + stand at liftoff"
                         % float(self.lcm_cfg.rm_mobile_rad)
@@ -5201,7 +5127,7 @@ class ModeELCMController:
                     self._restore_hop_height("LT stand")
                     self._prop_enable = False
                     self._close_prop_base_window("LT stand")
-                    print(
+                    jprint(
                         "[gait] LT STAND (liftoff after fold stance) -> "
                         "leg holds %.3f m (tau cap %.1f Nm, props OFF); "
                         "MOBILE when RM reaches %.1f rad"
@@ -5217,7 +5143,7 @@ class ModeELCMController:
                         float(self.lcm_cfg.rm_hopping_rad),
                         "RT job (push end -> unfold RM)",
                     )
-                    print(
+                    jprint(
                         "[gait] RT: push end -> RM +11.5 -> %.1f rad"
                         % float(self.lcm_cfg.rm_hopping_rad)
                     )
@@ -5240,18 +5166,20 @@ class ModeELCMController:
                     pwm_min = float(self.modee_cfg.pwm_min_us)
                     pwm_us = np.full(6, pwm_min, dtype=float)
                     props_active = False
-                    # Release to MOBILE once the arms are down (RM left its
-                    # drive stage) or on the fail-safe timeout.
-                    rm_done = int(self._rm_stage) != 2
+                    # Release to MOBILE once the fold drive is done. The
+                    # 1 s stage-3 hold is insurance and may overlap the
+                    # first wheel command after the gait change.
+                    rm_done = not self._rm_drive_busy()
                     timed_out = (
                         time.time() - float(self._lt_stand_t0)
                     ) >= float(self.lcm_cfg.switch_lt_timeout_s)
                     if rm_done or timed_out:
                         self._lt_stand_t0 = None
                         self._gait_mode = "mobile"
+                        self._reset_hop_estimator("LT STAND -> MOBILE")
                         self._reset_mobile_leg_stow()
                         props_active = False
-                        print(
+                        jprint(
                             "[gait] LT STAND done (%s) -> MOBILE: "
                             "props OFF; leg stows after wheel motion"
                             % ("RM reached" if rm_done else "TIMEOUT")
@@ -5316,30 +5244,14 @@ class ModeELCMController:
                     if (rm_near and stand_elapsed >= min_s) or timed_out:
                         self._rt_stand_t0 = None
                         self._gait_mode = "hopping"
-                        # Fresh ModeE hop cycle: stand was NOT a hop, so
-                        # clear cold-start / latch state. No special l0.
+                        # Fresh ModeE hop cycle: stand was NOT a hop.
                         # RM drive is intentionally LEFT RUNNING so the
                         # arms finish to 0 (or hit rm_drive_timeout).
-                        self.core._n_flights_done = 0
-                        self.core._flight_dur_prev = 0.0
-                        # 2026-08-11 12:17: stale _lo_t from the MOBILE
-                        # stance made the first hopping TD count a fake
-                        # flight (T_fl~1.2s in [0.12,1.5]) -> ++ BEFORE
-                        # the first stance, so every first-hop gate
-                        # (<1) was skipped (logs 120626/121233 pinned
-                        # at 42 N). Clear the liftoff clock too.
-                        self.core._lo_t = None
-                        if hasattr(self.core, "_stance_dur_prev"):
-                            self.core._stance_dur_prev = 0.0
-                        self.core._push_vel_ring[:] = 0.0
-                        self.core._push_vel_ring_i = 0
-                        self.core._push_vel_ring_cnt = 0
-                        self.core._vz_push_ring[:] = 0.0
-                        self.core._vz_push_ring_i = 0
-                        self.core._vz_push_ring_cnt = 0
-                        # 2026-08-12 (user): first hop after MOBILE->HOPPING
-                        # has no XY initial velocity; hop 2 starts calculating.
-                        self.core._rt_first_lo_zero_xy = True
+                        # Zero leftover MOBILE/last-hop velocity so the
+                        # first hop does not inherit a residual v_xy.
+                        self._reset_hop_estimator(
+                            "RT-STAND -> HOPPING", new_session=True
+                        )
                         self._prop_enable = True
                         self._arm_rt_first_hops("RT-STAND")
                         self._arm_rt_first_hop_l0("RT-STAND")
@@ -5352,7 +5264,7 @@ class ModeELCMController:
                                  10.0,
                              )))
                         )
-                        print(
+                        jprint(
                             "[gait] RT STAND done (%s) -> HOPPING "
                             "(收腿/normal cycle; prop base stays until "
                             "RM@0 or timeout)"
@@ -5378,25 +5290,9 @@ class ModeELCMController:
                         self._rb_p4_t0 = None
                         self._rb_p4_aligning = False
                         self._gait_mode = "hopping"
-                        # 2026-08-12 (user): first hop after MOBILE->HOPPING
-                        # has no XY initial velocity; hop 2 starts calculating.
-                        # (Was False since 2026-08-10; polluted LO latch then
-                        # fed Raibert on hop 1.)
-                        self.core._rt_first_lo_zero_xy = True
-                        self.core._n_flights_done = 0
-                        self.core._flight_dur_prev = 0.0
-                        # 2026-08-11 12:17: clear stale MOBILE liftoff
-                        # clock -- see RT-STAND handoff comment (fake
-                        # flight count skipped all first-hop gates).
-                        self.core._lo_t = None
-                        if hasattr(self.core, "_stance_dur_prev"):
-                            self.core._stance_dur_prev = 0.0
-                        self.core._push_vel_ring[:] = 0.0
-                        self.core._push_vel_ring_i = 0
-                        self.core._push_vel_ring_cnt = 0
-                        self.core._vz_push_ring[:] = 0.0
-                        self.core._vz_push_ring_i = 0
-                        self.core._vz_push_ring_cnt = 0
+                        self._reset_hop_estimator(
+                            "P4 -> HOPPING", new_session=True
+                        )
                         self._prop_enable = True
                         self._open_prop_base_window()
                         self._arm_rt_first_hops("P4")
@@ -5405,7 +5301,7 @@ class ModeELCMController:
                             float(self.lcm_cfg.rm_hopping_rad),
                             "RT: unfold RM alongside hopping (flight)",
                         )
-                        print(
+                        jprint(
                             "[gait] RT -> FLIGHT/HOPPING: hold was L=%.3f m "
                             "(= normal l0), RM +11.5 -> %.1f + prop base "
                             "%.0fus; normal hopping from here"
@@ -5441,7 +5337,7 @@ class ModeELCMController:
                         if align_reached or align_timed_out:
                             self._rb_p4_aligning = False
                             self._rb_p4_t0 = now_t
-                            print(
+                            jprint(
                                 "[switch_loop] P4 upright/short stage done "
                                 "(%s, err %.3fm) -> extend and hold L=%.3fm"
                                 % (
@@ -5462,62 +5358,175 @@ class ModeELCMController:
                                 pwm_us[ii] = prop_pwm_up
                     props_active = True
                 elif self._gait_mode == "manipulation":
-                    # Deployed appendages carry the body. Wheels are stopped
-                    # below; the released 3-RSR leg tracks a body-frame point
-                    # on its spherical workspace. Prefer live AprilTag button
-                    # setpoint (right 16.5 / down 2.6 / protrude 5 / press 1 cm);
-                    # otherwise stick teleop.
-                    manip_target_b = self._update_manip_button_target(q, dt)
-                    button_auto = manip_target_b is not None
-                    if manip_target_b is None:
-                        manip_target_b = self._update_manip_foot_target(
-                            gamepad_msg, q, dt
-                        )
-                    boost = bool(
-                        button_auto and getattr(self, "_manip_press_boost", False)
-                    )
-                    f_ff = None
-                    if button_auto and boost:
-                        tau_cap = float(getattr(
-                            self.lcm_cfg, "manip_press_tau_max_nm", 8.0
-                        ))
-                        kp_c = float(getattr(
-                            self.lcm_cfg, "manip_button_press_kp_n_m", 550.0
-                        ))
-                        # Open-loop contact force along latched wall normal
-                        # (does not need live tag while the hand occludes it).
-                        n_L = getattr(self, "_manip_press_n_L", None)
-                        ff_n = float(getattr(
-                            self.lcm_cfg, "manip_press_ff_n", 30.0
-                        ))
-                        if n_L is not None and ff_n > 1e-6:
-                            f_ff = (
-                                ff_n * np.asarray(n_L, dtype=float).reshape(3)
+                    if str(getattr(self, "_manip_kind", "hold")) == "button":
+                        manip_target_b = self._update_manip_button_target(q, dt)
+                        button_auto = manip_target_b is not None
+                        if manip_target_b is None:
+                            manip_target_b = self._update_manip_foot_target(
+                                gamepad_msg, q, dt
                             )
-                    elif button_auto:
-                        tau_cap = float(self.lcm_cfg.manip_tau_max_nm)
-                        kp_c = float(self.lcm_cfg.manip_button_kp_n_m)
-                    else:
-                        tau_cap = float(self.lcm_cfg.manip_tau_max_nm)
-                        kp_c = float(self.lcm_cfg.manip_kp_z_n_m)
-                    tau_send, self._manip_err_m, self._manip_speed_mps = (
-                        self.core.compute_stand_swing_tau(
-                            joint_pos=np.asarray(q, dtype=float).reshape(3),
-                            joint_vel=np.asarray(qd, dtype=float).reshape(3),
-                            leg_len_des_m=float(np.linalg.norm(manip_target_b)),
-                            tau_max_nm=tau_cap,
-                            foot_des_b=manip_target_b,
-                            kp_z=kp_c,
-                            kd_z=float(
-                                self.lcm_cfg.manip_button_kd_n_s_m
-                                if button_auto
-                                else self.lcm_cfg.manip_kd_z_n_s_m
-                            ),
-                            axial_ff_n=0.0,
-                            cartesian_pd=bool(button_auto),
-                            f_ff_native=f_ff,
+                        centering = (
+                            bool(button_auto)
+                            and str(getattr(self, "_btn_stage", ""))
+                            in ("home", "wait_tag")
                         )
-                    )
+                        arm_pressing = (
+                            bool(button_auto)
+                            and str(getattr(self, "_btn_stage", ""))
+                            in ("press", "hold", "done")
+                        )
+                        # WORK ENVELOPE (2026-08-14): every deployed
+                        # Cartesian target obeys the user-defined range
+                        # (z band, L cap, wheel keep-out sectors). Skip
+                        # during 归中 — that is joint-space, not Cartesian.
+                        if not centering and not arm_pressing:
+                            manip_target_b = self._clamp_work_envelope(
+                                manip_target_b
+                            )
+                            self._manip_foot_des_b = np.asarray(
+                                manip_target_b, dtype=float
+                            ).reshape(3)
+                            # Floor guard: log 01:42 q2 dumped the foot
+                            # to z=0.451 and 3 Nm sat against the ground.
+                            # Freeze XY and lift if we are already too deep.
+                            z_bot = float(getattr(
+                                self.lcm_cfg, "work_z_bottom_m", 0.440
+                            ))
+                            try:
+                                p_now, _ = self.core.fk.forward_kinematics(
+                                    np.asarray(q, dtype=float).reshape(3)
+                                )
+                                p_now = np.asarray(
+                                    p_now, dtype=float
+                                ).reshape(3)
+                                if (
+                                    np.all(np.isfinite(p_now))
+                                    and float(p_now[2]) > (z_bot - 0.005)
+                                ):
+                                    lift = p_now.copy()
+                                    lift[2] = z_bot - 0.020
+                                    manip_target_b = self._clamp_work_envelope(
+                                        lift
+                                    )
+                                    self._manip_foot_des_b = (
+                                        np.asarray(
+                                            manip_target_b, dtype=float
+                                        ).reshape(3)
+                                    )
+                            except Exception:
+                                pass
+                        boost = bool(
+                            button_auto
+                            and getattr(self, "_manip_press_boost", False)
+                        )
+                        if button_auto:
+                            tau_cap = float(getattr(
+                                self.lcm_cfg, "manip_button_tau_max_nm", 8.0
+                            ))
+                            kp_c = float(max(
+                                50.0,
+                                getattr(
+                                    self.lcm_cfg, "mobile_leg_kp_hold", 16.0
+                                ) * 15.0,
+                            ))
+                            kd_c = 4.0
+                        else:
+                            tau_cap = float(self.lcm_cfg.manip_tau_max_nm)
+                            kp_c = float(self.lcm_cfg.manip_kp_z_n_m)
+                            kd_c = float(self.lcm_cfg.manip_kd_z_n_s_m)
+                        f_ff = None
+                        _ = boost
+                        if centering:
+                            tau_send = self._button_center_tau(q, qd)
+                            try:
+                                p_now, _ = self.core.fk.forward_kinematics(
+                                    np.asarray(q, dtype=float).reshape(3)
+                                )
+                                self._manip_err_m = float(np.linalg.norm(
+                                    self._manip_home_foot()
+                                    - np.asarray(p_now, dtype=float).reshape(3)
+                                ))
+                            except Exception:
+                                self._manip_err_m = 0.0
+                            self._manip_speed_mps = 0.0
+                        else:
+                            tau_send, self._manip_err_m, self._manip_speed_mps = (
+                                self.core.compute_stand_swing_tau(
+                                    joint_pos=np.asarray(q, dtype=float).reshape(3),
+                                    joint_vel=np.asarray(qd, dtype=float).reshape(3),
+                                    leg_len_des_m=float(
+                                        np.linalg.norm(manip_target_b)
+                                    ),
+                                    tau_max_nm=tau_cap,
+                                    foot_des_b=manip_target_b,
+                                    kp_z=kp_c,
+                                    kd_z=kd_c,
+                                    axial_ff_n=0.0,
+                                    cartesian_pd=bool(button_auto),
+                                    f_ff_native=f_ff,
+                                )
+                            )
+                        if not bool(control_enabled):
+                            self._press_drive_active = False
+                            self._press_drive_remain_m = 0.0
+                        w_press = (
+                            self._update_button_wheel_press(dt)
+                            if bool(control_enabled) else None
+                        )
+                        if w_press is not None:
+                            self._wheel_pending_cmd = np.asarray(
+                                w_press, dtype=float
+                            ).reshape(3)
+                            self._wheel_pending_enable = (
+                                bool(control_enabled)
+                                and not self._rm_drive_busy()
+                            )
+                        else:
+                            self._wheel_pending_cmd = np.zeros(3, dtype=float)
+                            self._wheel_pending_enable = False
+                    else:
+                        tau_send = np.zeros(3, dtype=float)
+                        wheels_on = bool(
+                            control_enabled and not self._rm_drive_busy()
+                        )
+                        w_cmd = (
+                            self._compute_wheel_cmd(
+                                gamepad_msg, allow_yaw=True
+                            )
+                            if wheels_on else np.zeros(3, dtype=float)
+                        )
+                        self._wheel_pending_cmd = np.asarray(
+                            w_cmd, dtype=float
+                        ).reshape(3)
+                        self._wheel_pending_enable = bool(wheels_on)
+                        qh = np.asarray(q, dtype=float).reshape(3)
+                        q_goal = np.asarray(
+                            getattr(
+                                self.lcm_cfg, "manip_hold_q",
+                                (1.376, 1.378, -0.096),
+                            ),
+                            dtype=float,
+                        ).reshape(3)
+                        q_cmd = self._manip_hold_q_cmd
+                        if q_cmd is None or (not np.all(np.isfinite(q_cmd))):
+                            q_cmd = qh.copy()
+                        rate = float(max(
+                            0.0,
+                            getattr(
+                                self.lcm_cfg, "manip_hold_q_rate_rad_s", 0.0
+                            ),
+                        ))
+                        delta = q_goal - q_cmd
+                        dist = float(np.linalg.norm(delta))
+                        step = rate * float(max(0.0, dt))
+                        if dist > 1e-6 and step > 0.0:
+                            q_cmd = q_cmd + delta * (min(step, dist) / dist)
+                        else:
+                            q_cmd = q_goal.copy()
+                        self._manip_hold_q_cmd = np.asarray(
+                            q_cmd, dtype=float
+                        ).reshape(3)
+                        self._manip_err_m = float(np.linalg.norm(q_goal - qh))
                     tau_out_scale_applied = 1.0
                     props_active = False
                 elif self._gait_mode == "push":
@@ -5534,7 +5543,7 @@ class ModeELCMController:
                     # to mobile_leg_q_des (1 Nm wall), then P + AK60-D hold.
                     self._monitor_mobile_button_target()
                     wheels_on = bool(
-                        control_enabled and int(self._rm_stage) != 2
+                        control_enabled and not self._rm_drive_busy()
                     )
                     # LT auto-approach servo overrides the sticks while
                     # active (it cancels itself on stick/B and may enter
@@ -5620,13 +5629,13 @@ class ModeELCMController:
                             self._close_prop_base_window("first hop LO")
                 # RM M2006 sequence: refresh _rm_iq_des (rides inside hopper_cmd_lcmt below).
                 self._update_rm()
-                # MOBILE kiwi wheels: drive only in enabled MOBILE once the
-                # RM fold is out of its drive stage (don't roll while the
-                # arms are still folding); every other tick streams zeros
-                # with enable=0. The Jetson driver applies its own X/B mode
-                # gating on top, same class as rm_iq_des. PUSH keeps the
-                # wheels live too (leg contact + wheel transport together).
-                if self._gait_mode in ("mobile", "push"):
+                # MOBILE kiwi wheels: off only while RM is mid-drive
+                # (stage 2). The 1 s endpoint hold may overlap the first
+                # MOBILE wheel command -- that is the insurance hold.
+                if self._gait_mode in ("mobile", "push") or (
+                    self._gait_mode == "manipulation"
+                    and str(getattr(self, "_manip_kind", "hold")) == "hold"
+                ):
                     self._publish_wheel_cmd(
                         getattr(
                             self, "_wheel_pending_cmd", np.zeros(3)
@@ -5669,7 +5678,13 @@ class ModeELCMController:
                     # Manipulation/button/push: outer Cartesian position P
                     # only; AK60 supplies the sole velocity damping path.
                     kd_use = float(max(
-                        0.0, self.lcm_cfg.manip_ak60_kd
+                        0.0,
+                        getattr(
+                            self.lcm_cfg, "mobile_leg_ak60_kd_move", 2.0
+                        )
+                        if str(getattr(self, "_manip_kind", "hold"))
+                        == "button"
+                        else self.lcm_cfg.manip_ak60_kd,
                     ))
                 elif self._lt_stand_t0 is not None:
                     kd_use = float(max(0.0, float(
@@ -5693,7 +5708,29 @@ class ModeELCMController:
                             "ak60_first_hop_stance_damp_kd",
                             0.4,
                         ))))
-                if kd_use > 0.0:
+                if (self._gait_mode == "manipulation"
+                        and str(getattr(self, "_manip_kind", "hold"))
+                        == "hold"):
+                    q_hold = self._manip_hold_q_cmd
+                    if q_hold is None or (not np.all(np.isfinite(q_hold))):
+                        q_hold = np.asarray(
+                            getattr(
+                                self.lcm_cfg, "manip_hold_q",
+                                (1.376, 1.378, -0.096),
+                            ),
+                            dtype=float,
+                        ).reshape(3)
+                    kp_hold = float(max(
+                        0.0, getattr(self.lcm_cfg, "manip_hold_kp", 20.0)
+                    ))
+                    kd_hold = float(max(0.0, self.lcm_cfg.manip_ak60_kd))
+                    self._publish_hopper_cmd(
+                        np.zeros(3, dtype=float),
+                        q_des=np.asarray(q_hold, dtype=float).reshape(3),
+                        kp_joint=np.full(3, kp_hold, dtype=float),
+                        kd_joint=np.full(3, kd_hold, dtype=float),
+                    )
+                elif kd_use > 0.0:
                     self._publish_hopper_cmd(
                         tau_send,
                         kp_joint=np.zeros(3, dtype=float),
@@ -5734,7 +5771,7 @@ class ModeELCMController:
                         self._rx_motor_n = 0
                         self._rx_imu_n = 0
                         self._rx_rate_t0 = float(now)
-                    print(
+                    jprint(
                         self._format_status_line(
                             info=info,
                             q=q,
@@ -5745,32 +5782,8 @@ class ModeELCMController:
                         )
                     )
 
-                # Log (if enabled). Gate here: building all the np arrays and the
-                # dict(info) copy costs real time at 500Hz even when logging is off.
-                if not bool(self._log_enabled):
-                    continue
-                self._log_step(
-                    wall_time_s=float(now),
-                    q=q,
-                    qd=qd,
-                    imu_quat=imu_quat,
-                    imu_gyro=imu_gyro,
-                    imu_acc=imu_acc,
-                    imu_rpy=imu_rpy,
-                    desired_v_xy=desired_v_xy,
-                    tau_cmd=np.asarray(tau_send, dtype=float).reshape(3),
-                    tau_raw=np.asarray(tau_raw, dtype=float).reshape(3),
-                    tau_out_scale_applied=float(tau_out_scale_applied),
-                    pwm_us=np.asarray(pwm_us, dtype=float).reshape(6),
-                    info=dict(info),
-                    props_active=bool(props_active),
-                    prop_ctrl_mode=int(prop_cm),
-                )
-
         finally:
             # Zero all outgoing commands so the robot doesn't keep acting on stale values.
             self._publish_zero_outputs()
-            # Ensure file is closed when controller stops
-            self._stop_log()
 
 

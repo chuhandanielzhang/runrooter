@@ -30,11 +30,12 @@ echo "last hopper-upper start:      ${UP_START:-unknown}"
 echo "last hopper-perception start: ${PC_START:-unknown}"
 
 # --- CSV logs since the last upper start ---
+# Current recorder is hopper-lcm-csv -> logs/lcm_csv/lcm_*.csv.
+# Legacy in-loop modee_*.csv is no longer written.
 if [ -n "${UP_START}" ] && [ "${UP_START}" != "n/a" ]; then
-  CSVS="$($SSH "find ${RLOGS} -maxdepth 1 -name 'modee_2*.csv' -newermt '${UP_START}'" || true)"
+  CSVS="$($SSH "find ${RLOGS}/lcm_csv -maxdepth 1 -name 'lcm_2*.csv' -newermt '${UP_START}'; find ${RLOGS} -maxdepth 1 -name 'modee_2*.csv' -newermt '${UP_START}'" || true)"
 else
-  # Fallback: newest CSV only.
-  CSVS="$($SSH "ls -t ${RLOGS}/modee_2*.csv 2>/dev/null | head -1" || true)"
+  CSVS="$($SSH "ls -t ${RLOGS}/lcm_csv/lcm_2*.csv ${RLOGS}/modee_2*.csv 2>/dev/null | head -1" || true)"
 fi
 if [ -n "${CSVS}" ]; then
   echo "${CSVS}" | while read -r f; do
@@ -73,13 +74,42 @@ import numpy as np
 import pandas as pd
 
 dest = sys.argv[1]
-csvs = sorted(glob.glob(os.path.join(dest, "modee_2*.csv")))
+csvs = sorted(
+    glob.glob(os.path.join(dest, "modee_2*.csv"))
+    + glob.glob(os.path.join(dest, "lcm_2*.csv"))
+)
 if not csvs:
     print("no CSVs to summarize")
 for p in csvs:
     try:
-        df = pd.read_csv(p, low_memory=False,
-                         usecols=["t_s", "liftoff", "touchdown", "gait_mode"])
+        df = pd.read_csv(p, low_memory=False, nrows=1)
+        cols = set(df.columns)
+        if {"t_s", "liftoff", "touchdown", "gait_mode"} <= cols:
+            df = pd.read_csv(p, low_memory=False,
+                             usecols=["t_s", "liftoff", "touchdown", "gait_mode"])
+        elif {"wall_time_s", "wheel_en"} <= cols:
+            df = pd.read_csv(
+                p, low_memory=False,
+                usecols=["wall_time_s", "wheel_en",
+                         "wheel_w0", "wheel_w1", "wheel_w2"],
+            )
+            t = df.wall_time_s.to_numpy(float)
+            dur = float(t[-1] - t[0]) if len(t) else 0.0
+            en = (df.wheel_en.to_numpy(float) > 0.5)
+            w = np.hypot(
+                df.wheel_w0.to_numpy(float),
+                df.wheel_w1.to_numpy(float),
+                df.wheel_w2.to_numpy(float),
+            )
+            n_cmd = int(np.sum(en & (w > 0.05)))
+            print(f"{os.path.basename(p)}: {dur:.0f}s, "
+                  f"wheel_en {int(en.sum())} rows, "
+                  f"|w|>0.05 {n_cmd} rows, "
+                  f"w_max {float(np.nanmax(w)) if len(w) else 0:.2f} rad/s")
+            continue
+        else:
+            print(f"{os.path.basename(p)}: {len(df)} header-only / unknown schema")
+            continue
     except Exception as e:
         print(f"{os.path.basename(p)}: unreadable ({e})")
         continue

@@ -364,7 +364,7 @@ Examples:
         pass
     finally:
         ctl.running = False
-        # Join to allow ModeELCMController.run_controller() to close the CSV log cleanly.
+        # Join so run_controller() can publish its zero-output/DAMP frames.
         try:
             ctrl_thread.join(timeout=2.0)
         except Exception:

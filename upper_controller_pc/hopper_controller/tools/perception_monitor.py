@@ -162,49 +162,34 @@ def render_panel(
         tag_state = str((ctrl or {}).get("mobile_tag_state", "?")).upper()
         col = {"READY": GREEN, "SEARCHING": GRAY}.get(tag_state, YELLOW)
         p.line(f"tag: {tag_state}", col)
-        r_min = float((ctrl or {}).get("mobile_ready_r_min_m", 0.50))
-        r_max = float((ctrl or {}).get("mobile_ready_r_max_m", 0.53))
         d = (ctrl or {}).get("mobile_tag_cam_z_m")
         if d is None:
             d = btn.get("tag_cam_z_m")
-        # Goal vs now vs 差值 (radial band + workspace clip).
-        p.line(f"goal: |face|_L in [{r_min:.2f}, {r_max:.2f}] m", WHITE)
+        r_min = float((ctrl or {}).get("mobile_ready_r_min_m", 0.48))
+        r_max = float((ctrl or {}).get("mobile_ready_r_max_m", 0.56))
+        p.line(f"goal: |face| in [{r_min:.2f}, {r_max:.2f}] m, clip <= 4 cm",
+               WHITE)
         if d is not None:
             d = float(d)
-            r_err = (ctrl or {}).get("mobile_tag_r_err_m")
-            if r_err is None:
-                if d > r_max:
-                    r_err = d - r_max
-                elif d < r_min:
-                    r_err = d - r_min
-                else:
-                    r_err = 0.0
-            r_err = float(r_err)
-            if abs(r_err) < 1e-4:
-                p.line(f"now:  {d:.2f} m   Δr = 0.00 m (in band)", GREEN)
-            elif r_err > 0:
-                p.line(f"now:  {d:.2f} m   Δr = +{r_err*100:.1f} cm (too far)",
-                       YELLOW)
-            else:
-                p.line(f"now:  {d:.2f} m   Δr = {r_err*100:.1f} cm (too close)",
-                       YELLOW)
+            p.line(f"range: {d:.2f} m",
+                   GREEN if r_min <= d <= r_max else YELLOW)
         else:
-            p.line("now:  n/a   Δr = n/a", GRAY)
+            p.line("range: n/a   PRE XY err: n/a", GRAY)
         reach = (ctrl or {}).get("mobile_tag_reach_error_m")
         if reach is not None:
             rc = float(reach) * 100.0
-            p.line(f"clip: {rc:.1f} cm  (workspace 差值, info)",
-                   YELLOW if rc > 2.0 else GREEN)
+            p.line(f"clip: {rc:.1f} cm  (must be <= 4 cm)",
+                   YELLOW if rc > 4.0 else GREEN)
         else:
             p.line("clip: n/a", GRAY)
         if btn.get("valid") and btn.get("foot_face_L") is not None:
             p.line(f"BTN L {_fmt_vec(btn.get('foot_face_L'))}", WHITE)
-            p.line("preview: magenta BTN / cyan PRE", GRAY, 0.5)
+            p.line("BTN = wall RIGHT 19.5cm, DOWN 5.6cm", WHITE, 0.5)
+            p.line("preview: magenta BTN / cyan PRE / +X orange", GRAY, 0.5)
         if tag_state == "READY":
             p.line("manip: OK -> LT / auto-approach", GREEN)
         elif d is not None:
-            p.line(f"manip: FAR -> drive until Δr=0 "
-                   f"([{r_min:.2f},{r_max:.2f}])", YELLOW)
+            p.line("manip: ALIGN -> park PRE + square wall", YELLOW)
         else:
             p.line("manip: no target", GRAY)
         if approach:
@@ -327,7 +312,7 @@ def main():
                 frame = img
 
             rot = (args.rotate if args.rotate is not None
-                   else int((percep or {}).get("rotate_cw", 90)))
+                   else int((percep or {}).get("rotate_cw", 0)))
             if frame is not None:
                 view = np.ascontiguousarray(_rot_cw(frame, rot))
             else:

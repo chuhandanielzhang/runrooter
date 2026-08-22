@@ -318,8 +318,8 @@ def main():
                     help="disable AprilTag button overlay/setpoint publisher")
     ap.add_argument("--tag-id", type=int, default=1)
     ap.add_argument("--tag-size", type=float, default=0.09)
-    ap.add_argument("--button-right-m", type=float, default=0.165)
-    ap.add_argument("--button-down-m", type=float, default=0.026)
+    ap.add_argument("--button-right-m", type=float, default=-0.195)
+    ap.add_argument("--button-down-m", type=float, default=-0.056)
     ap.add_argument("--button-protrude-m", type=float, default=0.05)
     ap.add_argument("--button-press-m", type=float, default=0.01)
     ap.add_argument(

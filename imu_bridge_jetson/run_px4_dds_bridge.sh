@@ -21,12 +21,8 @@ if ls /dev/ttyUSB* >/dev/null 2>&1; then
 fi
 
 # Base mount rotation z150,y-90 reproduces the old USB px4_bridge frame.
-# 2026-08-07 level calibration (robot mechanically level, 501 samples):
-# measured roll=-0.413 deg, pitch=-1.917 deg.  Prepending the same measured
-# rotations to R_mount makes R_wb_new = R_wb_old*Rx(+0.413)*Ry(+1.917), so
-# the current pose reads roll=pitch=0 while preserving yaw.  This corrects
-# quat/rpy/gyro/acc together; do not apply a separate RPY-only subtraction.
-IMU_ROT="y-1.917,x-0.413,z150,y-90"
+# No level trim is applied; publish the mechanically mounted IMU attitude.
+IMU_ROT="z150,y-90"
 # 2026-07-23: props run UNIDIRECTIONAL (--no-bidir): ESC 3D mode kept OFF (it did not
 # persist across power cycles on the Hobbywing 4-in-1). Requires DSHOT_3D_ENABLE=0.
 exec python3 "$HERE/px4_dds_bridge.py" --rot "$IMU_ROT" --publish-hz 500 --print-hz 2 --no-bidir --prop-reverse "" $IMU_ARGS "$@"
