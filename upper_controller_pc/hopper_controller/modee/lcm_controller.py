@@ -172,7 +172,11 @@ class ModeELCMConfig:
     #   and pause the Python controller loop for a few seconds.
     safe_rp_deg: float = 50.0
     safe_q_min: float = -1.06     # CASE: retract limit (with kAk60LcmQOffsetRad=-60 deg)
-    safe_q_max: float = 1.40      # CASE: extend limit (user: do not past q=1.4)
+    # CASE: extend limit.  Was 1.40 (a policy number, not the mechanical
+    # stop).  User 2026-08-23 hand-posed the leg to q=[-0.71, 1.46, 1.53],
+    # foot r=0.374 at z=0.221 -- outside anything the 1.40 box could reach.
+    # 1.55 is that pose plus the 0.02 rad of solver margin, no further.
+    safe_q_max: float = 1.55
     # Whole-robot gait switch:
     # - OFF/DAMP + LT: no actuator motion; current RM pose is labeled q=+11.5
     #   and MOBILE is selected.
@@ -490,8 +494,8 @@ class ModeELCMConfig:
     # L=0.476 / r_xy=0.31 / tilt=41 deg — the old q-carve (L_qcap≈0.38)
     # rejected that pose and reported a fake 21 cm "clip".
     manip_leg_len_max_m: float = 0.58
-    manip_q_max: float = 1.4
-    manip_xy_max_m: float = 0.37
+    manip_q_max: float = 1.55
+    manip_xy_max_m: float = 0.383
     manip_tilt_max_deg: float = 65.0
     # Manipulation is intentionally low-authority: move the Cartesian target
     # incrementally like stick teleop, never snap the leg with a stiff servo.
@@ -735,20 +739,46 @@ class ModeELCMConfig:
     #           stop. Homing FK(0).z=0.354 is the INNER length bound,
     #           not a z-floor.
     #   BOTTOM  z <= 0.440 m (foot at wheel-contact floor level),
-    #   REACH   work_len_min (FK(0)≈0.354) <= L <= 0.50 m,
-    #   SWING   horizontal r <= 0.37 m (same two-q family at q2=-1.2).
-    #           Hold-q ring r=0.31 @ z=0.362 sits inside this disk.
-    #   MINUS three wheel disks, 120 deg symmetric about the origin
-    #   (user: 左边右边空间一样). Centers on chassis rays
-    #   (drive-frame 180/60/300: one wheel BACK, two LEFT/RIGHT)
-    #   rotated into L by drive yaw. Keep-out radius work_wheel_keep_m.
+    #   FLOOR   r_xy < 0.10 m at BOTTOM hits the floor (user 2026-08-23).
+    #           Inside that disk z is lifted toward work_len_min; z_bottom
+    #           is only allowed for r >= work_xy_floor_r_m.
+    #   REACH   work_len_min <= L <= 0.50 m.  work_len_min is NOT 归中
+    #           (FK(0)=0.354): the three keep-out ducts sit at
+    #           L=hypot(0.107, 0.320)=0.337, so a clamp at 归中 can only
+    #           skate their outer lip.  0.330 matches LEN_FOLD_MIN_M in
+    #           tools/workspace_envelope.py; joints retract to L=0.247.
+    #   SWING   horizontal r <= 0.383 m (FK(1.55,-0.97,1.55), at z=0.162).
+    #   MINUS three wheel BARRELS, 120 deg symmetric about the origin
+    #   (user: 左边右边空间一样). Keep-outs live in the LEG/L frame:
+    #   bottom on x=0 (az=270), then +120/+240 (30 and 150).
+    #   Independent of drive-frame wheel_azimuth_deg (kiwi IK).
+    #   The barrel is 3D (user 2026-08-23): at z_bottom it is just the wheel
+    #   disk, it opens into an ellipse at work_keep_z_wide_m and closes again
+    #   symmetrically above.  The ellipse was sized from a hand-posed foot
+    #   that just clears the wheel: centre = its perpendicular foot on the
+    #   ray through the wheel, b = its distance to that ray, a reaches the
+    #   inner edge of the wheel disk.  Because a grows exactly as fast as the
+    #   centre moves out, the inner face of all three barrels is one straight
+    #   cylinder at r = 0.115 m, the duct the low rings weave through.
+    #   work_keep_b_wide_m sets the barrel's AZIMUTHAL width, so it alone
+    #   decides how far round a ring gets; 2026-08-24 it came down from 0.150
+    #   to 0.118 after a hand pose 31 mm clear of the real wheel was called
+    #   blocked.  tools/workspace_envelope.py mirrors these numbers.
     work_z_top_m: float = 0.128
     work_z_bottom_m: float = 0.440
-    work_len_min_m: float = 0.354
+    work_len_min_m: float = 0.330
+    work_len_home_m: float = 0.354   # FK(0,0,0) 归中; floor-cone apex
     work_len_max_m: float = 0.50
-    work_xy_max_m: float = 0.37
+    work_xy_max_m: float = 0.383
+    work_xy_floor_r_m: float = 0.10
     work_wheel_center_m: float = 0.17
     work_wheel_keep_m: float = 0.055
+    work_wheel_azimuth_deg: tuple = (270.0, 30.0, 150.0)
+    work_keep_z_wide_m: float = 0.267
+    work_keep_r_wide_m: float = 0.229
+    work_keep_a_wide_m: float = 0.114
+    work_keep_b_wide_m: float = 0.118
+    work_keep_margin_m: float = 0.008
 
 
 class ModeELCMController:
@@ -963,23 +993,32 @@ class ModeELCMController:
             jprint(f"[init] T_L_C unavailable ({e}); drive yaw fallback "
                   f"{math.degrees(dy):+.1f} deg")
         self._l2d_cs: tuple = (math.cos(dy), math.sin(dy))
-        # Work envelope: homing length = L_min (q=0 零位, inner bound).
-        # z_top / xy_max = two-q-down with q2 at the -1.2 software stop.
+        # Work envelope.  L_min is work_len_min_m, NOT the homing length:
+        # 归中 (FK(0)=0.354) cannot fold into the r=0.107 keep-out ducts at
+        # L=0.337, so clamping there locks the foot out of them.
         try:
             f0, _ = self.core.fk.forward_kinematics(np.zeros(3))
             f0 = np.asarray(f0, dtype=float).reshape(3)
-            self.lcm_cfg.work_len_min_m = float(np.linalg.norm(f0))
+            l_home = float(np.linalg.norm(f0))
+            self.lcm_cfg.work_len_home_m = l_home
             jprint(
                 "[init] work envelope: z "
                 f"{float(self.lcm_cfg.work_z_top_m):.3f}..{float(self.lcm_cfg.work_z_bottom_m):.3f} m, "
-                f"L={float(self.lcm_cfg.work_len_min_m):.3f}..{float(self.lcm_cfg.work_len_max_m):.2f} m, "
+                f"L={float(self.lcm_cfg.work_len_min_m):.3f}..{float(self.lcm_cfg.work_len_max_m):.2f} m "
+                f"(归中 {l_home:.3f}), "
                 f"swing r<={float(self.lcm_cfg.work_xy_max_m):.3f} m "
-                f"(fwd-tilt), 3 wheels 120deg at r="
-                f"{float(self.lcm_cfg.work_wheel_center_m):.2f} m "
-                f"keep={float(self.lcm_cfg.work_wheel_keep_m):.3f} m"
+                f"(fwd-tilt), floor-keep r<"
+                f"{float(self.lcm_cfg.work_xy_floor_r_m):.2f} m at BOTTOM, "
+                f"3 wheel barrels 120deg at r="
+                f"{float(self.lcm_cfg.work_wheel_center_m):.2f} m: disk "
+                f"{float(self.lcm_cfg.work_wheel_keep_m):.3f} m at the floor, "
+                f"widest at z={float(self.lcm_cfg.work_keep_z_wide_m):.3f} m "
+                f"(a={float(self.lcm_cfg.work_keep_a_wide_m):.3f} "
+                f"b={float(self.lcm_cfg.work_keep_b_wide_m):.3f} "
+                f"+{float(self.lcm_cfg.work_keep_margin_m) * 1e3:.0f} mm)"
             )
         except Exception as exc:
-            jprint(f"[init] work envelope L_min fallback ({exc})")
+            jprint(f"[init] work envelope banner unavailable ({exc})")
         self._approach_ready_since: float | None = None
         self._approach_last_twist: tuple = (0.0, 0.0, 0.0)
         self._approach_waiting: bool = False
@@ -2861,7 +2900,7 @@ class ModeELCMController:
 
         Used by AprilTag wall-button press so the wall-normal stroke is
         not destroyed by rebuilding z = sqrt(L^2 - x^2 - y^2). Also carves
-        the outer sphere so joint q stays <= manip_q_max (1.4).
+        the outer sphere so joint q stays <= manip_q_max.
         """
         p = np.asarray(target, dtype=float).reshape(3).copy()
         if not np.all(np.isfinite(p)):
@@ -2906,18 +2945,15 @@ class ModeELCMController:
         return p.astype(float)
 
     def _work_wheel_az_L(self) -> tuple:
-        """Wheel-center azimuths in the leg/L frame (rad), 120 deg apart.
+        """Wheel keep-out azimuths in the leg/L frame (rad).
 
-        Chassis geometry only: drive-frame wheel azimuths (180/60/300)
-        rotated into L by the calibrated drive yaw. Same number for all
-        three; never per-wheel measurements.
+        Bottom wheel on x=0 (270 deg), then 120 deg (user 2026-08-23).
+        Not the drive-frame kiwi layout and not rotated by drive yaw.
         """
-        c, s = self._l2d_cs
-        yaw = math.atan2(float(s), float(c))
-        return tuple(
-            math.radians(float(a)) + yaw
-            for a in self.lcm_cfg.wheel_azimuth_deg
+        az = getattr(
+            self.lcm_cfg, "work_wheel_azimuth_deg", (270.0, 30.0, 150.0)
         )
+        return tuple(math.radians(float(a)) for a in az)
 
     def _work_wheel_centers_xy(self) -> tuple:
         """Three wheel hubs in L, common radius, 120 deg apart."""
@@ -2927,35 +2963,100 @@ class ModeELCMController:
             for az in self._work_wheel_az_L()
         )
 
+    def _work_keep_cross(self, z: float) -> tuple:
+        """Wheel-barrel cross-section at height z, margin included:
+        (centre radius on the wheel ray, radial semi-axis, tangential
+        semi-axis). Zero semi-axes outside the barrel's z span."""
+        cfg = self.lcm_cfg
+        z_bot = float(getattr(cfg, "work_z_bottom_m", 0.440))
+        z_wide = float(getattr(cfg, "work_keep_z_wide_m", 0.267))
+        rc0 = float(getattr(cfg, "work_wheel_center_m", 0.17))
+        a0 = float(getattr(cfg, "work_wheel_keep_m", 0.055))
+        rc1 = float(getattr(cfg, "work_keep_r_wide_m", 0.229))
+        a1 = float(getattr(cfg, "work_keep_a_wide_m", 0.114))
+        b1 = float(getattr(cfg, "work_keep_b_wide_m", 0.150))
+        margin = float(getattr(cfg, "work_keep_margin_m", 0.008))
+        cz = z_bot - z_wide
+        if cz <= 1e-9:
+            return rc0, a0 + margin, a0 + margin
+        t = (float(z) - z_wide) / cz
+        if abs(t) > 1.0:
+            return rc0, 0.0, 0.0
+        s = math.sqrt(max(0.0, 1.0 - t * t))
+        return (rc0 + s * (rc1 - rc0),
+                a0 + s * (a1 - a0) + margin,
+                a0 + s * (b1 - a0) + margin)
+
+    def _work_keep_near_r(self, az: float, z: float) -> float:
+        """Smallest r>0 where the ray at azimuth az enters a wheel barrel at
+        height z; inf when the ray misses all three."""
+        rc, a, b = self._work_keep_cross(z)
+        if a <= 0.0 or b <= 0.0:
+            return float("inf")
+        best = float("inf")
+        for az_w in self._work_wheel_az_L():
+            d = float(az) - az_w
+            c, s = math.cos(d), math.sin(d)
+            qa = (c / a) ** 2 + (s / b) ** 2
+            qb = -2.0 * rc * c / (a * a)
+            qc = (rc / a) ** 2 - 1.0
+            disc = qb * qb - 4.0 * qa * qc
+            if disc <= 0.0 or qa <= 0.0:
+                continue
+            r1 = (-qb - math.sqrt(disc)) / (2.0 * qa)
+            if 0.0 < r1 < best:
+                best = r1
+        return best
+
+    def _work_keep_inside(self, x: float, y: float, z: float) -> bool:
+        rc, a, b = self._work_keep_cross(z)
+        if a <= 0.0 or b <= 0.0:
+            return False
+        for az_w in self._work_wheel_az_L():
+            c, s = math.cos(az_w), math.sin(az_w)
+            du = float(x) * c + float(y) * s - rc
+            dn = -float(x) * s + float(y) * c
+            if (du / a) ** 2 + (dn / b) ** 2 <= 1.0:
+                return True
+        return False
+
     def _work_r_cap(self, az: float, z: float) -> float:
         """Max foot xy-radius at this azimuth/height (outer disk minus
-        the three wheel circles). Connected from the origin: a ray that
-        hits a wheel is capped at the inner intersection."""
+        the three wheel barrels). Connected from the origin: a ray that
+        hits a barrel is capped at the inner intersection."""
         l_max = float(getattr(self.lcm_cfg, "work_len_max_m", 0.50))
         r_max = math.sqrt(max(0.0, l_max * l_max - float(z) ** 2))
         xy_max = float(getattr(self.lcm_cfg, "work_xy_max_m", 0.37))
         if xy_max > 0.0:
             r_max = min(r_max, xy_max)
-        keep = float(getattr(self.lcm_cfg, "work_wheel_keep_m", 0.055))
-        ca, sa = math.cos(az), math.sin(az)
-        k2 = keep * keep
-        for cx, cy in self._work_wheel_centers_xy():
-            b = ca * cx + sa * cy
-            disc = b * b - (cx * cx + cy * cy - k2)
-            if disc <= 0.0:
-                continue
-            r1 = b - math.sqrt(disc)
-            if 0.0 < r1 < r_max:
-                r_max = r1
-        return r_max
+        return min(r_max, self._work_keep_near_r(az, z))
+
+    def _work_z_floor_max(self, r: float) -> float:
+        """Deepest allowed z at this xy radius.
+
+        User 2026-08-23: r_xy < 0.10 m at z_bottom hits the floor.
+        Cone from work_len_home at r=0 to z_bottom at r = work_xy_floor_r_m.
+        The apex is 归中, not work_len_min: the folding room work_len_min
+        buys is for reaching into the keep-out ducts out at r=0.107, and
+        pinning the apex to it would put 归中 itself outside the envelope.
+        """
+        cfg = self.lcm_cfg
+        z_bot = float(getattr(cfg, "work_z_bottom_m", 0.440))
+        z0 = float(getattr(cfg, "work_len_home_m", 0.354))
+        r_floor = float(getattr(cfg, "work_xy_floor_r_m", 0.10))
+        if r_floor <= 1e-9 or float(r) >= r_floor:
+            return z_bot
+        return z0 + (z_bot - z0) * max(0.0, float(r)) / r_floor
 
     def _clamp_work_envelope(self, target: np.ndarray) -> np.ndarray:
         """Deployed-leg WORK ENVELOPE clamp (user-defined 2026-08-14).
 
         z band [work_z_top, work_z_bottom], L in [work_len_min, work_len_max],
         horizontal r <= work_xy_max (forward-tilt disk ≈ 0.36 m),
-        minus three identical wheel disks (120 deg, left/right symmetric
-        about drive-forward). Not applied to MOBILE stow.
+        minus three identical wheel barrels (120 deg, left/right symmetric
+        about drive-forward; cross-section grows with height, see
+        _work_keep_cross). Inside r < work_xy_floor_r_m the lowest z
+        is lifted (floor cone). Not applied to MOBILE stow.
         """
         cfg = self.lcm_cfg
         z_top = float(getattr(cfg, "work_z_top_m", 0.354))
@@ -2976,27 +3077,23 @@ class ModeELCMController:
             p = p * (l_max / L)
             L = l_max
         p[2] = float(np.clip(p[2], min(z_top, z_bot), max(z_top, z_bot)))
+        r = math.hypot(float(p[0]), float(p[1]))
+        z_floor = self._work_z_floor_max(r)
+        if float(p[2]) > z_floor:
+            p[2] = z_floor
         xy_max = float(getattr(cfg, "work_xy_max_m", 0.37))
         r_cap = math.sqrt(max(0.0, l_max * l_max - float(p[2]) ** 2))
         if xy_max > 0.0:
             r_cap = min(r_cap, xy_max)
-        keep = float(getattr(cfg, "work_wheel_keep_m", 0.055))
-        r = math.hypot(float(p[0]), float(p[1]))
         az = math.atan2(float(p[1]), float(p[0]))
-        ca, sa = math.cos(az), math.sin(az)
-        k2 = keep * keep
-        # Only pull back if the foot is actually inside a wheel disk;
-        # side corners (beside a wheel) stay reachable.
-        for cx, cy in self._work_wheel_centers_xy():
-            if math.hypot(float(p[0]) - cx, float(p[1]) - cy) >= keep:
-                continue
-            b = ca * cx + sa * cy
-            disc = b * b - (cx * cx + cy * cy - k2)
-            if disc <= 0.0:
-                continue
-            r1 = b - math.sqrt(disc)
-            if 0.0 < r1 < r_cap:
-                r_cap = r1
+        # Always cap at the near intersection, even where the foot itself is
+        # in the clear sliver beyond a barrel.  The leg is the segment from
+        # the hip to the foot, so reaching that sliver drags the leg through
+        # the wheel -- 2026-08-24, the trace hit exactly this at az=144 deg
+        # on the TOP ring with the foot 9 mm clear of the barrel and the leg
+        # 45 mm inside the wheel.
+        r_cap = min(r_cap, self._work_keep_near_r(az, float(p[2])))
+        r = math.hypot(float(p[0]), float(p[1]))
         if r > r_cap and r > 1e-9:
             p[0] *= r_cap / r
             p[1] *= r_cap / r
