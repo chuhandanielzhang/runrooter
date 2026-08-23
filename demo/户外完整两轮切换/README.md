@@ -1,6 +1,6 @@
-# 11hop推车10hop
+# 户外完整两轮切换
 
-Outdoor. 2026-08-22 **13:28** BJ (Saturday afternoon).
+Outdoor two-round mobile↔hop. 2026-08-22 **13:28** BJ (Saturday afternoon).
 
 Source session: `run_20260822_1328BJ`.  
 LCM: `lcm_csv/lcm_20260822_085915.csv`.  
@@ -23,6 +23,6 @@ Second hop is in the CSV; video stops at 13:29:33.5, just before it.
 
 | File | What |
 |---|---|
-| `11hop推车10hop.csv` | LCM, 13:28:40–13:29:54 BJ |
-| `11hop推车10hop.webm` | RGB, 13:28:54–13:29:33 |
-| `11hop推车10hop_深度.webm` | RGB + depth, same window |
+| `户外完整两轮切换.csv` | LCM, 13:28:40–13:29:54 BJ |
+| `户外完整两轮切换.webm` | RGB, 13:28:54–13:29:33 |
+| `户外完整两轮切换_深度.webm` | RGB + depth, same window |
